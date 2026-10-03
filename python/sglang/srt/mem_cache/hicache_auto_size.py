@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
 )
 from sglang.srt.mem_cache.pool_host.base import (
+    host_memory_budget_bytes_per_rank,
     host_memory_budget_bytes,
     host_memory_budget_scope,
     ranks_per_host,
@@ -93,7 +94,10 @@ def auto_size_hicache(
         return
     requested = get_memory().hicache_ratio
     device_bytes = _estimate_hicache_bytes(params, draft_plan)
-    budget = int(host_memory_budget_bytes() * fraction)
+    # Auto-sizing keeps the per-rank split: host_memory_budget_bytes() returns
+    # the whole remaining headroom, since dividing it inside the guard refused
+    # late ranks whose explicitly sized pools fit (upstream #38156).
+    budget = int(host_memory_budget_bytes_per_rank() * fraction)
     ratio = min(requested, budget * (1 - _ALLOCATION_SLACK_FRACTION) / device_bytes)
     # One collective before any pool is built: PP stages own different pool
     # counts, so a per-pool collective could deadlock.
