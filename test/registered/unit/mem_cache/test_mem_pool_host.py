@@ -291,15 +291,17 @@ class TestHostMemoryBudget(CustomTestCase):
         ):
             return base.host_memory_budget_bytes()
 
-    def test_budget_is_split_across_co_located_ranks(self):
+    def test_budget_is_not_split_across_co_located_ranks(self):
+        # Outside a budget scope every rank sees the whole remaining headroom;
+        # splitting by rank count refused late ranks whose pools fit (#38156).
         solo = self._budget_with_ranks(1)
-        self.assertEqual(self._budget_with_ranks(4), solo // 4)
+        self.assertEqual(self._budget_with_ranks(4), solo)
+        self.assertEqual(self._budget_with_ranks(8), solo)
 
-    def test_reserve_is_taken_before_the_split(self):
-        # Each rank must not get its own copy of the reserve.
+    def test_reserve_is_taken_from_the_budget(self):
         budget = self._budget_with_ranks(8)
-        self.assertLessEqual(
-            budget * 8, self._AVAILABLE - base.HICACHE_HOST_MEMORY_RESERVE_BYTES
+        self.assertEqual(
+            budget, self._AVAILABLE - base.HICACHE_HOST_MEMORY_RESERVE_BYTES
         )
 
     def test_ranks_per_host_divides_world_size_by_nodes(self):

@@ -85,9 +85,16 @@ def ranks_per_host() -> int:
 def host_memory_budget_bytes(requested_bytes: int = 0) -> int:
     """Host RAM this rank may claim for a HiCache pool.
 
-    Bound machine availability by the visible cgroup limits before splitting
-    among local ranks. Independent engines with separate container budgets
-    therefore size against their own remaining allowance.
+    Bound machine availability by the visible cgroup limits. Independent
+    engines with separate container budgets therefore size against their own
+    remaining allowance.
+
+    The allowance is not divided by ranks_per_host(): outside a budget scope
+    each rank reads the host's remaining headroom at a different moment, so a
+    rank that checks after its peers have pinned their pools would be refused
+    even though all pools fit (upstream #38156). Explicitly sized pools are
+    checked one at a time against the whole headroom; HiCache auto-sizing
+    divides by ranks_per_host() itself before booking a budget scope.
 
     Inside host_memory_budget_scope, requested_bytes is booked against the
     snapshot when it fits; the allowance before booking is returned.
@@ -99,7 +106,16 @@ def host_memory_budget_bytes(requested_bytes: int = 0) -> int:
         return available
 
     free = available_host_memory_bytes() - HICACHE_HOST_MEMORY_RESERVE_BYTES
-    return free // ranks_per_host()
+    return max(0, free)
+
+
+def host_memory_budget_bytes_per_rank() -> int:
+    """Host RAM one rank may plan for when every local rank sizes itself the
+    same way (HiCache auto-sizing): the remaining headroom split evenly.
+
+    Kept out of host_memory_budget_bytes() so the explicit-size guard checks a
+    pool against the whole headroom (upstream #38156)."""
+    return host_memory_budget_bytes() // ranks_per_host()
 
 
 def sync_fixed_hicache_size(size: int, host_size: int) -> int:
