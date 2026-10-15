@@ -84,6 +84,13 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
         self.prefill_graph_wrapper_cls = getattr(
             kda, "RecurrentKDAPrefillWrapper", None
         )
+        # (query_start_loc, int64 copy). FlashInfer's CuTe prefill converts
+        # cu_seqlens to int64 and memoizes its host contents by tensor identity;
+        # the backend hands every KDA layer of a forward the same int32
+        # query_start_loc, so a per-call `.to(int64)` inside FlashInfer made a
+        # fresh tensor each layer, missed the memo, and paid a `.cpu()` host
+        # sync per layer. Converting once per forward keeps the identity stable.
+        self._cu_seqlens_i64: Optional[tuple[torch.Tensor, torch.Tensor]] = None
 
     def decode(self, *args, **kwargs):
         raise NotImplementedError("FlashInferKDAPrefillKernel is prefill-only")
@@ -118,6 +125,14 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             if needs_checkpoint
             else None
         )
+        if query_start_loc.dtype == torch.int64:
+            cu_seqlens = query_start_loc
+        else:
+            cached = self._cu_seqlens_i64
+            if cached is None or cached[0] is not query_start_loc:
+                cached = (query_start_loc, query_start_loc.to(torch.int64))
+                self._cu_seqlens_i64 = cached
+            cu_seqlens = cached[1]
         result = self._recurrent_kda(
             q=q.contiguous(),
             k=k.contiguous(),
@@ -133,7 +148,7 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
             lower_bound=lower_bound,
-            cu_seqlens=query_start_loc,
+            cu_seqlens=cu_seqlens,
             ssm_state_indices=cache_indices.to(torch.int32),
             beta_is_logit=True,
             state_checkpoints=checkpoints,
