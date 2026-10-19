@@ -6,7 +6,11 @@ from contextlib import contextmanager
 
 import torch
 
-from sglang.srt.mem_cache.pool_host.base import HostKVCache, host_memory_budget_bytes
+from sglang.srt.mem_cache.pool_host.base import (
+    HostKVCache,
+    host_memory_budget_bytes,
+    host_memory_budget_bytes_per_rank,
+)
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     _cuda_host_unregister,
@@ -111,7 +115,8 @@ class _SharedPageEnvelopeHostBacking:
         ]
 
         if host_size == 0 and host_to_device_ratio == 0:
-            total_bytes = host_memory_budget_bytes()
+            # Sizing, not checking: keep this rank's share (see base.py).
+            total_bytes = host_memory_budget_bytes_per_rank()
         elif host_size > 0:
             total_bytes = max(nominal_view_bytes)
         else:
