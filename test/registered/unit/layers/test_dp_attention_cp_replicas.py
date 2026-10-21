@@ -241,6 +241,66 @@ class TestDpGatherCpReplicas(CustomTestCase):
             with self.subTest(is_partial=is_partial):
                 self.run_ranks([3, 0], DpPaddingMode.SUM_LEN, is_partial)
 
+    def test_max_len_gather_slices_replicated_rows_locally(self):
+        """Without CP, the MAX_LEN gather over attention TP must place every DP
+        group's rows once; a replicated input needs no attention-TP collective
+        (each rank already holds its slice), a partial one must still be summed."""
+        rows_per_group = 2 * ATTN_TP_SIZE
+        tp_size = DP_SIZE * ATTN_TP_SIZE
+        generator = torch.Generator().manual_seed(0)
+        values = [
+            torch.randint(-8, 8, (rows_per_group, HIDDEN), generator=generator).double()
+            for _ in range(DP_SIZE)
+        ]
+        for is_partial in (False, True):
+            with self.subTest(is_partial=is_partial):
+                contributions = [None] * tp_size
+                reduce_scatters = []
+                for tp_rank in range(tp_size):
+                    dp, attn_tp = divmod(tp_rank, ATTN_TP_SIZE)
+                    local = (
+                        values[dp] * PARTIAL_WEIGHTS[attn_tp]
+                        if is_partial
+                        else values[dp].clone()
+                    )
+
+                    def reduce_scatter(output, value, dp=dp):
+                        reduce_scatters.append(tp_rank)
+                        output.copy_(values[dp].tensor_split(ATTN_TP_SIZE)[attn_tp])
+
+                    def all_gather(output, value, tp_rank=tp_rank):
+                        contributions[tp_rank] = value.clone()
+
+                    parallel = SimpleNamespace(
+                        attn_tp_size=ATTN_TP_SIZE,
+                        attn_tp_rank=attn_tp,
+                        attn_cp_size=1,
+                        tp_group=SimpleNamespace(all_gather_into_tensor=all_gather),
+                        attn_tp_group=SimpleNamespace(
+                            reduce_scatter_tensor=reduce_scatter
+                        ),
+                    )
+                    with (
+                        patch.object(
+                            dp_attention, "get_parallel", return_value=parallel
+                        ),
+                        patch.object(
+                            dp_attention, "world_dp_gather_enabled", return_value=False
+                        ),
+                    ):
+                        dp_attention._dp_gather_via_all_gather(
+                            torch.empty(DP_SIZE * rows_per_group, HIDDEN).double(),
+                            local,
+                            forward_batch=None,
+                            is_partial=is_partial,
+                        )
+                self.assertEqual(
+                    reduce_scatters, list(range(tp_size)) if is_partial else []
+                )
+                torch.testing.assert_close(
+                    torch.cat(contributions), torch.cat(values), rtol=0, atol=0
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
