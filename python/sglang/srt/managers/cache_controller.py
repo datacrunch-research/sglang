@@ -89,6 +89,8 @@ class LayerDoneCounter:
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1
+        # Called with the consumer index on the forward stream (striped MLA host tier).
+        self.consume_hook = None
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
@@ -99,6 +101,8 @@ class LayerDoneCounter:
 
     def set_consumer(self, index: int):
         self.consumer_index = index
+        if self.consume_hook is not None and index >= 0:
+            self.consume_hook(index)
 
     def wait_until(self, threshold: int):
         if self.consumer_index < 0:
@@ -1056,6 +1060,22 @@ class HiCacheController:
     ) -> list[L2Transfer]:
         return self._l2_transfers(host_indices, device_indices, pool_transfers)
 
+    def _register_shard_gather(self, producer_id: int, device_indices) -> None:
+        from sglang.srt.mem_cache.pool_host.mla_host_shard import (
+            MLAHostShardPoolMixin,
+        )
+
+        anchor = getattr(self.mem_pool_host, "anchor_entry", None)
+        host_pool = anchor.host_pool if anchor is not None else self.mem_pool_host
+        if not isinstance(host_pool, MLAHostShardPoolMixin):
+            return
+        counter = self.layer_done_counter
+        if counter.consume_hook is None:
+            counter.consume_hook = lambda idx: host_pool.run_pending_gather(
+                idx, counter.events[idx].finish_event
+            )
+        host_pool.register_pending_gather(producer_id, device_indices)
+
     def start_loading(self) -> int:
         if len(self.load_queue) == 0:
             return -1
@@ -1063,6 +1083,7 @@ class HiCacheController:
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
         host_indices, device_indices, pool_transfers = self._move_op_indices(op)
+        self._register_shard_gather(producer_id, device_indices)
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()

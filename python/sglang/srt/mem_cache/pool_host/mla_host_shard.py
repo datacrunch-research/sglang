@@ -18,9 +18,13 @@ for an owner-major plan built on the CPU from the host slots (no device sync):
 
 - backup (device -> host): each rank copies only the pages it owns;
 - load-back (host -> device): each rank copies its own pages to their device
-  rows, then one all-gather per layer over a dedicated NCCL communicator (on the
-  host-to-device stream, before the layer's done event) writes the other ranks'
-  pages into the device rows of every rank.
+  rows on the host-to-device stream (copies only, as stock HiCache). The other
+  ranks' pages are filled by one all-gather per layer over a dedicated NCCL
+  communicator, run on the forward stream when the consuming batch starts
+  (``LayerDoneCounter.set_consumer``), after the whole load has landed. A
+  collective on a side stream would deadlock against kernels that grid-sync
+  across ranks (MegaMoE): they occupy every SM while waiting for peers whose
+  side-stream collective cannot get SMs.
 
 Every rank's block is padded to the largest owner's page count with page 0
 (host local page 0 and device page 0, which no allocator hands out), so all
@@ -77,6 +81,7 @@ class MLAHostShardPoolMixin:
         self.host_shard_size = host_shard.size
         self._gather_send = None
         self._gather_recv = None
+        self._pending_gathers: dict = {}
         super().__init__(*args, **kwargs)
         assert self.dcp_size == 1, "MLA host sharding does not compose with DCP"
         assert self.layout in _SUPPORTED_LAYOUTS, (
@@ -192,14 +197,33 @@ class MLAHostShardPoolMixin:
     ) -> None:
         if host_indices.numel() == 0:
             return
-        mine = self._my_block(device_indices)
         self.load_to_device_per_layer(
-            device_pool, host_indices, mine, layer_id, io_backend, is_draft=is_draft
+            device_pool,
+            host_indices,
+            self._my_block(device_indices),
+            layer_id,
+            io_backend,
+            is_draft=is_draft,
         )
-        if is_draft or layer_id not in self._target_layer_indices:
+
+    def register_pending_gather(self, producer_index: int, device_all: torch.Tensor):
+        """Record the device rows a load submitted under ``producer_index``
+        must fill from peers; replaces any unconsumed plan of that slot."""
+        self._pending_gathers[producer_index] = device_all
+
+    def run_pending_gather(self, consumer_index: int, finish_event) -> None:
+        """On the forward stream, before the consuming batch: wait for the
+        load, then fill the other ranks' pages layer by layer."""
+        device_all = self._pending_gathers.pop(consumer_index, None)
+        if device_all is None or device_all.numel() == 0:
             return
-        buf = self.device_kv_buffers[self._buffer_index_by_layer[layer_id]]
-        self._gather_layer(buf, mine, device_indices)
+        stream = torch.cuda.current_stream()
+        stream.wait_event(finish_event)
+        device_all.record_stream(stream)
+        mine = self._my_block(device_all)
+        for layer_id in self._target_layer_indices:
+            buf = self.device_kv_buffers[self._buffer_index_by_layer[layer_id]]
+            self._gather_layer(buf, mine, device_all)
 
     def _gather_buffers(self, buf: torch.Tensor, rows: int):
         n_ranks = self.host_shard_size
