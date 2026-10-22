@@ -50,6 +50,7 @@ from sglang.srt.layers.layer_boundary import (
     append_stages,
     declare_attn,
     declare_ffn,
+    is_dense_ffn_fully_dp,
 )
 from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -290,7 +291,11 @@ def _dense_mlp_parallel_group() -> str:
     attention-TP replica.  The GPU K3 refactor instead gathers all DP rows
     and shards this one dense layer over the full TP group.  Keep the GPU
     default, but allow the NPU launcher to retain the proven attention-TP
-    layout without a device-type branch in shared model code."""
+    layout without a device-type branch in shared model code.
+    --moe-dense-tp-size 1 replicates it, as the scheduler assumes when it
+    stops sharing DP token counts (require_mlp_tp_gather)."""
+    if is_dense_ffn_fully_dp():
+        return "replicated"
     return (
         "attn_tp"
         if get_parallel().enable_dense_mlp_attn_tp and is_dp_attention_enabled()

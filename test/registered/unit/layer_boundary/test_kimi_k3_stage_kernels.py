@@ -21,7 +21,9 @@ from sglang.srt.layers.layer_boundary.residual.attn_bank import (
     AttnBankOutputRead,
 )
 from sglang.srt.models import kimi_k3
+from sglang.test.boundary_fixtures import parallel_of
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -224,6 +226,35 @@ class TestKimiK3BankOnShards(CustomTestCase):
                 self.assertEqual(
                     kimi_k3._carries_bank_slices(config, sp_collective=True), carries
                 )
+
+
+class TestKimiK3DenseLayer(CustomTestCase):
+    def test_dense_tp_size_one_runs_the_dense_layer_on_local_rows(self):
+        """With --moe-dense-tp-size 1 each DP rank may keep only its own token
+        count, so the dense layer must not gather DP rows over TP: a TP-sharded
+        dense layer sized that gather from local counts and hung."""
+        config = SimpleNamespace(**{**vars(CONFIG), "attn_res_block_size": None})
+        for dense_tp_size, group, width in ((1, "replicated", 1), (None, "tp", 4)):
+            parallel = parallel_of(
+                attn_dp=2,
+                attn_tp=2,
+                moe_dense_tp_size=dense_tp_size,
+                enable_dense_mlp_attn_tp=False,
+            )
+            with (
+                self.subTest(moe_dense_tp_size=dense_tp_size),
+                patch_communicator("get_parallel", lambda: parallel),
+                patch.object(kimi_k3, "get_parallel", lambda: parallel),
+                patch.object(kimi_k3, "is_dp_attention_enabled", return_value=True),
+                patch.object(
+                    kimi_k3,
+                    "resolve_linear_parallel_group",
+                    lambda name: (0, {"replicated": 1, "tp": 4}[name]),
+                ),
+            ):
+                self.assertEqual(kimi_k3._dense_mlp_parallel_group(), group)
+                _, ffn = kimi_k3._stage_facts(config, 0, sp_collective=False)
+                self.assertEqual(ffn.dense_tp_size, width)
 
 
 if __name__ == "__main__":
