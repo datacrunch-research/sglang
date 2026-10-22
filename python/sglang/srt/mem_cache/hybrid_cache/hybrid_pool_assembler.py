@@ -33,6 +33,10 @@ from sglang.srt.mem_cache.pool_host.mha import (
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mla_host_shard import (
+    make_mla_host_shard,
+    mla_host_shard_pool_cls,
+)
 from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -216,6 +220,14 @@ def build_kv_host_pool(
         )
         kwargs["dcp_size"] = parallel.attn_dcp_size
         kwargs["dcp_rank"] = parallel.attn_dcp_rank
+    if use_mla and pool_label == "kv":
+        host_shard = make_mla_host_shard(
+            storage_backend=get_memory().hicache_storage_backend,
+            layout=get_memory().hicache_mem_layout,
+        )
+        if host_shard is not None:
+            kv_host_pool_cls = mla_host_shard_pool_cls(kv_host_pool_cls)
+            kwargs["host_shard"] = host_shard
     return kv_host_pool_cls(
         host_input,
         get_memory().hicache_ratio,

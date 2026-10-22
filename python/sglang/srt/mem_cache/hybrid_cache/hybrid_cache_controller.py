@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mla_host_shard import MLAHostShardPoolMixin
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 
@@ -1491,6 +1492,12 @@ class HybridCacheController(BaseHiCacheController):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if uses_shared_host_layout(host_pool):
             return host_indices, device_indices
+        if isinstance(host_pool, MLAHostShardPoolMixin):
+            # Striped MLA host tier: this rank's host rows, all ranks' device rows.
+            host_indices, device_indices = host_pool.host_shard_plan(
+                host_indices=host_indices, device_indices=device_indices
+            )
+            return self.move_indices(host_indices, device_indices)
         if write_back_jit and host_pool.can_use_write_back_jit:
             if host_indices.is_cuda:
                 host_indices = host_indices.cpu()
