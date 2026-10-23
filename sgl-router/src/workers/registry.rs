@@ -34,6 +34,7 @@ pub enum AddWorkerError {
 
 #[derive(Debug, Default)]
 pub struct WorkerRegistry {
+    active_health_required: std::sync::atomic::AtomicBool,
     by_id: DashMap<WorkerId, Arc<Worker>>,
     by_model: DashMap<ModelId, HashSet<WorkerId>>,
     /// Serializes the validate→insert section of `add_with_cb` so the
@@ -80,6 +81,15 @@ impl WorkerRegistry {
     /// in `KvEventIndex` / `RouterInflightLoadRegistry` if so). Doing that
     /// cleanup here would leak orphan state into those sidecars when
     /// a caller actually wanted to keep the prior entry.
+    /// Enable startup exclusion before discovery admits the first endpoint.
+    pub fn require_active_health(&self) {
+        self.active_health_required
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        for worker in self.all() {
+            worker.set_active_healthy(false);
+        }
+    }
+
     pub fn add_with_cb(
         &self,
         spec: WorkerSpec,
@@ -124,6 +134,12 @@ impl WorkerRegistry {
             }
         }
         let mut w = Worker::with_cb_config(spec, cb, profile);
+        if self
+            .active_health_required
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            w.set_active_healthy(false);
+        }
         // An upsert (e.g. bootstrap repair racing the grace expiry) must not reset
         // live state or extend the bootstrap-port grace.
         if let Some(prev) = self.by_id.get(&w.id) {
@@ -184,7 +200,7 @@ impl WorkerRegistry {
         self.workers_for(model)
             .into_iter()
             .filter(|w| !w.awaiting_bootstrap_port())
-            .filter(|w| w.breaker.would_allow())
+            .filter(|w| w.is_healthy())
             .collect()
     }
 

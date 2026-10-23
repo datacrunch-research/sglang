@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{BlockSizeOracle, CacheNamespace, HashTree};
+use crate::policies::cache_aware::{cap_matched_prefix_blocks, estimate_matched_prefix_tokens};
 use sgl_kv_indexer::{PrefixMatch, PrefixOutcome};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -10,6 +11,7 @@ use std::sync::Arc;
 /// consumed by cache-aware routing.
 pub struct PrefixLookupResult {
     pub outcome: PrefixOutcome,
+    /// Remote query length; for local mixed pages this is only the largest native query.
     pub query_blocks: usize,
     /// Workers whose reported depth came from a pending stake rather than
     /// from KV events (empty when the confirmed tree decided the lookup).
@@ -18,6 +20,35 @@ pub struct PrefixLookupResult {
     /// The query's block hashes when the local tree answered, so routing can
     /// record the placement without rehashing.
     pub block_hashes: Option<Arc<[i64]>>,
+    /// Native query units and optional pending placement hashes, keyed by worker URL.
+    pub local_queries: BTreeMap<String, LocalPrefixQuery>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LocalPrefixQuery {
+    block_size: u32,
+    query_blocks: usize,
+    hashes: Option<Arc<[i64]>>,
+}
+
+impl PrefixLookupResult {
+    pub fn matched_blocks(&self, url: &str, blocks: u32) -> u32 {
+        let limit = self
+            .local_queries
+            .get(url)
+            .map_or(self.query_blocks, |query| query.query_blocks);
+        cap_matched_prefix_blocks(limit, blocks)
+    }
+
+    pub fn matched_tokens(&self, input: u64, url: &str, blocks: u32) -> u64 {
+        let blocks = u64::from(self.matched_blocks(url, blocks));
+        match self.local_queries.get(url) {
+            Some(query) => blocks
+                .saturating_mul(u64::from(query.block_size))
+                .min(input),
+            None => estimate_matched_prefix_tokens(input, self.query_blocks, blocks as u32),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -57,6 +88,28 @@ impl RadixTreePrefixProvider {
         tokens: &[u32],
         namespace: &CacheNamespace,
     ) -> Option<PrefixLookupResult> {
+        self.match_tokens(tokens, namespace, true)
+    }
+
+    /// The KV-event tree alone: no pending stake is consulted or written.
+    pub fn match_confirmed_tokens(
+        &self,
+        tokens: &[u32],
+        namespace: &CacheNamespace,
+    ) -> Option<PrefixLookupResult> {
+        self.match_tokens(tokens, namespace, false)
+    }
+
+    fn match_tokens(
+        &self,
+        tokens: &[u32],
+        namespace: &CacheNamespace,
+        include_pending: bool,
+    ) -> Option<PrefixLookupResult> {
+        let configs = self.block_size_oracle.worker_configs();
+        if !configs.is_empty() {
+            return self.match_worker_configs(tokens, namespace, configs, include_pending);
+        }
         let hashes = self.block_hashes(tokens, namespace)?;
 
         let mut depth_by_url = BTreeMap::<String, u32>::new();
@@ -67,20 +120,10 @@ impl RadixTreePrefixProvider {
         let confirmed_by_url = depth_by_url.clone();
         // Stakes at their follower cap are already filtered out by
         // `PendingPrefixes::depths`.
-        let (consult_pending, merge_pending) = match self.pending_consult_below {
-            // Original behavior: walk the pending store on every request and
-            // merge its depths with the confirmed ones by maximum.
-            None => (self.tree.pending().is_enabled(), true),
-            // Confirmed-first: pay for the pending tier only when the confirmed
-            // tree has not already placed this prompt (a first turn, or a turn
-            // racing its predecessor's KV events), and let a stake count only
-            // where it is strictly deeper than the best confirmed match, so a
-            // real match that is at least as good always decides.
-            Some(below) => {
-                let covered = confirmed.unwrap_or(0) as f64 / hashes.len() as f64;
-                (self.tree.pending().is_enabled() && covered < below, false)
-            }
-        };
+        let (consult_pending, merge_pending) = self.pending_mode(
+            include_pending,
+            confirmed.unwrap_or(0) as f64 / hashes.len() as f64,
+        );
         let pending = if consult_pending {
             self.tree.pending().depths(&hashes)
         } else {
@@ -126,14 +169,38 @@ impl RadixTreePrefixProvider {
             query_blocks: hashes.len(),
             pending_winners,
             block_hashes: consult_pending.then(|| hashes.into()),
+            local_queries: BTreeMap::new(),
         })
+    }
+
+    /// Whether to walk the pending store, and whether its depths merge by
+    /// maximum (`true`) or only where strictly deeper than the best confirmed
+    /// match (`false`), given the confirmed match's share of the prompt.
+    fn pending_mode(&self, include_pending: bool, covered: f64) -> (bool, bool) {
+        let enabled = include_pending && self.tree.pending().is_enabled();
+        match self.pending_consult_below {
+            // Original behavior: walk the pending store on every request and
+            // merge its depths with the confirmed ones by maximum.
+            None => (enabled, true),
+            // Confirmed-first: pay for the pending tier only when the confirmed
+            // tree has not already placed this prompt (a first turn, or a turn
+            // racing its predecessor's KV events), and let a stake count only
+            // where it is strictly deeper than the best confirmed match, so a
+            // real match that is at least as good always decides.
+            Some(below) => (enabled && covered < below, false),
+        }
     }
 
     /// Remember that `signal`'s prompt was just routed to `url`. When the
     /// placement followed `url`'s pending stake, charge that stake a follower
     /// first, so the cap sees every request the stake attracted.
     pub fn record_route(&self, signal: &PrefixLookupResult, url: &str) {
-        if let Some(hashes) = &signal.block_hashes {
+        let hashes = signal
+            .local_queries
+            .get(url)
+            .and_then(|query| query.hashes.as_ref())
+            .or(signal.block_hashes.as_ref());
+        if let Some(hashes) = hashes {
             if signal.pending_winners.iter().any(|w| w == url) {
                 self.tree.pending().record_follow(url, hashes);
             }
@@ -148,7 +215,15 @@ impl RadixTreePrefixProvider {
         namespace: &CacheNamespace,
         worker_url: &str,
     ) -> Vec<(u32, usize)> {
-        let Some(hashes) = self.block_hashes(tokens, namespace) else {
+        let configs = self.block_size_oracle.worker_configs();
+        let hashes = if configs.is_empty() {
+            self.block_hashes(tokens, namespace)
+        } else {
+            configs
+                .get(worker_url)
+                .map(|&(size, bigram)| full_block_hashes(tokens, namespace, size, bigram))
+        };
+        let Some(hashes) = hashes else {
             return Vec::new();
         };
         self.tree
@@ -157,6 +232,108 @@ impl RadixTreePrefixProvider {
             .filter(|(worker, _)| worker.url == worker_url)
             .map(|(worker, depth)| (worker.dp_rank, depth))
             .collect()
+    }
+
+    /// Mixed native page sizes: each worker group is queried in its own block
+    /// units, and depths are compared across groups in tokens.
+    fn match_worker_configs(
+        &self,
+        tokens: &[u32],
+        namespace: &CacheNamespace,
+        configs: BTreeMap<String, (u32, bool)>,
+        include_pending: bool,
+    ) -> Option<PrefixLookupResult> {
+        let mut groups = BTreeMap::<(u32, bool), Vec<String>>::new();
+        for (url, config) in configs {
+            groups.entry(config).or_default().push(url);
+        }
+        let groups: Vec<_> = groups
+            .into_iter()
+            .map(|((size, bigram), urls)| {
+                let hashes = full_block_hashes(tokens, namespace, size, bigram);
+                (size, urls, hashes)
+            })
+            .collect();
+        let query_blocks = groups.iter().map(|(_, _, h)| h.len()).max().unwrap_or(0);
+        if query_blocks == 0 {
+            return None;
+        }
+        let query_tokens = groups
+            .iter()
+            .map(|(size, _, h)| (h.len() as u64).saturating_mul(u64::from(*size)))
+            .max()
+            .unwrap_or(0)
+            .max(1);
+
+        let mut depths = BTreeMap::new();
+        let mut confirmed_tokens = 0u64;
+        for (size, urls, hashes) in &groups {
+            for (worker, depth) in self.tree.prefix_depths(None, hashes) {
+                if urls.contains(&worker.url) {
+                    confirmed_tokens =
+                        confirmed_tokens.max((depth as u64).saturating_mul(u64::from(*size)));
+                    merge_depth(&mut depths, worker.url, depth);
+                }
+            }
+        }
+        let confirmed_by_url = depths.clone();
+        let (consult_pending, merge_pending) = self.pending_mode(
+            include_pending,
+            confirmed_tokens as f64 / query_tokens as f64,
+        );
+
+        let mut pending_tokens = 0u64;
+        let mut local_queries = BTreeMap::new();
+        for (size, urls, hashes) in groups {
+            if consult_pending {
+                for (url, depth) in self.tree.pending().depths(&hashes) {
+                    let staked = (depth as u64).saturating_mul(u64::from(size));
+                    if urls.iter().any(|worker| worker == url.as_ref())
+                        && (merge_pending || staked > confirmed_tokens)
+                    {
+                        pending_tokens = pending_tokens.max(staked);
+                        merge_depth(&mut depths, url.to_string(), depth);
+                    }
+                }
+            }
+            let query = LocalPrefixQuery {
+                block_size: size,
+                query_blocks: hashes.len(),
+                hashes: consult_pending.then(|| Arc::<[i64]>::from(hashes)),
+            };
+            for url in urls {
+                local_queries.insert(url, query.clone());
+            }
+        }
+        if pending_tokens > confirmed_tokens {
+            self.tree.pending().record_hit();
+        }
+        let pending_winners: Vec<String> = depths
+            .iter()
+            .filter(|(url, depth)| confirmed_by_url.get(*url) < Some(depth))
+            .map(|(url, _)| url.clone())
+            .collect();
+        let outcome = match depths.values().copied().max() {
+            None => PrefixOutcome::Empty,
+            Some(best_prefix_blocks) => PrefixOutcome::Matched {
+                matches: depths
+                    .into_iter()
+                    .map(|(address, matched_prefix_blocks)| PrefixMatch {
+                        worker_id: address.clone(),
+                        address,
+                        matched_prefix_blocks,
+                    })
+                    .collect(),
+                best_prefix_blocks,
+            },
+        };
+        Some(PrefixLookupResult {
+            outcome,
+            query_blocks,
+            pending_winners,
+            block_hashes: None,
+            local_queries,
+        })
     }
 
     fn block_hashes(&self, tokens: &[u32], namespace: &CacheNamespace) -> Option<Vec<i64>> {
@@ -171,6 +348,20 @@ fn merge_depth(depth_by_url: &mut BTreeMap<String, u32>, url: String, depth: usi
         .entry(url)
         .and_modify(|current| *current = (*current).max(depth))
         .or_insert(depth);
+}
+
+fn full_block_hashes(
+    tokens: &[u32],
+    namespace: &CacheNamespace,
+    size: u32,
+    bigram: bool,
+) -> Vec<i64> {
+    let logical = tokens.len().saturating_sub(usize::from(bigram));
+    let full = logical / size as usize * size as usize;
+    if full == 0 {
+        return Vec::new();
+    }
+    namespace.block_hashes(&tokens[..full + usize::from(bigram)], size as usize, bigram)
 }
 
 #[cfg(test)]
@@ -412,5 +603,75 @@ mod tests {
         }
         assert_eq!(provider.tree.pending().followed(), 0);
         assert_eq!(provider.tree.pending().capped(), 0);
+    }
+
+    /// Mixed native page sizes in confirmed-first mode: the coverage gate and
+    /// the strictly-deeper rule compare tokens, since block counts of
+    /// different page sizes are not comparable.
+    #[test]
+    fn mixed_pages_confirmed_first_compares_tokens() {
+        let mixed = |below: f64| {
+            let tree = Arc::new(HashTree::new());
+            let oracle = BlockSizeOracle::new();
+            oracle.register_worker("http://small", 2, false).unwrap();
+            oracle.register_worker("http://large", 4, false).unwrap();
+            tree.pending().enable(Duration::from_secs(60));
+            RadixTreePrefixProvider::new(tree, oracle).with_pending_consult_below(below)
+        };
+        let ns = CacheNamespace::default();
+        let prompt: Vec<u32> = (1..=16).collect();
+        let small_hashes = full_block_hashes(&prompt, &ns, 2, false);
+        let large_hashes = full_block_hashes(&prompt, &ns, 4, false);
+        let confirm_small = |provider: &RadixTreePrefixProvider, blocks: usize| {
+            provider.tree.insert(
+                &KvWorkerId::new("http://small".into(), 0),
+                None,
+                &small_hashes[..blocks],
+            );
+        };
+        // A cold lookup of the first `tokens` tokens, routed to large: large's stake.
+        let stake_large = |provider: &RadixTreePrefixProvider, tokens: usize| {
+            let probe = provider
+                .match_request_tokens(&prompt[..tokens], &ns)
+                .unwrap();
+            provider.record_route(&probe, "http://large");
+        };
+
+        // large stakes 2 blocks of 4 (8 tokens); small holds 3 blocks of 2 (6 tokens).
+        let provider = mixed(1.0);
+        stake_large(&provider, 8);
+        confirm_small(&provider, 3);
+        let signal = provider.match_request_tokens(&prompt, &ns).unwrap();
+        // 2 blocks are fewer than 3, but 8 tokens are more than 6: the stake counts.
+        assert_eq!(
+            depths(&signal),
+            [("http://large".into(), 2), ("http://small".into(), 3)]
+        );
+        assert_eq!(signal.pending_winners, vec!["http://large".to_string()]);
+        assert_eq!(provider.tree.pending().hits(), 1);
+        assert_eq!(signal.matched_tokens(16, "http://large", 2), 8);
+        assert_eq!(signal.matched_tokens(16, "http://small", 3), 6);
+        // The confirmed-only lookup ignores the stake.
+        let confirmed = provider.match_confirmed_tokens(&prompt, &ns).unwrap();
+        assert_eq!(depths(&confirmed), [("http://small".into(), 3)]);
+        assert!(confirmed.pending_winners.is_empty());
+
+        // An equal-token stake (1 block of 4 against 2 blocks of 2) does not count.
+        let provider = mixed(1.0);
+        stake_large(&provider, 4);
+        confirm_small(&provider, 2);
+        let signal = provider.match_request_tokens(&prompt, &ns).unwrap();
+        assert_eq!(depths(&signal), [("http://small".into(), 2)]);
+        assert!(signal.pending_winners.is_empty());
+        assert_eq!(provider.tree.pending().hits(), 0);
+
+        // 10 of 16 tokens confirmed is past a 0.5 gate: no walk and no stake written.
+        let provider = mixed(0.5);
+        confirm_small(&provider, 5);
+        let warm = provider.match_request_tokens(&prompt, &ns).unwrap();
+        assert!(warm.local_queries.values().all(|q| q.hashes.is_none()));
+        provider.record_route(&warm, "http://large");
+        assert!(provider.tree.pending().depths(&large_hashes).is_empty());
+        assert_eq!(provider.tree.pending().hits(), 0);
     }
 }

@@ -213,6 +213,33 @@ impl HashTree {
         (workers, nodes, aliases)
     }
 
+    /// At most 256 nodes with 16 carriers each, without allocating a full snapshot.
+    /// Busy shards are skipped rather than making diagnostics wait on event ingestion.
+    pub fn debug_nodes(&self, limit: usize) -> serde_json::Value {
+        let limit = limit.clamp(1, 256);
+        let mut nodes = Vec::with_capacity(limit);
+        let mut truncated = false;
+        let mut busy = 0;
+        for (shard_id, shard) in self.shards.iter().enumerate() {
+            let Some(state) = shard.try_read() else {
+                busy += 1;
+                continue;
+            };
+            for (&id, node) in state.nodes.iter().filter(|(id, _)| **id != ROOT_ID) {
+                if nodes.len() == limit {
+                    truncated = true;
+                    break;
+                }
+                let workers:Vec<_>=node.workers.iter().take(16).map(|(w,t)|serde_json::json!({"url":w.url,"dp_rank":w.dp_rank,"tiers":t.bits()})).collect();
+                nodes.push(serde_json::json!({"shard":shard_id,"id":id.to_string(),"parent":node.parent.map(|p|p.to_string()),"block_hash":node.block_hash.to_string(),"workers":workers,"workers_truncated":node.workers.len()>16}));
+            }
+            if truncated {
+                break;
+            }
+        }
+        serde_json::json!({"maintained":true,"limit":limit,"nodes":nodes,"truncated":truncated,"busy_shards":busy})
+    }
+
     /// Export every node as a flat, parent-linked list that
     /// [`HashTree::restore_snapshot`] can rebuild an identical tree from.
     ///
@@ -1039,5 +1066,33 @@ mod tests {
         assert_eq!(rec.block_hash, 7);
         assert_eq!(rec.workers, vec![0]);
         assert!(rec.tiers.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::*;
+    #[test]
+    fn debug_dump_bounds_nodes_carriers_and_skips_busy_shards() {
+        let tree = HashTree::new();
+        for i in 0..300 {
+            tree.insert(&KvWorkerId::new("http://worker".into(), 0), None, &[i]);
+        }
+        for rank in 1..40 {
+            tree.insert(&KvWorkerId::new("http://worker".into(), rank), None, &[0]);
+        }
+        for (requested, expected) in [(7, 7), (usize::MAX, 256)] {
+            let dump = tree.debug_nodes(requested);
+            let nodes = dump["nodes"].as_array().unwrap();
+            assert_eq!(nodes.len(), expected);
+            assert_eq!(dump["truncated"], true);
+            assert!(nodes
+                .iter()
+                .all(|n| n["workers"].as_array().unwrap().len() <= 16));
+        }
+        let _locks: Vec<_> = tree.shards.iter().map(|s| s.write()).collect();
+        let dump = tree.debug_nodes(7);
+        assert_eq!(dump["busy_shards"], N_SHARDS);
+        assert!(dump["nodes"].as_array().unwrap().is_empty());
     }
 }

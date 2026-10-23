@@ -51,10 +51,13 @@ impl ChatRouting {
 
 pub struct AppContext {
     pub config: Config,
+    pub active_health: Option<Arc<crate::health::active::ActiveHealth>>,
+    pub admission: crate::server::admission::Admission,
     pub tokenizers: Arc<TokenizerRegistry>,
     pub proxy: Arc<Proxy>,
     pub registry: Arc<WorkerRegistry>,
     pub policies: Arc<PolicyRegistry>,
+    pub decode_policy: Box<dyn crate::policies::decode::DecodePolicy>,
     /// Converts static Bucket configuration into request candidate domains.
     pub bucket_selector: Arc<BucketSelector>,
     /// Select legacy policies or model-specific bucket-first routing.
@@ -98,19 +101,23 @@ impl AppContext {
         registry: Arc<WorkerRegistry>,
         policies: Arc<PolicyRegistry>,
     ) -> Self {
+        let router_inflight_load = RouterInflightLoadRegistry::new(
+            Arc::new(crate::state::load_monitor::router_inflight_load::SystemTimeClock),
+            std::time::Duration::from_secs(config.router_inflight_load.stale_request_timeout_secs),
+        );
         Self::with_router_inflight_load(
             config,
             tokenizers,
             proxy,
             registry,
             policies,
-            RouterInflightLoadRegistry::with_defaults(),
+            router_inflight_load,
         )
     }
 
     /// Construct an [`AppContext`] with an explicit [`RouterInflightLoadRegistry`].
-    /// Production wires the default (5-minute timeout, SystemTimeClock)
-    /// via [`Self::new`]; tests that exercise the janitor pass a registry
+    /// [`Self::new`] uses the configured budget and a system clock;
+    /// tests that exercise the janitor pass a registry
     /// built with a `MockClock`.
     pub fn with_router_inflight_load(
         config: Config,
@@ -131,12 +138,17 @@ impl AppContext {
         policies.attach_metrics(Arc::clone(&metrics));
         let bucket_selector = Arc::new(BucketSelector::new(config.model.bucket_config.clone()));
         let decode_gate = DecodeGate::new(config.proxy.decode_dispatch_limit);
+        let decode_policy =
+            crate::policies::decode::build_decode_policy(config.model.decode_policy);
         Self {
+            active_health: None,
+            admission: crate::server::admission::Admission::new(&config.server.admission),
             config,
             tokenizers,
             proxy,
             registry,
             policies,
+            decode_policy,
             bucket_selector,
             chat_routing: ChatRouting::Legacy,
             router_inflight_load,
@@ -205,6 +217,9 @@ impl AppContext {
     #[cfg(test)]
     pub fn stub() -> Self {
         Self {
+            active_health: None,
+            admission: crate::server::admission::Admission::default(),
+            decode_policy: crate::policies::decode::build_decode_policy(Default::default()),
             config: Config {
                 server: crate::config::ServerConfig {
                     host: "x".into(),
@@ -235,6 +250,7 @@ impl AppContext {
                 },
                 discovery: crate::config::DiscoveryBackend::StaticUrls(
                     crate::config::StaticUrlsDiscoveryConfig {
+                        roles: Default::default(),
                         urls: vec!["http://placeholder:0".into()],
                     },
                 ),

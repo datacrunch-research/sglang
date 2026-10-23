@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 #[tokio::test]
 async fn emits_one_added_per_url_with_plain_seed() {
     let cfg = StaticUrlsDiscoveryConfig {
+        roles: Default::default(),
         urls: vec!["http://x:30000".into(), "http://y:30000".into()],
     };
     let (tx, mut rx) = mpsc::channel(16);
@@ -55,6 +56,7 @@ async fn emits_one_added_per_url_with_plain_seed() {
 #[tokio::test]
 async fn emits_one_event_and_parks_until_receiver_dropped() {
     let cfg = StaticUrlsDiscoveryConfig {
+        roles: Default::default(),
         urls: vec!["http://x:30000".into()],
     };
     let (tx, mut rx) = mpsc::channel(16);
@@ -150,6 +152,7 @@ async fn static_urls_pd_role_resolved_end_to_end() {
             default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+            roles: Default::default(),
             urls: vec![url.clone()],
         }),
         proxy: ProxyConfig::default(),

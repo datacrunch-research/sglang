@@ -565,6 +565,16 @@ async fn register_one(
             spec.bootstrap_port = new_port;
         }
     }
+    let explicit_role = cfg.as_ref().and_then(|config| match &config.discovery {
+        crate::config::DiscoveryBackend::StaticUrls(workers) => {
+            workers.roles.get(&worker_url).copied()
+        }
+        _ => None,
+    });
+    if let Some((mode, port)) = explicit_role {
+        spec.mode = mode;
+        spec.bootstrap_port = port;
+    }
     // `--decode-dispatch-limit` sends a request to decode only once earlier
     // KV has arrived, and a default prefill engine computes only once decode
     // has bootstrapped, so the two would wait on each other: at most N
@@ -689,6 +699,7 @@ mod tests {
                 default_chat_template_kwargs: Default::default(),
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+                roles: Default::default(),
                 urls: vec!["http://test:30000".into()],
             }),
             proxy: ProxyConfig::default(),

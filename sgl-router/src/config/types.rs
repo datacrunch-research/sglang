@@ -1,5 +1,5 @@
 use crate::config::sampling::SamplingOverrides;
-use reqwest::header::HeaderValue;
+use reqwest::header::{HeaderName, HeaderValue};
 use serde::Deserialize;
 use std::num::NonZeroU32;
 
@@ -54,14 +54,14 @@ impl ProxyConfig {
 }
 
 pub fn default_proxy_request_timeout_secs() -> u64 {
-    300
+    1800
 }
 
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             request_timeout_secs: default_proxy_request_timeout_secs(),
-            stream_idle_timeout_secs: 180,
+            stream_idle_timeout_secs: default_proxy_request_timeout_secs(),
             max_attempts: NonZeroU32::MIN,
             initial_backoff_ms: 50,
             max_backoff_ms: 2000,
@@ -71,7 +71,7 @@ impl Default for ProxyConfig {
     }
 }
 
-/// Request-tracking timeout; defaults above the proxy timeout.
+/// Request-tracking timeout; defaults to the proxy request budget.
 #[derive(Debug, Clone, Copy)]
 pub struct InflightLoadConfig {
     /// Maximum request-entry lifetime before cancellation with 504 `stale_request_expired`.
@@ -79,7 +79,7 @@ pub struct InflightLoadConfig {
 }
 
 pub fn default_stale_request_timeout_secs() -> u64 {
-    600
+    default_proxy_request_timeout_secs()
 }
 
 impl Default for InflightLoadConfig {
@@ -151,6 +151,8 @@ pub enum PolicyKind {
 /// Policy used to select decode workers for PD requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum DecodePolicyKind {
+    #[value(name = "round_robin")]
+    RoundRobin,
     #[default]
     #[value(name = "power_of_two")]
     PowerOfTwo,
@@ -312,6 +314,16 @@ pub struct ServerConfig {
     pub termination_grace_secs: Option<u64>,
     /// `Authorization` for the router's own requests to workers, from `--worker-api-key`.
     pub worker_auth: Option<HeaderValue>,
+    /// Additional client headers forwarded to workers.
+    pub forward_request_headers: Vec<HeaderName>,
+    /// Resolve an omitted served-model name from worker metadata before loading the tokenizer.
+    pub infer_model_from_workers: bool,
+    pub worker_startup_timeout_secs: u64,
+    pub admission: AdmissionConfig,
+    pub max_payload_size: usize,
+    pub prometheus_port: Option<u16>,
+    pub admin_port: Option<u16>,
+    pub health_check: HealthCheckConfig,
 }
 
 impl ServerConfig {
@@ -343,8 +355,52 @@ impl Default for ServerConfig {
             shutdown_drain_secs: default_shutdown_drain_secs(),
             termination_grace_secs: None,
             worker_auth: None,
+            forward_request_headers: Vec::new(),
+            infer_model_from_workers: false,
+            worker_startup_timeout_secs: 1800,
+            admission: AdmissionConfig::default(),
+            max_payload_size: 32 << 20,
+            prometheus_port: None,
+            admin_port: None,
+            health_check: HealthCheckConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum HealthCheckMode {
+    Generation,
+    #[default]
+    Http,
+    Off,
+}
+
+#[derive(Debug, Clone)]
+pub struct HealthCheckConfig {
+    pub mode: HealthCheckMode,
+    pub interval_secs: u64,
+    pub timeout_secs: u64,
+    pub failure_threshold: u32,
+    pub success_threshold: u32,
+}
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            mode: HealthCheckMode::Http,
+            interval_secs: 60,
+            timeout_secs: 5,
+            failure_threshold: 3,
+            success_threshold: 2,
+        }
+    }
+}
+
+/// Gateway-compatible refill credits plus a strict in-flight ceiling.
+#[derive(Debug, Clone, Default)]
+pub struct AdmissionConfig {
+    /// None disables admission limiting.
+    pub max_concurrent_requests: Option<usize>,
+    pub refill_per_second: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -786,6 +842,8 @@ impl DiscoveryBackend {
 #[derive(Debug, Clone)]
 pub struct StaticUrlsDiscoveryConfig {
     pub urls: Vec<String>,
+    /// Explicit static roles and bootstrap ports override worker self-discovery.
+    pub roles: std::collections::HashMap<String, (crate::discovery::WorkerMode, Option<u16>)>,
 }
 
 /// Kubernetes EndpointSlice discovery. Selectors classify slices; worker roles

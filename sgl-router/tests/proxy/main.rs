@@ -10,6 +10,7 @@
 
 mod common;
 
+mod admission;
 mod bucket_routing;
 mod cache_aware_input_ids;
 mod chat_routing;
@@ -24,11 +25,15 @@ mod h2c_forward;
 mod header_forwarding;
 mod inbound_h2c;
 mod messages_api;
+mod metrics_opt_in;
+mod observability;
 mod openai_generate;
 mod pd_bootstrap_injection;
 mod pd_pool_isolation;
 mod pd_protocol_binding;
 mod radix_tree_routing;
+mod recipe_health;
+mod recipe_launch;
 mod reorg_launch;
 mod rerank_routing;
 mod retry;

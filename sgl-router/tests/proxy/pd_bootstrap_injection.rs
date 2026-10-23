@@ -65,6 +65,7 @@ fn config() -> Config {
             default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+            roles: Default::default(),
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
@@ -73,7 +74,10 @@ fn config() -> Config {
 }
 
 fn build_ctx(specs: Vec<WorkerSpec>) -> Arc<AppContext> {
-    let cfg = config();
+    build_ctx_with_config(config(), specs)
+}
+
+fn build_ctx_with_config(cfg: Config, specs: Vec<WorkerSpec>) -> Arc<AppContext> {
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
     for s in specs {
@@ -82,6 +86,111 @@ fn build_ctx(specs: Vec<WorkerSpec>) -> Arc<AppContext> {
     let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
     Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
+}
+
+#[path = "../component/policies/zmq_helpers.rs"]
+mod kv_fixture_wire;
+
+#[tokio::test]
+async fn pd_fixture_consumes_all_three_kv_publishers_and_rotates_decode() {
+    use sgl_router::state::kv_events::{
+        compute_block_hashes, EventConfig, KvEventIndex, KvWorkerId,
+    };
+    use zeromq::SocketSend;
+
+    let workers = [
+        crate::common::mock_worker::MockWorker::start(vec![]).await,
+        crate::common::mock_worker::MockWorker::start(vec![]).await,
+        crate::common::mock_worker::MockWorker::start(vec![]).await,
+    ];
+    let mut cfg = config();
+    cfg.model.decode_policy = sgl_router::config::DecodePolicyKind::RoundRobin;
+    let specs = workers
+        .iter()
+        .enumerate()
+        .map(|(i, worker)| WorkerSpec {
+            id: WorkerId(worker.url.clone()),
+            url: worker.url.clone(),
+            mode: if i == 0 {
+                WorkerMode::Prefill
+            } else {
+                WorkerMode::Decode
+            },
+            bootstrap_port: (i == 0).then_some(30000),
+            model_ids: vec![ModelId("tiny".into())],
+            ..Default::default()
+        })
+        .collect();
+    let ctx = build_ctx_with_config(cfg, specs);
+    let index = KvEventIndex::new();
+    let mut publishers = Vec::new();
+    for (i, worker) in workers.iter().enumerate() {
+        let (publisher, port) = kv_fixture_wire::make_pub_bound().await;
+        index
+            .add_worker(
+                &worker.url,
+                Some(EventConfig {
+                    host: "127.0.0.1".into(),
+                    port_base: port,
+                    topic: String::new(),
+                    block_size: if i == 0 { 64 } else { 512 },
+                    dp_size: 1,
+                    load_port_base: None,
+                    load_topic: None,
+                    replay_port_base: None,
+                    is_bigram: false,
+                }),
+            )
+            .await;
+        publishers.push(publisher);
+    }
+    let tokens: Vec<u32> = (0..1024).collect();
+    let hashes: Vec<_> = [64, 512, 512]
+        .into_iter()
+        .map(|size| compute_block_hashes(&tokens, size))
+        .collect();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        for sequence in 1i64.. {
+            for (i, publisher) in publishers.iter_mut().enumerate() {
+                let size = if i == 0 { 64 } else { 512 };
+                let payload = kv_fixture_wire::encode_event_batch(
+                    0.0,
+                    vec![kv_fixture_wire::encode_block_stored_event(
+                        &hashes[i], None, &tokens, size,
+                    )],
+                    Some(0),
+                );
+                publisher
+                    .send(kv_fixture_wire::build_multipart(sequence, payload))
+                    .await
+                    .unwrap();
+            }
+            if workers.iter().enumerate().all(|(i, worker)| {
+                let matched = index.tree().match_prefix(None, &hashes[i]);
+                matched.matched_blocks == hashes[i].len()
+                    && matched.holds(&KvWorkerId::new(worker.url.clone(), 0))
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("mixed-page P/D workers must each have a functioning KV subscriber");
+    let app = build_router(ctx);
+    for _ in 0..2 {
+        assert_eq!(
+            app.clone().oneshot(chat_request()).await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+    for worker in &workers {
+        let body: Value = serde_json::from_slice(&worker.wait_for_request().await).unwrap();
+        assert_eq!(body["bootstrap_port"], 30000);
+    }
+    tokio::time::timeout(Duration::from_secs(2), index.shutdown())
+        .await
+        .unwrap();
 }
 
 fn chat_request() -> Request<Body> {
@@ -349,7 +458,7 @@ fn streaming_chat_request() -> Request<Body> {
 }
 
 #[tokio::test]
-async fn pd_mode_disconnect_aborts_decode_but_not_prefill() {
+async fn pd_mode_disconnect_aborts_decode_but_not_completed_prefill() {
     let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let decode = crate::common::mock_worker::MockWorker::start_slow_stream(
         vec!["data: a\n\n", "data: b\n\n", "data: c\n\n"],
@@ -400,3 +509,69 @@ async fn pd_mode_disconnect_aborts_decode_but_not_prefill() {
 }
 
 mod reliability;
+
+#[tokio::test]
+async fn pd_disconnect_aborts_both_outstanding_legs_before_and_after_headers() {
+    for before_headers in [true, false] {
+        let prefill =
+            crate::common::mock_worker::MockWorker::start_hanging(Duration::from_secs(30)).await;
+        let decode = if before_headers {
+            crate::common::mock_worker::MockWorker::start_hanging(Duration::from_secs(30)).await
+        } else {
+            crate::common::mock_worker::MockWorker::start_slow_stream(
+                vec!["data: first\n\n", "data: second\n\n", "data: [DONE]\n\n"],
+                Duration::from_millis(50),
+            )
+            .await
+        };
+        let ctx = build_ctx(vec![
+            WorkerSpec {
+                id: WorkerId("p1".into()),
+                url: prefill.url.clone(),
+                mode: WorkerMode::Prefill,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: Some(30000),
+                ..Default::default()
+            },
+            WorkerSpec {
+                id: WorkerId("d1".into()),
+                url: decode.url.clone(),
+                mode: WorkerMode::Decode,
+                model_ids: vec![ModelId("tiny".into())],
+                ..Default::default()
+            },
+        ]);
+        let task = tokio::spawn(build_router(Arc::clone(&ctx)).oneshot(streaming_chat_request()));
+        let p_body: Value = serde_json::from_slice(&prefill.wait_for_request().await).unwrap();
+        let d_body: Value = serde_json::from_slice(&decode.wait_for_request().await).unwrap();
+        assert_eq!(p_body["rid"], d_body["rid"]);
+        if before_headers {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        } else {
+            let response = task.await.unwrap().unwrap();
+            use futures::StreamExt;
+            let mut stream = response.into_body().into_data_stream();
+            assert!(stream.next().await.is_some());
+            drop(stream);
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !prefill.abort_log.lock().unwrap().is_empty()
+                    && !decode.abort_log.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("disconnect must abort every outstanding worker leg");
+        for worker in [&prefill, &decode] {
+            assert_eq!(
+                *worker.abort_log.lock().unwrap(),
+                vec![json!({"rid":p_body["rid"], "abort_all":false})]
+            );
+        }
+    }
+}

@@ -1,9 +1,11 @@
 pub mod cli;
 pub mod sampling;
 pub mod types;
+mod worker_model;
 pub use cli::Cli;
 pub use sampling::*;
 pub use types::*;
+pub use worker_model::resolve_worker_model;
 
 use anyhow::{anyhow, ensure, Result};
 
@@ -44,6 +46,19 @@ impl Config {
     /// Validate invariants not enforced by the CLI parser.
     pub(crate) fn validate(&self) -> Result<()> {
         ensure!(!self.model.id.is_empty(), "model id must be non-empty");
+        ensure!(
+            self.server.max_payload_size > 0,
+            "--max-payload-size must be positive"
+        );
+        let health = &self.server.health_check;
+        ensure!(
+            health.interval_secs > 0 && health.timeout_secs > 0,
+            "health check interval and timeout must be positive"
+        );
+        ensure!(
+            health.failure_threshold > 0 && health.success_threshold > 0,
+            "health check thresholds must be positive"
+        );
         // Policies that read the prompt are checked against the built routing at startup.
         ensure!(
             self.model.tokenizer_path.is_some() || self.model.bucket_config.is_none(),
@@ -276,6 +291,7 @@ mod tests {
                 default_chat_template_kwargs: Default::default(),
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+                roles: Default::default(),
                 urls: urls.iter().map(|s| s.to_string()).collect(),
             }),
             proxy: ProxyConfig::default(),

@@ -51,6 +51,22 @@ The Indexer replaces the Router-local radix tree as the native Cache-Aware
 signal. Query timeouts and local concurrency are bounded by the two Indexer
 options, which default to 100 ms and 32 respectively.
 
+### Worker KV page sizes
+
+The local radix tree subscribes to workers with different `page_size` values.
+Queries hash once per page-size and bigram configuration, then credit only
+workers in that group. Cache costs use each worker's native block size and
+count only complete query pages. DP-rank lookup and pending-prefix placement
+use the selected worker's hashing configuration too.
+
+`sgl_router_kv_worker_block_size{worker_url}` converts each worker's block
+counts to tokens. The fleet-wide `sgl_router_kv_block_size` is zero when page
+sizes differ; aggregate event-block counters cannot then be converted with a
+single multiplier. Remote indexer queries and peer snapshots still require
+one fleet-wide hashing configuration and are unavailable for mixed fleets.
+Tier pricing and recurrent-state checkpoint boundaries are separate from
+page-size matching.
+
 ### LoRA cache identity
 
 LoRA routing requires workers that publish `BlockStored.lora_name`. Requests
@@ -251,6 +267,12 @@ request's `--stale-request-timeout-secs` deadline, and none starts after it. Whe
 every eligible worker has failed, the client gets the last failure.
 `sgl_router_retries_total` counts the retried attempts.
 
+The request timeout defaults to 1800 seconds. Unless explicitly set,
+`--stream-idle-timeout-secs` and `--stale-request-timeout-secs` inherit that
+request timeout, including a caller's longer override. A long prefill or stream
+therefore does not encounter an independent, shorter default deadline. Explicit
+idle and lifetime budgets remain independent of the upstream header timeout.
+
 Each retry first waits out a jittered exponential backoff: a random delay in
 `[d/2, d]`, where `d` starts at `--retry-initial-backoff-ms` (default 50),
 doubles per retry, and is capped at `--retry-max-backoff-ms` (default 2000).
@@ -267,11 +289,31 @@ connections leave the pool after 3 s, under SGLang's default 5 s keep-alive.
 Each worker has a circuit breaker: after `--cb-threshold` (default 3)
 consecutive failures the worker is taken out of routing until a request already
 sent to it succeeds or, once `--cb-cool-down-secs` (default 30) has passed, a
-probe request does. Under `--worker-urls` it is the only thing that takes a
-dead or hung worker out of routing, since there is no active health check.
+probe request does. Active health checks independently exclude workers.
 `--disable-circuit-breaker` turns it off, for example when one worker serves a
-role and an open breaker would reject all of that role's requests; a worker
-that stops answering then keeps its share of traffic.
+role and an open breaker would reject all of that role's requests.
+
+### Health checks and readiness
+
+`--health-check-mode http` is the default: workers must pass `GET /health`.
+`generation` also requires a bounded one-token generation through a plain
+worker or a compatible prefill/decode pair. `off` disables active probes;
+worker discovery and the optional circuit breaker still apply. Generation
+checks must be enabled explicitly for deployments that require full-path proof.
+
+The interval, per-probe timeout, failure threshold and success threshold are
+configured by `--health-check-interval-secs`, `--health-check-timeout-secs`,
+`--health-failure-threshold` and `--health-success-threshold`. A failed cycle
+does not exclude a proven worker before its failure threshold. Adding or
+removing a worker preserves surviving workers' evidence and streaks; a new
+worker instance must qualify independently. Completed client generations,
+including usage-free streams and gRPC output, supply recent proof and avoid
+queuing another probe behind busy engines.
+
+`/health`, `/healthz` and `/liveness` report router liveness. `/readiness` and
+`/readyz` require completed startup, a usable worker or compatible role pair,
+and settled KV bootstrap; they reject traffic during shutdown drain. In an
+active health mode, the usable workers must have passed its configured checks.
 
 ### Engines with `--api-key`
 

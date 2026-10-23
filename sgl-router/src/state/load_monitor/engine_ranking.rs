@@ -194,18 +194,6 @@ impl<'a> CandidateLoads<'a> {
         }
     }
 
-    pub(crate) fn compare_decode_load_keys(
-        &self,
-        left: &LoadKey<'a>,
-        right: &LoadKey<'a>,
-    ) -> Ordering {
-        match (left.load, right.load) {
-            (Some(left_load), Some(right_load)) => compare_decode_load(left_load, right_load)
-                .then_with(|| left.local_active.cmp(&right.local_active)),
-            _ => left.local_active.cmp(&right.local_active),
-        }
-    }
-
     pub(crate) fn compare_prefill_engines(
         &self,
         left: &Arc<Worker>,

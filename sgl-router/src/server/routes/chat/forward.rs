@@ -36,7 +36,12 @@ use tokio_util::sync::CancellationToken;
 const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url");
 // SGLang's DP controller dispatches to this rank; it outranks `routed_dp_rank` in the body.
 const X_DATA_PARALLEL_RANK: HeaderName = HeaderName::from_static("x-data-parallel-rank");
-type LoadGuards = (LoadGuard, RouterInflightLoadGuard, Option<DpRankGuard>);
+type LoadGuards = (
+    LoadGuard,
+    RouterInflightLoadGuard,
+    Option<DpRankGuard>,
+    Option<Arc<crate::server::admission::RequestScope>>,
+);
 
 /// A plain worker, or a prefill worker paired with a decode worker for PD.
 pub(super) struct SelectedWorkers {
@@ -174,6 +179,11 @@ async fn dispatch<T: Transport>(
         decode,
         track_dispatch_timestamps,
     } = workers;
+    if let Some(scope) = &request.scope {
+        let mut proof = vec![Arc::clone(&prefill)];
+        proof.extend(decode.iter().cloned());
+        scope.life.bind_generation_workers(proof);
+    }
     let decode_url_header = decode
         .as_ref()
         .and_then(|worker| parse_decode_url_header(&worker.url));
@@ -226,6 +236,19 @@ async fn dispatch<T: Transport>(
     });
     let path = request.path;
     let engine_rid = request.engine_rid();
+    if let Some(scope) = &request.scope {
+        let mut candidates = ctx.registry.healthy_workers_for(&request.model);
+        candidates.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        let candidates=candidates.iter().filter(|w|w.mode()==prefill.mode()).take(64).map(|w|serde_json::json!({"worker_id":w.id.0,"url":w.url,"selected":w.id==prefill.id,"inflight":w.router_inflight_load(),"policy":ctx.config.model.policy.to_string()})).collect();
+        scope.life.route(
+            engine_rid.as_deref(),
+            &prefill.url,
+            pd.as_ref().map(|(d, _)| d.url.as_str()),
+            candidates,
+            request.streaming,
+            pd.as_ref().map(|(_, b)| b.room),
+        );
+    }
     let additions = Additions {
         rid: engine_rid.clone(),
         bootstrap: pd.as_ref().map(|(_, bootstrap)| DisaggregatedParams {
@@ -253,6 +276,7 @@ async fn dispatch<T: Transport>(
         worker_load_guard,
         active_request_guard,
         prefill_rank.map(|rank| prefill.dp_rank_guard(rank)),
+        request.scope.clone(),
     );
 
     // In PD mode, prefill runs independently and decode supplies the client response.
@@ -277,12 +301,19 @@ async fn dispatch<T: Transport>(
             // Counted from arrival, so decode selection sees requests waiting here.
             let decode_load = decode.load_guard();
             if let Some(slot) = &decode_slot {
-                let mut abort = ctx.proxy.abort_on_drop(
-                    &prefill.url,
-                    prefill.protocol(),
-                    &headers,
-                    engine_rid.as_deref(),
-                );
+                // With a request scope the detached prefill aborts itself once the scope is
+                // cancelled (client gone, or this request failed), which covers this wait too;
+                // the guard serves scope-less requests, so prefill gets one abort either way.
+                let mut abort = if request.scope.is_some() {
+                    crate::proxy::AbortOnDrop::default()
+                } else {
+                    ctx.proxy.abort_on_drop(
+                        &prefill.url,
+                        prefill.protocol(),
+                        &headers,
+                        engine_rid.as_deref(),
+                    )
+                };
                 admit_decode(
                     ctx,
                     request,
@@ -308,6 +339,7 @@ async fn dispatch<T: Transport>(
                     request_started_at.elapsed(),
                 ),
                 decode_rank.map(|rank| decode.dp_rank_guard(rank)),
+                request.scope.clone(),
             );
             let decode_leg = Leg::new(
                 dp_aware,
@@ -342,10 +374,11 @@ async fn dispatch<T: Transport>(
         stream_abort,
         decode_slot,
     );
+    let wait_for_prefill = ctx.config.proxy.stream_after_prefill || request.wait_for_prefill;
     let dispatch = async {
         match prefill_task {
             Some((task, prefill)) => {
-                let wait = ctx.config.proxy.stream_after_prefill;
+                let wait = wait_for_prefill;
                 forward_pd(task, prefill, response, wait).await
             }
             None => (response.await, None),
@@ -362,6 +395,11 @@ async fn dispatch<T: Transport>(
     };
     if matches!(dispatch_outcome::<T>(&result), RequestOutcome::Success) {
         unanswered.0 = None;
+    }
+    if !metrics.streaming && matches!(dispatch_outcome::<T>(&result), RequestOutcome::Success) {
+        if let Some(scope) = &request.scope {
+            scope.life.progress("buffered_upstream_response");
+        }
     }
     // A 2xx stream is already the client's; any other success or client error is final too.
     let retryable = matches!(
@@ -472,6 +510,7 @@ trait Transport: Clone + Send + Sync + 'static {
         worker: Arc<Worker>,
         path: &'static str,
         leg: Leg,
+        load_guards: LoadGuards,
     ) -> impl Future<Output = PrefillFailure<Self::Response>> + Send;
 }
 
@@ -562,7 +601,17 @@ impl Transport for Http {
         worker: Arc<Worker>,
         path: &'static str,
         leg: Leg,
+        load_guards: LoadGuards,
     ) -> PrefillFailure {
+        let scope = load_guards.3.clone();
+        let mut abort = proxy
+            .abort_on_drop(
+                &worker.url,
+                worker.protocol(),
+                &leg.headers,
+                leg.additions.rid.as_deref(),
+            )
+            .with_guards(Some(Box::new(load_guards)));
         let result = proxy
             .forward_json_to(
                 &worker.url,
@@ -574,7 +623,10 @@ impl Transport for Http {
                 None,
             )
             .await;
-        prefill_failure(result).await
+        if result.is_ok() {
+            abort.disarm();
+        }
+        prefill_failure(result, scope.as_deref()).await
     }
 }
 
@@ -590,10 +642,21 @@ impl<R> Clone for Grpc<R> {
 impl<R: EngineRpc> Transport for Grpc<R> {
     type Response = GrpcResponse<R::Reply>;
     async fn respond(
-        _request: &mut PreparedRequest,
-        response: Self::Response,
+        request: &mut PreparedRequest,
+        mut response: Self::Response,
         _streaming: bool,
     ) -> Self::Response {
+        if let Some(scope) = &request.scope {
+            let scope = Arc::downgrade(scope);
+            response.replies = response
+                .replies
+                .inspect(move |reply| {
+                    if let (Some(scope), Ok(reply)) = (scope.upgrade(), reply) {
+                        scope.life.observe_generation(R::generation_evidence(reply));
+                    }
+                })
+                .boxed();
+        }
         response
     }
 
@@ -651,11 +714,22 @@ impl<R: EngineRpc> Transport for Grpc<R> {
         worker: Arc<Worker>,
         _path: &'static str,
         leg: Leg,
+        load_guards: LoadGuards,
     ) -> PrefillFailure<Self::Response> {
         let (headers, body, additions) = (&leg.headers, leg.body, &leg.additions);
         let result = proxy
             .forward_grpc(
-                &worker, &*self.0, headers, body, additions, None, false, None, None, None, None,
+                &worker,
+                &*self.0,
+                headers,
+                body,
+                additions,
+                additions.rid.as_deref(),
+                false,
+                Some(Box::new(load_guards)),
+                None,
+                None,
+                None,
                 None,
             )
             .await;
@@ -760,7 +834,7 @@ fn parse_decode_url_header(decode_url: &str) -> Option<HeaderValue> {
 /// A prefill's client-visible failure; `None` means it succeeded.
 type PrefillFailure<R = Response<Body>> = Option<Result<R, ApiError>>;
 
-/// Runs prefill to completion even if the client disconnects. A failure also
+/// Cancels unfinished prefill when its client leaves. A failure also
 /// aborts decode's stream until its first token, which proves KV transfer completed.
 #[allow(clippy::too_many_arguments)]
 fn spawn_prefill_request<T: Transport>(
@@ -778,12 +852,30 @@ fn spawn_prefill_request<T: Transport>(
     let proxy = Arc::clone(&ctx.proxy);
     let (registry, model) = (Arc::clone(&metrics.registry), metrics.model.clone());
     tokio::spawn(async move {
-        let _load_guards = load_guards;
-        let failure = transport
-            .prefill(proxy, Arc::clone(&prefill_worker), path, leg)
-            .await;
+        let prefill_started = Instant::now();
+        let cancelled = load_guards
+            .3
+            .as_ref()
+            .map(|scope| scope.cancelled.clone())
+            .unwrap_or_default();
+        let work = transport.prefill(proxy, Arc::clone(&prefill_worker), path, leg, load_guards);
+        let failure = tokio::select! {
+            biased;
+            failure = work => failure,
+            () = cancelled.cancelled() => {
+                if let Some(slot) = &slot { slot.release(); }
+                registry.record_worker_request(&prefill_worker.url, &model, WorkerModeLabel::Prefill, RequestOutcome::Cancelled);
+                registry.observe_pd_prefill_duration(&model,prefill_started.elapsed().as_secs_f64());
+                tracing::info!(worker = %prefill_worker.url, bootstrap_room, "prefill cancelled with client");
+                return None;
+            }
+        };
         if let Some(slot) = &slot {
             slot.release();
+        }
+        registry.observe_pd_prefill_duration(&model, prefill_started.elapsed().as_secs_f64());
+        if failure.is_some() {
+            registry.record_pd_failure(&model, "prefill");
         }
         let prefill_url = &prefill_worker.url;
         let outcome = failure
@@ -809,13 +901,21 @@ fn spawn_prefill_request<T: Transport>(
 
 /// Client errors and backpressure pass through; only a prefill fault becomes
 /// `prefill_failed`.
-async fn prefill_failure(result: Result<Response<Body>, ApiError>) -> PrefillFailure {
+async fn prefill_failure(
+    result: Result<Response<Body>, ApiError>,
+    scope: Option<&crate::server::admission::RequestScope>,
+) -> PrefillFailure {
     let status = match result {
         // A streaming prefill reports a late failure as a 200 carrying an SSE error event.
         Ok(response) if response.status().is_success() => {
             let status = response.status();
             match axum::body::to_bytes(response.into_body(), usize::MAX).await {
-                Ok(body) if !sse::has_error_event(&body) => return None,
+                Ok(body) if !sse::has_error_event(&body) => {
+                    if let Some(scope) = scope {
+                        scope.life.observe_prefill(&body);
+                    }
+                    return None;
+                }
                 _ => status,
             }
         }
@@ -928,8 +1028,13 @@ async fn forward_to_response_worker(
             .await
     } else {
         // JSON forwarding reads the full response body before releasing load guards.
-        let _load_guards = load_guards;
-        ctx.proxy
+        let scope = load_guards.3.clone();
+        let mut abort = ctx
+            .proxy
+            .abort_on_drop(&worker.url, worker.protocol(), headers, engine_rid)
+            .with_guards(Some(Box::new(load_guards)));
+        let result = ctx
+            .proxy
             .forward_json_to(
                 &worker.url,
                 worker.protocol(),
@@ -937,9 +1042,18 @@ async fn forward_to_response_worker(
                 path,
                 headers,
                 body,
-                engine_rid,
+                None,
             )
-            .await
+            .await;
+        if result.is_ok() {
+            abort.disarm();
+            if result.as_ref().is_ok_and(|r| r.status().is_success()) {
+                if let Some(scope) = scope {
+                    scope.life.progress("buffered_response");
+                }
+            }
+        }
+        result
     }
 }
 
@@ -951,6 +1065,7 @@ struct DispatchMetrics {
     streaming: bool,
     request_started_at: Instant,
     duration: Arc<RequestDurationGuard>,
+    scope: Option<Arc<crate::server::admission::RequestScope>>,
 }
 
 impl DispatchMetrics {
@@ -973,6 +1088,7 @@ impl DispatchMetrics {
             streaming: request.streaming,
             request_started_at,
             duration: Arc::clone(duration),
+            scope: request.scope.clone(),
         }
     }
 
@@ -981,7 +1097,13 @@ impl DispatchMetrics {
         let metrics = Arc::clone(&self.registry);
         let model = self.model.clone();
         let request_started_at = self.request_started_at;
-        Box::new(move || metrics.observe_ttft(&model, request_started_at.elapsed().as_secs_f64()))
+        let scope = self.scope.clone();
+        Box::new(move || {
+            metrics.observe_ttft(&model, request_started_at.elapsed().as_secs_f64());
+            if let Some(scope) = scope {
+                scope.life.progress("upstream_chunk");
+            }
+        })
     }
 
     fn stream_duration_guard(&self) -> Arc<RequestDurationGuard> {
@@ -994,7 +1116,20 @@ impl DispatchMetrics {
     ) -> Box<dyn FnOnce(StreamEnd) + Send + 'static> {
         let metrics = Arc::clone(&self.registry);
         let model = self.model.clone();
+        let scope = self.scope.clone();
         Box::new(move |end| {
+            if let Some(scope) = &scope {
+                if end.saw_error_event
+                    || !matches!(
+                        end.reason,
+                        StreamEndReason::Completed | StreamEndReason::ClientDisconnect
+                    )
+                {
+                    scope.life.fail("upstream_stream_error");
+                } else if end.reason == StreamEndReason::ClientDisconnect {
+                    scope.life.abort();
+                }
+            }
             if end.reason == StreamEndReason::Expired {
                 metrics.record_stale_request(StaleRequestOutcome::Expired);
             }
@@ -1014,6 +1149,15 @@ impl DispatchMetrics {
                 .record_stale_request(StaleRequestOutcome::Expired);
         }
         let outcome = dispatch_outcome::<T>(result);
+        if matches!(self.mode, WorkerModeLabel::Decode)
+            && blame.is_none()
+            && !result
+                .as_ref()
+                .is_ok_and(|r| (200..300).contains(&T::status(r)))
+        {
+            self.registry
+                .record_pd_failure(&self.model, "decode_dispatch");
+        }
         let worker_url = match blame {
             // The prefill task books its own outcome, so recording `outcome`
             // here would double-count it against prefill. Decode still has to

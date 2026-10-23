@@ -97,13 +97,11 @@ async fn send(app: &axum::Router, worker: &MockWorker, headers: &[(&str, &str)])
     }
     let request = request.body(Body::from(body().to_string())).unwrap();
     worker.captured.lock().unwrap().headers.clear();
-    assert!(app
-        .clone()
-        .oneshot(request)
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert!(response.status().is_success());
+    axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .unwrap()
-        .status()
-        .is_success());
+        .unwrap();
     worker.captured.lock().unwrap().headers.get(RANK).cloned()
 }
 
@@ -326,7 +324,12 @@ async fn send_pd(path: &str, body: serde_json::Value) -> (serde_json::Value, ser
         .body(Body::from(body.to_string()))
         .unwrap();
     let app = router(sticky_config(), &workers, Default::default());
-    assert!(app.oneshot(request).await.unwrap().status().is_success());
+    let response = app.oneshot(request).await.unwrap();
+    assert!(response.status().is_success());
+    // A successful call consumes its body; dropping it would intentionally cancel prefill.
+    axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     (prefill.captured_json().await, decode.captured_json().await)
 }
 

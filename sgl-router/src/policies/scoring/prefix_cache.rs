@@ -5,7 +5,7 @@
 
 use super::{EligibilityFilter, ScoringPolicy};
 use crate::policies::SelectionContext;
-use crate::state::kv_events::{BlockSizeOracle, HashTree};
+use crate::state::kv_events::{BlockSizeOracle, HashTree, RadixTreePrefixProvider};
 use crate::workers::Worker;
 use std::sync::Arc;
 
@@ -58,25 +58,32 @@ impl PrefixCachePolicy {
         let Some(tokens) = ctx.request_tokens().filter(|t| !t.is_empty()) else {
             return flat();
         };
-        let Some(hashes) = self
-            .block_size_oracle
-            .block_hashes(tokens, ctx.cache_namespace())
-            .filter(|hashes| !hashes.is_empty())
-        else {
-            return flat();
-        };
-
-        let depths = self.tree.prefix_depths(None, &hashes);
-        let total = hashes.len() as f32;
+        let provider = RadixTreePrefixProvider::new(
+            Arc::clone(&self.tree),
+            Arc::clone(&self.block_size_oracle),
+        );
+        let signal = provider.match_confirmed_tokens(tokens, ctx.cache_namespace());
         workers
             .iter()
-            .map(|w| {
-                depths
+            .map(|worker| {
+                let Some(signal) = &signal else {
+                    return NO_HOLDING;
+                };
+                let sgl_kv_indexer::PrefixOutcome::Matched { matches, .. } = &signal.outcome else {
+                    return NO_HOLDING;
+                };
+                matches
                     .iter()
-                    .filter(|(kw, _)| kw.url == w.url)
-                    .map(|(_, &d)| d)
-                    .max()
-                    .map_or(NO_HOLDING, |d| d as f32 / total)
+                    .filter(|entry| entry.address == worker.url)
+                    .map(|entry| {
+                        signal.matched_tokens(
+                            tokens.len() as u64,
+                            &entry.address,
+                            entry.matched_prefix_blocks,
+                        ) as f32
+                            / tokens.len() as f32
+                    })
+                    .fold(NO_HOLDING, f32::max)
             })
             .collect()
     }
