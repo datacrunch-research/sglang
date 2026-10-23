@@ -91,5 +91,56 @@ def test_empty_mhc_view_clears_idle_dispatch() -> None:
     torch.testing.assert_close(buf_weights, torch.zeros_like(buf_weights))
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="Requires Blackwell GPU (sm_100+)",
+)
+@pytest.mark.parametrize("num_valid_value", [0, 3, 6])
+def test_num_valid_routes_padded_rows_to_no_expert(num_valid_value: int) -> None:
+    """Rows at and past num_valid get (-1, 0); the rows before it and every
+    row's quantized activations match the unmasked call."""
+    torch.manual_seed(0)
+    num_tokens, padded_max, hidden, top_k = 6, 8, 2304, 8
+    x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    topk_idx = torch.randint(
+        0, 256, (num_tokens, top_k), device="cuda", dtype=torch.int32
+    )
+    topk_weights = torch.rand(num_tokens, top_k, device="cuda", dtype=torch.float32)
+
+    def run(num_valid):
+        buf_x = torch.zeros(
+            padded_max, hidden, device="cuda", dtype=torch.float8_e4m3fn
+        )
+        buf_x_sf = torch.zeros(padded_max, 20, device="cuda", dtype=torch.int32)[:, :18]
+        buf_idx = torch.full((padded_max, top_k), 7, device="cuda", dtype=torch.int64)
+        buf_w = torch.ones(padded_max, top_k, device="cuda", dtype=torch.float32)
+        mega_moe_pre_dispatch(
+            x,
+            topk_idx,
+            topk_weights,
+            buf_x,
+            buf_x_sf,
+            buf_idx,
+            buf_w,
+            num_valid=num_valid,
+        )
+        torch.cuda.synchronize()
+        return buf_x, buf_x_sf, buf_idx, buf_w
+
+    ref_x, ref_sf, ref_idx, ref_w = run(None)
+    nv = torch.tensor([num_valid_value], device="cuda", dtype=torch.int32)
+    got_x, got_sf, got_idx, got_w = run(nv)
+
+    assert torch.equal(got_x.view(torch.uint8), ref_x.view(torch.uint8))
+    assert torch.equal(got_sf, ref_sf)
+    assert torch.equal(got_idx[:num_valid_value], ref_idx[:num_valid_value])
+    assert torch.equal(got_w[:num_valid_value], ref_w[:num_valid_value])
+    assert torch.all(got_idx[num_valid_value:] == -1)
+    assert torch.all(got_w[num_valid_value:] == 0)
+    # A 0-d int64 scalar (an eager batch) is accepted too.
+    _, _, idx0d, _ = run(torch.tensor(num_valid_value, device="cuda"))
+    assert torch.equal(idx0d, got_idx)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

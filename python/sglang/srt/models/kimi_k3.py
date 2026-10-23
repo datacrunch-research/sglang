@@ -381,6 +381,11 @@ def _add3(
 # One-shot log guard: proves the merged front is live (see _ep_front).
 _EP_FRONT_LOGGED = False
 
+# This forward's per-rank count of real MoE rows (forward_batch.moe_num_token_non_padded:
+# int32 [1], the CUDA-graph buffer itself during capture, so replays read the live count).
+# Set by KimiK3LinearModel.forward only under SGLANG_K3_MEGAMOE_MASK_PAD.
+_K3_MOE_NUM_VALID: Optional[torch.Tensor] = None
+
 
 def _o_proj_takes_output(o_proj: RowParallelLinear) -> bool:
     """Whether o_proj can write into caller-owned storage. ``apply_into`` is an
@@ -854,6 +859,8 @@ class KimiK3MoE(nn.Module):
                 (0, self._mega_top_k), dtype=torch.float32
             )
 
+        # CUDA-graph padding rows carry stale activations and their own top-k;
+        # with the mask they go to no expert, so no EP rank waits on their GEMMs.
         mega_moe_pre_dispatch(
             routed_input,
             topk_ids_in,
@@ -863,6 +870,7 @@ class KimiK3MoE(nn.Module):
             buf.topk_idx,
             buf.topk_weights,
             quant_group_size=32,
+            num_valid=_K3_MOE_NUM_VALID if num_tokens > 0 else None,
         )
         # At least one row so the tvm-ffi binding sees a non-null data_ptr.
         y = torch.empty(
@@ -2757,6 +2765,9 @@ class KimiK3LinearModel(nn.Module):
         self.pp_group = get_parallel().pp_group
         self.dspark_layers_to_capture: Optional[list[int]] = None
         self._dp_attention = is_dp_attention_enabled()
+        self._megamoe_mask_pad = (
+            envs.SGLANG_K3_MEGAMOE_MASK_PAD.get() and get_moe_a2a_backend().is_megamoe()
+        )
         # Whether K3's SP collective is enabled on this rank, which the layers'
         # stage declarations depend on: settled once, before any is built.
         sp_collective = k3_sp_collective.enabled()
@@ -2855,6 +2866,10 @@ class KimiK3LinearModel(nn.Module):
     ) -> torch.Tensor:
         global _K3_NUM_TOKEN_NON_PADDED
         _K3_NUM_TOKEN_NON_PADDED = forward_batch.num_token_non_padded
+        global _K3_MOE_NUM_VALID
+        _K3_MOE_NUM_VALID = (
+            forward_batch.moe_num_token_non_padded() if self._megamoe_mask_pad else None
+        )
         if get_parallel().pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
