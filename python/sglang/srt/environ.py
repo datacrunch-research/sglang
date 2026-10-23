@@ -317,6 +317,9 @@ class Envs:
     # they reference a larger mmap-backed checkpoint storage.
     SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)
     SGLANG_LOAD_SNAPSHOT_USE_ZMQ = EnvBool(False)
+    # In seconds. How long the TP ranks wait after weight loading for the slowest
+    # rank (monitored barrier); multi-node loads from shared storage can need more.
+    SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT_S = EnvInt(480)
     SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)
     # In seconds. If a warmup forward batch takes longer than this, the server will crash to prevent hanging.
