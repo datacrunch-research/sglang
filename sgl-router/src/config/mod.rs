@@ -584,7 +584,7 @@ mod tests {
         assert!(
             shutdown_drain_advisory(
                 default_shutdown_drain_secs(),
-                Some(K8S_DEFAULT_GRACE_SECS * 2),
+                Some(default_shutdown_drain_secs() + K8S_DEFAULT_GRACE_SECS),
             )
             .is_none(),
             "a grace period declared with room for the in-flight drain must silence it",
