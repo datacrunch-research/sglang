@@ -341,8 +341,9 @@ pub fn default_port() -> u16 {
     30000
 }
 
+// Sized for streams of a few minutes; the pod grace period must exceed it.
 pub fn default_shutdown_drain_secs() -> u64 {
-    30
+    300
 }
 
 /// Defaults for config construction; the CLI mapping remains exhaustive.

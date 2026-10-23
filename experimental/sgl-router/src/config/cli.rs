@@ -1673,7 +1673,7 @@ mod tests {
         assert_eq!(c.model.id, "qwen3-0.6b");
         assert_eq!(c.proxy.request_timeout_secs, 1800);
         assert_eq!(c.router_inflight_load.stale_request_timeout_secs, 1800);
-        assert_eq!(c.server.shutdown_drain_secs, 30);
+        assert_eq!(c.server.shutdown_drain_secs, 300);
     }
 
     /// Several values, not just the default: a clamp or a rescale in the
