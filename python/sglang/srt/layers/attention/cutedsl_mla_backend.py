@@ -28,8 +28,16 @@ from sglang.kernels.ops.attention.utils import (
     mla_quantize_without_rope_for_fp8,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.cutedsl_mla_var_split import (
+    CuteDslMLAVarSplitDecode,
+    plan_block_splits,
+    smax_for,
+    stock_split,
+    var_split_enabled,
+)
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
+    TRTLLMMLADecodeMetadata,
     TRTLLMMLAMultiStepDraftBackend,
 )
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
@@ -43,7 +51,7 @@ if is_flashinfer_available():
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
@@ -66,6 +74,71 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             q_indptr_decode_buf,
             backend="cute-dsl",
         )
+        self._var_split_on = get_parallel().dcp_enabled and var_split_enabled()
+        self._var_split_launchers: dict = {}
+        self._num_sms = (
+            torch.cuda.get_device_properties(model_runner.device).multi_processor_count
+            if self._var_split_on
+            else 0
+        )
+        if self._var_split_on:
+            logger.info(
+                "cute-dsl MLA decode: length-balanced split-KV on (DCP, CUDA-graph decode)"
+            )
+
+    # ------------------------------------------------------------------
+    # Length-balanced split-KV (graph decode only).
+    # ------------------------------------------------------------------
+    def _init_cuda_graph_metadata(
+        self,
+        bs: int,
+        num_tokens: int,
+        forward_mode: ForwardMode,
+        seq_lens: torch.Tensor,
+        device: torch.device,
+    ):
+        super()._init_cuda_graph_metadata(
+            bs, num_tokens, forward_mode, seq_lens, device
+        )
+        if not self._var_split_on or not forward_mode.is_decode():
+            return
+        metadata = self.decode_cuda_graph_metadata[bs]
+        metadata.block_split_kvs = torch.ones((bs,), dtype=torch.int32, device=device)
+        metadata.var_split_base = stock_split(bs, self._num_sms)
+        metadata.var_split_smax = smax_for(bs, self._num_sms)
+
+    def _apply_dcp_cuda_graph_metadata(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        forward_mode: ForwardMode,
+        metadata: TRTLLMMLADecodeMetadata,
+    ):
+        super()._apply_dcp_cuda_graph_metadata(
+            bs, req_pool_indices, seq_lens, forward_mode, metadata
+        )
+        if metadata.block_split_kvs is not None:
+            plan_block_splits(
+                metadata.seq_lens_k,
+                out=metadata.block_split_kvs,
+                base_split=metadata.var_split_base,
+                smax=metadata.var_split_smax,
+            )
+
+    def _var_split_launcher(self, num_heads: int) -> CuteDslMLAVarSplitDecode:
+        launcher = self._var_split_launchers.get(num_heads)
+        if launcher is None:
+            launcher = CuteDslMLAVarSplitDecode(
+                device=self.workspace_buffer.device,
+                num_heads=num_heads,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                page_size=self.page_size,
+                cp_world=get_parallel().dcp_size,
+            )
+            self._var_split_launchers[num_heads] = launcher
+        return launcher
 
     # ------------------------------------------------------------------
     # Kernel + decode forward.
@@ -83,6 +156,8 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         cp_world: int = 1,
         cp_rank: int = 0,
         return_lse: bool = False,
+        block_split_kvs: Optional[torch.Tensor] = None,
+        var_split_smax: int = 0,
     ):
         """Call the flashinfer cute-dsl MLA decode kernel.
 
@@ -110,6 +185,19 @@ class CuteDslMLABackend(TRTLLMMLABackend):
                 "MLA decode."
             )
         bmm1_scale = self._compute_decode_bmm1_scale(layer)
+        if block_split_kvs is not None:
+            return self._var_split_launcher(query.shape[2]).run(
+                query=query,
+                kv_cache=kv_cache,
+                workspace=self.workspace_buffer,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                causal_seqs=causal_seqs,
+                cp_rank=cp_rank,
+                block_split_kvs=block_split_kvs,
+                smax=var_split_smax,
+                softmax_scale=bmm1_scale,
+            )
         raw_out, lse = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query,
             kv_cache=kv_cache,
@@ -264,6 +352,13 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             cp_world=parallel.dcp_size,
             cp_rank=parallel.dcp_rank,
             return_lse=True,
+            block_split_kvs=(
+                metadata.block_split_kvs
+                if metadata.block_split_kvs is not None
+                and metadata.block_split_kvs.shape[0] == forward_batch.batch_size
+                else None
+            ),
+            var_split_smax=metadata.var_split_smax,
         )
 
         output = raw_out.view(-1, layer.tp_q_head_num, layer.v_head_dim)
