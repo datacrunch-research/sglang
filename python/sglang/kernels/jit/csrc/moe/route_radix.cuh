@@ -117,6 +117,10 @@ struct RouteRadixParams {
   // becomes num_local_experts + r (unique per row). num_local_experts 0 disables.
   int local_expert_offset = 0;
   int num_local_experts = 0;
+  // Optional device scalar: rows >= *num_valid (CUDA-graph padding) get id -1
+  // and weight 0, which no EP rank treats as local. With rank-local ids the
+  // masked id is remapped like any non-local expert (num_local_experts + r).
+  const int32_t* __restrict__ num_valid = nullptr;
 };
 
 // Whole-CTA routing body, callable from other kernels (the fused
@@ -318,15 +322,23 @@ SGL_DEVICE void route_radix_block(const RouteRadixParams& params, typename Large
     const auto norm = (sum > 0.0f) ? sum : 1.0f;
     if (params.renormalize) w = w / norm;
     if (params.apply_scale) w = w * params.routed_scaling_factor;
+    int32_t out_id = id;
+    if (params.num_valid != nullptr && static_cast<int>(bx) >= *params.num_valid) {
+      out_id = -1;
+      w = 0.0f;
+    }
     params.out_w[bx * params.out_w_stride + rank] = w;
-    params.out_i[bx * params.out_i_stride + rank] = id;
+    params.out_i[bx * params.out_i_stride + rank] = out_id;
     if (params.out_packed != nullptr) {
       // (id << 16) | bf16(w) bits -- RN float->bf16 matches the triton pack.
       const auto bits = static_cast<uint32_t>(__bfloat16_as_ushort(__float2bfloat16_rn(w)));
-      int32_t packed_id = id;
+      // Remap the masked id, not the raw one: a padded row then packs as the
+      // non-local id num_local_experts + r with weight 0 on every rank, and every
+      // packed id stays below the rank-local expert count.
+      int32_t packed_id = out_id;
       if (params.num_local_experts > 0) {
-        const int32_t local_id = id - params.local_expert_offset;
-        packed_id = (local_id >= 0 && local_id < params.num_local_experts)
+        const int32_t local_id = out_id - params.local_expert_offset;
+        packed_id = (out_id >= 0 && local_id >= 0 && local_id < params.num_local_experts)
                         ? local_id
                         : params.num_local_experts + static_cast<int32_t>(rank);
       }

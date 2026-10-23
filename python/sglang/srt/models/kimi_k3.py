@@ -154,6 +154,16 @@ from sglang.srt.utils.common import (
 
 logger = logging.getLogger(__name__)
 
+# The current forward's CUDA-graph num_token_non_padded scalar (int32 [1]; the graph
+# buffer itself during capture, so captured kernels read the replay-time count).
+_K3_NUM_TOKEN_NON_PADDED: Optional[torch.Tensor] = None
+# CUDA-graph padding rows carry stale activations whose router scores can be
+# non-finite; the radix top-k then sends them to experts 0..15 (EP rank 0), so rank 0
+# runs expert GEMMs for rows nobody reads. Masked rows get id -1 (no EP rank's expert).
+_K3_MASK_PAD_ROUTING = os.environ.get("SGLANG_K3_MASK_PAD_ROUTING", "1") == "1"
+_K3_MASK_PAD_ROUTING_LOGGED = False
+
+
 # `experts.<expert_id>.<w1|w2|w3>.` fragment of a checkpoint tensor name, the
 # key FusedMoE.make_expert_params_mapping entries match on.
 _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
@@ -1309,9 +1319,22 @@ class KimiK3MoE(nn.Module):
             experts.num_local_experts,
         )
 
+    def _stage_route_quant(self, routed_input):
+        global _K3_MASK_PAD_ROUTING_LOGGED
+        num_valid = _K3_NUM_TOKEN_NON_PADDED if _K3_MASK_PAD_ROUTING else None
+        if num_valid is not None and not _K3_MASK_PAD_ROUTING_LOGGED:
+            _K3_MASK_PAD_ROUTING_LOGGED = True
+            rank0_log(
+                "Kimi-K3: CUDA-graph padding rows masked out of the fused MoE "
+                "routing (SGLANG_K3_MASK_PAD_ROUTING=0 turns it off)"
+            )
+        route_quant_handoff.stage(
+            routed_input, self._route_quant_local_experts(), num_valid=num_valid
+        )
+
     def _forward_routed(self, hidden_states, router_logits, routed_input, latent):
         if self._route_quant_fuse_eligible:
-            route_quant_handoff.stage(routed_input, self._route_quant_local_experts())
+            self._stage_route_quant(routed_input)
         try:
             topk_output = self.topk(hidden_states, router_logits)
             with zero_copy_context.set_moe_output(latent):
@@ -1327,7 +1350,7 @@ class KimiK3MoE(nn.Module):
         expanded_idx_to_permuted_idx, expert_weights) for the finalize-fused
         all-reduce."""
         if self._route_quant_fuse_eligible:
-            route_quant_handoff.stage(routed_input, self._route_quant_local_experts())
+            self._stage_route_quant(routed_input)
         try:
             topk_output = self.topk(hidden_states, router_logits)
             return self.experts.forward_deferred_finalize(routed_input, topk_output)
@@ -2825,6 +2848,8 @@ class KimiK3LinearModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        global _K3_NUM_TOKEN_NON_PADDED
+        _K3_NUM_TOKEN_NON_PADDED = forward_batch.num_token_non_padded
         if get_parallel().pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds

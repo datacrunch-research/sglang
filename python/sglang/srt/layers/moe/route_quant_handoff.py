@@ -50,6 +50,8 @@ class _Handoff(msgspec.Struct):
     request_x: Optional[torch.Tensor] = None
     # staged with them: this rank's (first expert, count) under EP, or None
     request_local_experts: Optional[Tuple[int, int]] = None
+    # staged with them: rows at and past this device scalar are graph padding
+    request_num_valid: Optional[torch.Tensor] = None
     # published by the routing dispatch, keyed by the staged activations
     produced_x: Optional[torch.Tensor] = None
     packed: Optional[torch.Tensor] = None
@@ -81,21 +83,28 @@ def rank_local_num_experts(
     return compact if compact < num_experts else None
 
 
-def stage(x: torch.Tensor, local_experts: Optional[Tuple[int, int]] = None) -> None:
+def stage(
+    x: torch.Tensor,
+    local_experts: Optional[Tuple[int, int]] = None,
+    num_valid: Optional[torch.Tensor] = None,
+) -> None:
     """Publish the routed activations for the upcoming topk call. Caller pairs
     this with clear() after the experts call (try/finally).
 
     ``local_experts`` is this rank's ``(first expert, count)`` when the experts
     are sharded over EP ranks; the fused launch then writes rank-local packed
-    ids (see the module docstring)."""
+    ids (see the module docstring). ``num_valid`` (int32 [1] device scalar)
+    masks rows at and past it out of the routing (id -1, weight 0)."""
     _handoff.request_x = x
     _handoff.request_local_experts = local_experts
+    _handoff.request_num_valid = num_valid
     _handoff.produced_x = None
 
 
 def clear() -> None:
     _handoff.request_x = None
     _handoff.request_local_experts = None
+    _handoff.request_num_valid = None
     _handoff.produced_x = None
     _handoff.packed = None
     _handoff.x_q = None
@@ -150,9 +159,11 @@ def try_route_quant_fused(
         apply_scale=apply_routed_scaling_factor_on_output,
         local_expert_offset=local[0] if local is not None else 0,
         num_local_experts=local[1] if local is not None else 0,
+        num_valid=_handoff.request_num_valid,
     )
     _handoff.request_x = None
     _handoff.request_local_experts = None
+    _handoff.request_num_valid = None
     _handoff.produced_x = x
     _handoff.packed = packed
     _handoff.x_q = x_q
