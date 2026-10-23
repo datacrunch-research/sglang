@@ -83,14 +83,18 @@ wire_struct! {
 control_messages! {
     /// The scheduler's `AbortReq`: stop generating for one rid.
     AbortReq {
-        /// This server never aborts the whole queue — only the one rid.
+        /// True only for an explicit abort-all operation, never for a dropped call.
         abort_all: bool,
         finished_reason: (),
         abort_message: (),
+        weight_versions: (),
+        exact_rids: Option<Vec<String>>,
     }
 
     /// `/server_info`'s control request: a bare `BaseReq` with no extra fields.
     GetInternalStateReq {}
+
+    ClearHiCacheReqInput {}
 
     /// `/flush_cache`'s control request: the scheduler flushes its caches in
     /// its own loop, waiting up to `timeout_s` for running requests to drain.
@@ -173,6 +177,12 @@ impl GetInternalStateReq {
     }
 }
 
+impl ClearHiCacheReqInput {
+    pub fn new(rid: String) -> Self {
+        Self { rid }
+    }
+}
+
 impl FlushCacheReqInput {
     pub fn new(rid: String, timeout_s: Option<f64>) -> Self {
         Self { rid, timeout_s }
@@ -198,12 +208,21 @@ impl CheckWeightsReqInput {
 }
 
 impl AbortReq {
+    pub fn exact(rids: Vec<String>, abort_all: bool) -> Self {
+        Self {
+            exact_rids: Some(rids),
+            ..Self::new(String::new(), abort_all)
+        }
+    }
+
     pub fn new(rid: String, abort_all: bool) -> Self {
         Self {
             rid,
             abort_all,
             finished_reason: (),
             abort_message: (),
+            weight_versions: (),
+            exact_rids: None,
         }
     }
 }
@@ -213,14 +232,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exact_abort_wire_matches_the_python_scheduler_fixture() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../testdata/abort_selection.json")).unwrap();
+        let encoded = AbortReq::exact(
+            vec![fixture["selected"].as_str().unwrap().to_owned()],
+            false,
+        )
+        .encode()
+        .unwrap();
+        let decoded: serde_json::Value = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, fixture["wire"]);
+    }
+
+    #[test]
     fn abort_req_msgpack_shape() {
         let b = AbortReq::new("12345".into(), false).encode().unwrap();
         let val = rmpv::decode::read_value(&mut &b[..]).unwrap();
         let arr = val.as_array().expect("array");
         assert_eq!(
             arr.len(),
-            6,
-            "AbortReq = [tag, rid, http_ipc, abort_all, finished_reason, abort_message]"
+            8,
+            "AbortReq = [tag, rid, http_ipc, abort_all, finished_reason, abort_message, weight_versions, exact_rids]"
         );
         assert_eq!(arr[0].as_str(), Some("AbortReq"));
         assert_eq!(arr[1].as_str(), Some("12345"));
@@ -228,6 +261,8 @@ mod tests {
         assert_eq!(arr[3].as_bool(), Some(false));
         assert!(arr[4].is_nil());
         assert!(arr[5].is_nil());
+        assert!(arr[6].is_nil());
+        assert!(arr[7].is_nil());
     }
 
     #[test]

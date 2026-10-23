@@ -168,6 +168,58 @@ fn answering_app_state() -> Arc<super::AppState> {
     })
 }
 
+#[tokio::test]
+async fn cache_usage_is_disabled_by_default_for_chat_and_completions() {
+    for enabled in [false, true] {
+        for path in ["/v1/completions", "/v1/chat/completions"] {
+            for stream in [false, true] {
+                let mut body = json!({"model":"model", "n":2, "stream":stream, "max_tokens":1});
+                if stream {
+                    body["stream_options"] = json!({"include_usage":true});
+                }
+                if path == "/v1/completions" {
+                    body["prompt"] = json!("hi");
+                } else {
+                    body["messages"] = json!([{"role":"user","content":"hi"}]);
+                }
+                let mut state = answering_app_state();
+                if enabled {
+                    let args = &mut Arc::get_mut(&mut state).unwrap().server_args;
+                    Arc::make_mut(args).enable_cache_report = true;
+                }
+                let response = post_json(routes().with_state(state), path, body).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                    .await
+                    .unwrap();
+                let value = if stream {
+                    std::str::from_utf8(&bytes)
+                        .unwrap()
+                        .lines()
+                        .filter_map(|line| line.strip_prefix("data: "))
+                        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                        .find(|value| {
+                            value["usage"].is_object()
+                                && value["choices"].as_array().is_some_and(Vec::is_empty)
+                        })
+                        .expect("stream includes final usage")
+                } else {
+                    serde_json::from_slice(&bytes).unwrap()
+                };
+                let details = &value["usage"]["prompt_tokens_details"];
+                assert_eq!(
+                    details.is_object(),
+                    enabled,
+                    "{path}, stream={stream}, enabled={enabled}: {value}"
+                );
+                if enabled {
+                    assert_eq!(details["cached_tokens"], 0);
+                }
+            }
+        }
+    }
+}
+
 /// Serve one request through the full router (extractors, auth, routing).
 /// `with_state` consumes the state into a `Router<()>`, which is what
 /// implements `tower::Service`.

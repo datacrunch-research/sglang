@@ -35,6 +35,7 @@ from sglang.srt.constrained.reasoner_grammar_backend import (
 )
 from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
 from sglang.srt.distributed.communication_tags import P2PTag
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_MODEL_END_SAMPLING,
     CONTENT_THINKING,
@@ -464,9 +465,7 @@ class TestAbortRequests(unittest.TestCase):
         req.grammar = future
         mgr.grammar_queue.append(req)
 
-        abort_req = MagicMock()
-        abort_req.abort_all = False
-        abort_req.rid = "req-123"
+        abort_req = AbortReq(abort_all=False, rid="req-123")
 
         mgr.abort_requests(abort_req)
         future.cancel.assert_called_once()
@@ -478,9 +477,7 @@ class TestAbortRequests(unittest.TestCase):
         req.grammar = MagicMock(spec=Future)
         mgr.grammar_queue.append(req)
 
-        abort_req = MagicMock()
-        abort_req.abort_all = False
-        abort_req.rid = "req-123"
+        abort_req = AbortReq(abort_all=False, rid="req-123")
 
         mgr.abort_requests(abort_req)
         req.set_finish_with_abort.assert_not_called()
@@ -494,9 +491,7 @@ class TestAbortRequests(unittest.TestCase):
             mgr.grammar_queue.append(req)
             reqs.append(req)
 
-        abort_req = MagicMock()
-        abort_req.abort_all = True
-        abort_req.rid = ""
+        abort_req = AbortReq(abort_all=True, rid="")
 
         mgr.abort_requests(abort_req)
         for req in reqs:
@@ -505,9 +500,7 @@ class TestAbortRequests(unittest.TestCase):
     def test_abort_empty_queue(self):
         """Aborting on an empty queue should not raise."""
         mgr = self._make_mgr_with_queue()
-        abort_req = MagicMock()
-        abort_req.abort_all = True
-        abort_req.rid = ""
+        abort_req = AbortReq(abort_all=True, rid="")
         mgr.abort_requests(abort_req)  # Should not raise
 
     def test_abort_prefix_match(self):
@@ -517,9 +510,7 @@ class TestAbortRequests(unittest.TestCase):
         req.grammar = MagicMock(spec=Future)
         mgr.grammar_queue.append(req)
 
-        abort_req = MagicMock()
-        abort_req.abort_all = False
-        abort_req.rid = "req-123"
+        abort_req = AbortReq(abort_all=False, rid="req-123")
 
         mgr.abort_requests(abort_req)
         req.set_finish_with_abort.assert_called_once()

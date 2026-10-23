@@ -1,12 +1,13 @@
 //! TokenizerManager — to_scheduler side.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::message::detok::DetokMsg;
+use crate::message::finish_reason::{AbortReason, FinishKind};
 use crate::message::ids::Rid;
 use crate::message::io_struct::{AbortReq, ControlRequest};
 use crate::message::request::{Request, RequestKind, SchedulerRequest};
-use crate::message::response::ResponseItem;
+use crate::message::response::{ChunkEvent, ResponseItem, ResponseSink};
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::channel::ToSchedulerTx;
 pub use crate::tokenizer_manager::to_scheduler_types::{Limits, MmDispatch};
@@ -21,7 +22,22 @@ use crate::utils::{
 
 /// Longest client-supplied rid accepted. It keys the detok table and travels on
 /// every chunk, so its length is a recurring cost; Python mints 32-byte uuid hex.
-pub(super) const MAX_RID_LEN: usize = 128;
+pub(crate) const MAX_RID_LEN: usize = 128;
+
+struct PendingRequest {
+    state: RequestState,
+    generation_sink: Option<ResponseSink>,
+}
+
+impl PendingRequest {
+    fn new(request: &Request, state: RequestState) -> Self {
+        Self {
+            state,
+            generation_sink: matches!(request.kind, RequestKind::Generate(_))
+                .then(|| request.sink.clone()),
+        }
+    }
+}
 
 /// Intake FSM dispatcher stage. Owns its inbox + downstream handles, so the
 /// runtime spawns it as a [`Runnable`] rather than calling a free `run_*` fn
@@ -36,7 +52,7 @@ pub struct Intake {
     limits: Limits,
     mm: MmDispatch,
     /// Track request states when intake does not hold it.
-    request_states: HashMap<Rid, RequestState>,
+    request_states: HashMap<Rid, PendingRequest>,
     shutdown: flume::Receiver<()>,
 }
 
@@ -97,6 +113,13 @@ impl Runnable for Intake {
                 Some(Lane::Event(TmEvent::Tokenized(req) | TmEvent::Encoded(req))) => {
                     self.drive(req)
                 }
+                Some(Lane::Event(TmEvent::AbortRequest {
+                    rids,
+                    abort_all,
+                    reply,
+                })) => {
+                    let _ = reply.send(self.abort_request(&rids, abort_all));
+                }
                 None => {
                     // Shutdown, or the inbox closed. Drain whatever is still queued
                     // on the abort lane first: those requests are in flight on the
@@ -146,7 +169,10 @@ impl Intake {
         // pushed or failed. Dropping the request releases any shm it carries.
         if matches!(
             self.request_states.remove(&req.rid),
-            Some(RequestState::Aborted)
+            Some(PendingRequest {
+                state: RequestState::Aborted,
+                ..
+            })
         ) {
             tracing::debug!(rid = %req.rid, "dropping request aborted");
             return;
@@ -248,12 +274,13 @@ impl Intake {
                 // is recorded in `request_states` and honored when it returns.
                 RequestState::Encoding => {
                     let rid = req.rid.clone();
+                    let pending = PendingRequest::new(&req, state);
                     // Full = the pool can't keep up, so back-pressure like a full
                     // to_scheduler channel. Disconnected = pool gone. Either way
                     // flume hands the request back.
                     match self.mm.tx.try_send(req) {
                         Ok(()) => {
-                            self.request_states.insert(rid, state);
+                            self.request_states.insert(rid, pending);
                         }
                         Err(e) => {
                             let (err, mut req) = match e {
@@ -281,9 +308,10 @@ impl Intake {
                         continue;
                     }
                     let rid = req.rid.clone();
+                    let pending = PendingRequest::new(&req, state);
                     match self.senders.tokenizer_tx.send(req) {
                         Ok(()) => {
-                            self.request_states.insert(rid, state);
+                            self.request_states.insert(rid, pending);
                         }
                         Err(err) => {
                             // Pool gone (workers exited); flume hands the request back.
@@ -486,8 +514,9 @@ impl Intake {
             .senders
             .detok_for(&rid)
             .send(DetokMsg::Deregister { rid: rid.clone() });
-        if let Some(state) = self.request_states.get_mut(&rid) {
-            *state = RequestState::Aborted;
+        if let Some(pending) = self.request_states.get_mut(&rid) {
+            pending.state = RequestState::Aborted;
+            pending.generation_sink = None;
             tracing::debug!(rid = %rid, "abort recorded for request");
             return;
         }
@@ -500,7 +529,9 @@ impl Intake {
 
         // The channel is BOUNDED and drops pushes under exactly the load this matters
         // for, so report the miss rather than assuming the scheduler was told.
-        match ControlRequest::AbortReq(AbortReq::new(rid.as_str().to_string(), false)).encode() {
+        match ControlRequest::AbortReq(AbortReq::exact(vec![rid.as_str().to_owned()], false))
+            .encode()
+        {
             Ok(header) => {
                 if !self.to_scheduler_tx.try_push(SchedulerRequest {
                     header,
@@ -515,6 +546,54 @@ impl Intake {
             }
             Err(e) => tracing::error!(rid = %rid, error = %e, "abort encode failed"),
         }
+    }
+
+    fn abort_request(&mut self, rids: &HashSet<Rid>, abort_all: bool) -> Result<(), Error> {
+        if rids.is_empty() && !abort_all {
+            return Ok(());
+        }
+        let header = ControlRequest::AbortReq(AbortReq::exact(
+            rids.iter().map(|rid| rid.as_str().to_owned()).collect(),
+            abort_all,
+        ))
+        .encode()?;
+        if !self.to_scheduler_tx.try_push(SchedulerRequest {
+            header,
+            buffers: Vec::new(),
+        }) {
+            return Err(Error::QueueFull);
+        }
+        // One exact target set crosses the scheduler boundary atomically.
+        // Pool work is not on the scheduler yet and must be stopped on its return.
+        for (rid, pending) in &mut self.request_states {
+            if !(abort_all || rids.contains(rid)) {
+                continue;
+            }
+            let Some(sink) = pending.generation_sink.take() else {
+                continue;
+            };
+            pending.state = RequestState::Aborted;
+            let _ = sink.try_send(ResponseItem::Done(ChunkEvent {
+                rid: rid.clone(),
+                finish_reason: Some(
+                    FinishKind::Abort(Box::new(AbortReason {
+                        message: Some("Request aborted".into()),
+                        status_code: None,
+                        err_type: None,
+                    }))
+                    .into(),
+                ),
+                ..Default::default()
+            }));
+            let _ = self
+                .senders
+                .detok_for(rid)
+                .send(DetokMsg::Deregister { rid: rid.clone() });
+        }
+        if let Some(metrics) = crate::utils::tokenizer_metrics::get() {
+            metrics.on_abort();
+        }
+        Ok(())
     }
 
     /// Serialize the tokenized request to its `TokenizedGenerateReqInput` wire and

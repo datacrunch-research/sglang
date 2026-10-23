@@ -20,8 +20,8 @@ type Labels = Vec<(String, String)>;
 const TOKEN_BUCKETS: [f64; 35] = [
     100.0, 300.0, 500.0, 700.0, 1000.0, 1500.0, 2000.0, 3000.0, 4000.0, 5000.0, 6000.0, 7000.0,
     8000.0, 9000.0, 10000.0, 12500.0, 15000.0, 17500.0, 20000.0, 22500.0, 25000.0, 27500.0,
-    30000.0, 35000.0, 40000.0, 60000.0, 80000.0, 100000.0, 200000.0, 300000.0, 400000.0,
-    600000.0, 800000.0, 1000000.0, 1100000.0,
+    30000.0, 35000.0, 40000.0, 60000.0, 80000.0, 100000.0, 200000.0, 300000.0, 400000.0, 600000.0,
+    800000.0, 1000000.0, 1100000.0,
 ];
 const TTFT_BUCKETS: [f64; 18] = [
     0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 20.0, 40.0, 60.0, 80.0, 100.0, 200.0,
@@ -296,7 +296,9 @@ impl TokenizerMetrics {
                     .observe_n(self.with(&stream_label), ttft, 1.0, ttft);
             }
         } else {
-            let new = times.completion_tokens.saturating_sub(times.last_completion_tokens);
+            let new = times
+                .completion_tokens
+                .saturating_sub(times.last_completion_tokens);
             if new > 0 {
                 let interval = now.duration_since(times.last_time).as_secs_f64();
                 registry.inter_token_latency.observe_n(
@@ -355,9 +357,12 @@ impl TokenizerMetrics {
             .prompt_tokens_histogram
             .observe_n(self.labels.clone(), prompt, 1.0, prompt);
         let uncached = f64::from(prompt_tokens) - f64::from(cached_tokens);
-        registry
-            .uncached_prompt_tokens_histogram
-            .observe_n(self.labels.clone(), uncached, 1.0, uncached);
+        registry.uncached_prompt_tokens_histogram.observe_n(
+            self.labels.clone(),
+            uncached,
+            1.0,
+            uncached,
+        );
         registry.generation_tokens_histogram.observe_n(
             self.labels.clone(),
             completion as f64,
@@ -493,10 +498,17 @@ fn cpu_monitor() {
                 continue;
             };
             let comm = &stat[open + 1..close];
-            if !FRONT_END_THREADS.iter().any(|prefix| comm.starts_with(prefix)) {
+            if !FRONT_END_THREADS
+                .iter()
+                .any(|prefix| comm.starts_with(prefix))
+            {
                 continue;
             }
-            let component = if comm.starts_with("detokenizer") { "detokenizer" } else { "tokenizer" };
+            let component = if comm.starts_with("detokenizer") {
+                "detokenizer"
+            } else {
+                "tokenizer"
+            };
             let fields: Vec<&str> = stat[close + 2..].split_whitespace().collect();
             let (Some(Ok(utime)), Some(Ok(stime))) = (
                 fields.get(11).map(|f| f.parse::<f64>()),
@@ -504,7 +516,10 @@ fn cpu_monitor() {
             ) else {
                 continue;
             };
-            out.insert(task.file_name().to_string_lossy().into_owned(), (component, (utime + stime) / ticks));
+            out.insert(
+                task.file_name().to_string_lossy().into_owned(),
+                (component, (utime + stime) / ticks),
+            );
         }
         out
     };

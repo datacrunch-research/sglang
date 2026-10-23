@@ -2,18 +2,23 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.managers.io_struct import FlushCacheReqInput, FlushCacheReqOutput
+from sglang.srt.managers.io_struct import (
+    ClearHiCacheReqInput,
+    FlushCacheReqInput,
+    FlushCacheReqOutput,
+)
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.flush_wrapper import (
     SchedulerFlushWrapper,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 
 
-class TestSchedulerFlushCache(unittest.TestCase):
+class TestSchedulerFlushCache(CustomTestCase):
     def _new_scheduler(self) -> SimpleNamespace:
         """The wrapper plus the three collaborators it was handed."""
         flush_cache = MagicMock(return_value=True)
@@ -123,6 +128,19 @@ class TestSchedulerFlushCache(unittest.TestCase):
 
         self.assertIsNotNone(scheduler.flush_wrapper._pending)
         scheduler.send_output.assert_not_called()
+
+    def test_clear_returns_the_actual_backend_outcome(self):
+        """An enabled cache with an unsuccessful backend clear must report failure."""
+        for success in (True, False):
+            scheduler = SimpleNamespace(
+                enable_hierarchical_cache=True,
+                enable_lmcache=False,
+                tree_cache=SimpleNamespace(clear_storage_backend=lambda: success),
+            )
+            output = Scheduler.clear_hicache_storage_wrapped(
+                scheduler, ClearHiCacheReqInput()
+            )
+            self.assertEqual(output.success, success)
 
     def test_control_output_goes_to_the_embedded_rust_server(self):
         """A control reply, deferred flush included, takes the Rust server's

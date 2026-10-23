@@ -1,3 +1,4 @@
+from importlib import import_module, util
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -9,6 +10,7 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.rust_server import config as rust_config
 from sglang.srt.rust_server import server as rust_server
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -34,6 +36,10 @@ def _scheduler_for_typed_config():
     "overrides,kwarg,expected",
     [
         ({}, "grpc_port", 50051),
+        ({}, "enable_cache_report", False),
+        ({"enable_cache_report": True}, "enable_cache_report", True),
+        ({}, "rust_server_allow_abort_all", False),
+        ({"rust_server_allow_abort_all": True}, "rust_server_allow_abort_all", True),
         ({"smg_grpc_mode": True}, "grpc_port", None),
         ({"grpc_mode": True}, "grpc_port", None),
         ({"default_priority_value": 5}, "default_priority_value", None),
@@ -45,6 +51,10 @@ def _scheduler_for_typed_config():
     ],
     ids=[
         "native-grpc",
+        "cache-report-default-off",
+        "cache-report-explicit-on",
+        "abort-all-default-off",
+        "abort-all-explicit-on",
         "legacy-smg",
         "deprecated-legacy-smg",
         "priority-off",
@@ -72,6 +82,31 @@ def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected
         )
 
     assert extension.ServerArgs.call_args.kwargs[kwarg] == expected
+
+
+class TestCompiledLaunchConfig(CustomTestCase):
+    def test_typed_config_constructs_the_compiled_abort_and_cache_policies(self):
+        """A mock constructor cannot catch a drifted Python/PyO3 launch schema."""
+        if util.find_spec("sglang.srt.rust_extensions._server") is None:
+            self.skipTest("requires the compiled Rust server extension")
+        extension = import_module("sglang.srt.rust_extensions._server")
+        for enabled in [False, True]:
+            with (
+                get_context().override_server_args(
+                    model_path="model",
+                    served_model_name="model",
+                    rust_server_allow_abort_all=enabled,
+                    enable_cache_report=enabled,
+                ),
+                patch.object(
+                    rust_config, "compute_num_reserved_tokens", return_value=0
+                ),
+                patch.object(rust_config, "_launch_server_info", return_value="{}"),
+            ):
+                args = rust_config._build_server_args(
+                    _scheduler_for_typed_config(), extension=extension
+                )
+            assert type(args) is extension.ServerArgs
 
 
 @pytest.mark.parametrize("enable_metrics", [False, True])
@@ -129,11 +164,15 @@ def test_dp_leaders_reuse_node_local_ports(
             ep_join_mode=ep_join_mode,
             host="0.0.0.0",
             port=30000,
+            enable_cache_report=True,
         ),
         patch.object(rust_extensions, "load_rust_extension") as extension,
         patch.object(rust_server, "_partition_cores", return_value=(None, None)),
         patch.object(rust_server, "_build_server_args"),
     ):
+        extension.return_value.RUST_SERVER_WIRE_VERSION = (
+            rust_server.RUST_SERVER_WIRE_VERSION
+        )
         parallel = get_parallel()
         ports = []
         for dp_rank, tp_rank in enumerate(ranks):

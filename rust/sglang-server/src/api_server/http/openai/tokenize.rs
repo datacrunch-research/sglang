@@ -108,7 +108,9 @@ async fn tokenize(
         // The rendered template owns its special tokens, as on the chat path
         // (Python encodes it with `add_special_tokens=False`).
         // Kimi-K3 renders straight to ids (the chat path's), as Python's `_process_messages` does.
-        (None, Some(messages)) if matches!(state.chat_formatter, Some(ChatFormatter::KimiK3(_))) => {
+        (None, Some(messages))
+            if matches!(state.chat_formatter, Some(ChatFormatter::KimiK3(_))) =>
+        {
             let Some(ChatFormatter::KimiK3(kimi_k3)) = &state.chat_formatter else {
                 unreachable!()
             };

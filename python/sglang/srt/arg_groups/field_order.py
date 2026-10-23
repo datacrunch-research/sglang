@@ -143,6 +143,7 @@ POSITIONAL_FIELD_ORDER = (
     "hf_chat_template_name",
     "completion_template",
     "file_storage_path",
+    "rust_server_allow_abort_all",
     "enable_cache_report",
     "return_input_ids",
     "return_output_ids",

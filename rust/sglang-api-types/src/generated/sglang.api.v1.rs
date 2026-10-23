@@ -495,6 +495,19 @@ pub struct GenerateMetaInfo {
     pub cached_tokens: u32,
     #[prost(uint64, tag = "14")]
     pub reasoning_tokens: u64,
+    #[prost(message, optional, tag = "15")]
+    pub cached_tokens_details: ::core::option::Option<CachedTokensDetails>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CachedTokensDetails {
+    #[prost(uint32, tag = "1")]
+    pub device: u32,
+    #[prost(uint32, tag = "2")]
+    pub host: u32,
+    #[prost(uint32, optional, tag = "3")]
+    pub storage: ::core::option::Option<u32>,
+    #[prost(string, optional, tag = "4")]
+    pub storage_backend: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GenerateResponse {

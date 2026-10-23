@@ -1,5 +1,8 @@
 """Model packages use one extension for server arguments and worker startup."""
 
+import importlib.util
+import subprocess
+import sys
 import unittest
 from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
@@ -13,7 +16,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.rust_server import server as server_module  # noqa: E402
 from sglang.srt.rust_server.server import RustServer  # noqa: E402
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 
 @contextmanager
@@ -49,7 +52,9 @@ def launch_context(server_cls):
         patch.object(
             server_module,
             "get_serving",
-            return_value=SimpleNamespace(host="::", port=30000),
+            return_value=SimpleNamespace(
+                host="::", port=30000, enable_cache_report=True
+            ),
         ),
         patch.object(
             server_module, "_build_server_args", return_value=sentinel.args
@@ -59,9 +64,89 @@ def launch_context(server_cls):
 
 
 class TestRustServerExtension(CustomTestCase):
+    def test_launch_requires_cache_reporting_before_binding(self):
+        """A serving process must not silently omit cached-token billing data."""
+        extension = ModuleType("cache_server")
+        extension.Server = Mock()
+        extension.RUST_SERVER_WIRE_VERSION = server_module.RUST_SERVER_WIRE_VERSION
+
+        class CacheServer(RustServer):
+            @classmethod
+            def _load_extension(cls):
+                return extension
+
+        scheduler = SimpleNamespace(model_config=SimpleNamespace(is_multimodal=False))
+        for serving in [
+            SimpleNamespace(host="::", port=30000),
+            SimpleNamespace(host="::", port=30000, enable_cache_report=False),
+        ]:
+            with (
+                self.subTest(serving=serving),
+                launch_context(CacheServer),
+                patch.object(server_module, "get_serving", return_value=serving),
+                self.assertRaisesRegex(RuntimeError, "--enable-cache-report"),
+            ):
+                CacheServer.launch(scheduler)
+        extension.Server.assert_not_called()
+
+    def test_launch_refuses_an_unversioned_or_incompatible_extension(self):
+        """A mixed Python/extension pair must fail before accepting generation."""
+        for version in [None, 0, 999]:
+            with self.subTest(version=version):
+                extension = ModuleType("old_server")
+                extension.Server = Mock()
+                if version is not None:
+                    extension.RUST_SERVER_WIRE_VERSION = version
+
+                class MixedServer(RustServer):
+                    @classmethod
+                    def _load_extension(cls, module=extension):
+                        return module
+
+                scheduler = SimpleNamespace(
+                    model_config=SimpleNamespace(is_multimodal=False)
+                )
+                with (
+                    launch_context(MixedServer),
+                    self.assertRaisesRegex(RuntimeError, "wire protocol mismatch"),
+                ):
+                    MixedServer.launch(scheduler)
+                extension.Server.assert_not_called()
+
+    def test_extension_import_refuses_python_without_the_wire_version(self):
+        """The compiled module must also reject an older Python producer at boot."""
+        if importlib.util.find_spec("sglang.srt.rust_extensions._server") is None:
+            self.skipTest("requires the compiled Rust server extension")
+        script = """
+import importlib
+import sys
+from sglang.srt.rust_server import server
+if sys.argv[1] == 'None':
+    vars(server).pop('RUST_SERVER_WIRE_VERSION', None)
+else:
+    server.RUST_SERVER_WIRE_VERSION = int(sys.argv[1])
+try:
+    importlib.import_module('sglang.srt.rust_extensions._server')
+except RuntimeError as error:
+    assert 'wire protocol mismatch' in str(error), str(error)
+else:
+    raise AssertionError('An old Python producer loaded the new extension')
+"""
+        for version in [None, 0, 999]:
+            with self.subTest(version=version):
+                result = subprocess.run(
+                    [sys.executable, "-c", script, str(version)],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_launch_uses_the_model_extension_and_instance_worker_state(self):
         extension = ModuleType("model_server")
         extension.Server = Mock()
+        extension.RUST_SERVER_WIRE_VERSION = server_module.RUST_SERVER_WIRE_VERSION
 
         class ModelServer(RustServer):
             @classmethod
@@ -102,6 +187,11 @@ class TestRustServerExtension(CustomTestCase):
             patch.object(
                 server_module, "psutil", SimpleNamespace(Process=lambda: process)
             ),
+            patch.object(
+                server_module,
+                "get_observability",
+                return_value=SimpleNamespace(enable_metrics=False),
+            ),
         ):
             server.set_startup_time(
                 {
@@ -123,6 +213,7 @@ class TestRustServerExtension(CustomTestCase):
         one gets workers for the spec resolved up front."""
         extension = ModuleType("server")
         extension.Server = Mock()
+        extension.RUST_SERVER_WIRE_VERSION = server_module.RUST_SERVER_WIRE_VERSION
 
         class BuiltinServer(RustServer):
             @classmethod

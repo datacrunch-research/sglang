@@ -184,6 +184,19 @@ pub struct BatchHeader {
     pub hidden_reqlens: Vec<u32>,
     #[serde(default)]
     pub hidden_poslens: Vec<u32>,
+    #[serde(default)]
+    pub cached_tokens_details: Option<Vec<Option<CachedTokensDetails>>>,
+}
+
+/// Scheduler cache-source metadata, appended after the existing shape columns.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CachedTokensDetails {
+    #[serde(default)]
+    pub device: u32,
+    #[serde(default)]
+    pub host: u32,
+    pub storage: Option<u32>,
+    pub storage_backend: Option<String>,
 }
 
 /// Read a request's flat logprob column (`l` val/idx pairs) from `data` at cursors
@@ -287,6 +300,9 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
         || h.tok_lens.len() != n
         || h.cached_tokens.len() != n
         || h.reasoning_tokens.len() != n
+        || h.cached_tokens_details
+            .as_ref()
+            .is_some_and(|details| details.len() != n)
     {
         reject!()
     }
@@ -370,7 +386,8 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
         && h.in_top_reqlens.is_empty()
         && h.out_tokids_lp_reqlens.is_empty()
         && h.in_tokids_lp_reqlens.is_empty()
-        && h.hidden_reqlens.is_empty());
+        && h.hidden_reqlens.is_empty()
+        && h.cached_tokens_details.is_none());
 
     // Position cursors into the header's per-request `poslens` (ragged + hidden).
     let (mut p_ot, mut p_it, mut p_od, mut p_id, mut p_h) =
@@ -438,6 +455,10 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
             // Even in an extras batch, most requests carry none — box only if this
             // one actually does, so its `ChunkEvent` stays the small common frame.
             let ex = ChunkExtras {
+                cached_tokens_details: h
+                    .cached_tokens_details
+                    .as_mut()
+                    .and_then(|details| details[i].take()),
                 out_lp_val,
                 out_lp_idx,
                 in_lp_val,
@@ -606,6 +627,7 @@ pub struct ChunkEvent {
 /// [`ChunkEvent`]).
 #[derive(Debug, Clone, Default)]
 pub struct ChunkExtras {
+    pub cached_tokens_details: Option<CachedTokensDetails>,
     /// Output-token logprobs (parallel `val`/`idx`, one entry per new output token).
     pub out_lp_val: Vec<f32>,
     pub out_lp_idx: Vec<i32>,
@@ -645,7 +667,8 @@ impl ChunkExtras {
     /// True when no logprob / hidden column carries data — lets the decoder skip the
     /// box allocation for the common (extras-free) frame.
     fn is_empty(&self) -> bool {
-        self.out_lp_val.is_empty()
+        self.cached_tokens_details.is_none()
+            && self.out_lp_val.is_empty()
             && self.in_lp_val.is_empty()
             && self.out_top_lens.is_empty()
             && self.in_top_lens.is_empty()
@@ -1270,6 +1293,50 @@ mod rid_recovery_tests {
                 vec![Rid::from("a"), Rid::from("b")],
                 "arity {extra_cols}: rids must survive so the caller can fail them"
             );
+        }
+    }
+    /// The cache detail column follows every existing positional shape column.
+    #[test]
+    fn regression_cached_details_reach_native_json_and_legacy_headers_still_decode() {
+        use rmpv::Value;
+        let mut columns = vec![
+            Value::Array(vec![Value::from("r")]),
+            Value::Array(vec![Value::Nil]),
+            Value::Array(vec![Value::from(10)]),
+            Value::Array(vec![Value::from(0)]),
+            Value::Array(vec![Value::from(8)]),
+            Value::Array(vec![Value::from(0)]),
+        ];
+        for detailed in [false, true] {
+            if detailed {
+                columns.resize(18, Value::Array(vec![]));
+                columns.push(Value::Array(vec![Value::Map(vec![
+                    ("device".into(), 2.into()),
+                    ("host".into(), 3.into()),
+                    ("storage".into(), 3.into()),
+                    ("storage_backend".into(), "test-store".into()),
+                ])]));
+            }
+            let mut header = Vec::new();
+            rmpv::encode::write_value(&mut header, &Value::Array(columns.clone())).unwrap();
+            let framed = frame_decode_batch_cols(&header, &[]);
+            let mut events = Vec::new();
+            assert!(
+                for_each_chunk(&framed[1..], |event| events.push(event)).ok,
+                "detailed={detailed}"
+            );
+            assert_eq!(events.len(), 1);
+            let output = crate::api_server::core::CoreOutput::from(events.remove(0));
+            let frame = serde_json::to_value(output.frame("r", None, None)).unwrap();
+            assert_eq!(frame["meta_info"]["cached_tokens"], 8);
+            if detailed {
+                assert_eq!(
+                    frame["meta_info"]["cached_tokens_details"],
+                    serde_json::json!({"device":2,"host":3,"storage":3,"storage_backend":"test-store"})
+                );
+            } else {
+                assert!(frame["meta_info"].get("cached_tokens_details").is_none());
+            }
         }
     }
 }
