@@ -1103,14 +1103,14 @@ dependencies = [
 [[package]]
 name = "dynamo-tokenizers"
 version = "3.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2bee9c4bcbcb9c498d03199d4ec6738cc0a9f861463074369fc3f7352539e44"
+source = "git+https://github.com/Venkat2811/frontend-crates.git?rev=34e5627943637971f1a118973e54022ad12f819f#34e5627943637971f1a118973e54022ad12f819f"
 dependencies = [
  "aho-corasick",
  "anyhow",
  "base64 0.22.1",
  "basetenkenizer",
  "blake3",
+ "fancy-regex 0.13.0",
  "fastokens",
  "moka",
  "rayon",
