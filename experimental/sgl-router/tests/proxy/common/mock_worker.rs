@@ -56,6 +56,19 @@ where
 }
 
 impl MockWorker {
+    pub async fn wait_for_request(&self) -> Bytes {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(body) = self.captured.lock().unwrap().last_body.clone() {
+                    return body;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker must receive the independently dispatched request")
+    }
+
     /// Bind to a random port on 127.0.0.1 and start serving.
     ///
     /// `stream_chunks` are the raw SSE bytes returned when a streaming
@@ -72,6 +85,7 @@ impl MockWorker {
         // worker-manager introspect step resolves model_ids for the
         // "tiny" model the tests register a tokenizer + policy under.
         let app = axum::Router::new()
+            .route("/health", get(|| async { StatusCode::OK }))
             .route("/v1/chat/completions", post(chat))
             .route("/v1/completions", post(chat))
             .route("/generate", post(generate))
@@ -160,6 +174,7 @@ impl MockWorker {
             delay,
         };
         let app = axum::Router::new()
+            .route("/health", get(|| async { StatusCode::OK }))
             .route("/v1/chat/completions", post(hang_handler))
             .route("/server_info", get(serve_tiny_server_info))
             .route("/abort_request", abort_request_route(abort_log.clone()))
@@ -243,6 +258,7 @@ impl MockWorker {
             delay,
         };
         let app = axum::Router::new()
+            .route("/health", get(|| async { StatusCode::OK }))
             .route("/v1/chat/completions", post(slow_chat))
             .route("/generate", post(slow_chat))
             .route("/server_info", get(serve_tiny_server_info))
@@ -402,6 +418,7 @@ impl MockWorker {
             status,
         };
         let app = axum::Router::new()
+            .route("/health", get(|| async { StatusCode::OK }))
             .route("/v1/chat/completions", post(error_handler))
             .route("/generate", post(error_handler))
             .route("/server_info", get(serve_tiny_server_info))
@@ -443,6 +460,10 @@ async fn serve_tiny_server_info() -> Json<Value> {
 
 #[allow(dead_code)] // Used by `MockWorker::start`, only some test files need it.
 fn capture_request(s: &MockWorkerState, headers: &HeaderMap, body: &Bytes) -> Value {
+    // Placement assertions observe client traffic, independently of background health probes.
+    if headers.contains_key("x-sgl-router-probe") {
+        return serde_json::from_slice(body).unwrap_or(Value::Null);
+    }
     let mut g = s.captured.lock().unwrap();
     g.last_body = Some(body.clone());
     for (k, v) in headers.iter() {
@@ -508,7 +529,7 @@ async fn generate(
     Json(serde_json::json!({
         "text": "ok",
         "output_ids": [1, 2],
-        "meta_info": {"id": v["rid"], "finish_reason": {"type": "stop"}},
+        "meta_info": {"id": v["rid"], "completion_tokens": 2, "finish_reason": {"type": "stop"}},
     }))
     .into_response()
 }

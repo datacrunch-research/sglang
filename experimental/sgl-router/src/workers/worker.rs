@@ -6,9 +6,11 @@ use crate::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use sglang_api_types::runtime::v1::sglang_service_client::SglangServiceClient;
 use sglang_processor::openai::OpenAiSettings;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+
+static NEXT_HEALTH_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
 /// How long a prefill stays unroutable, after joining its model pool, while
 /// `/server_info` has not reported its bootstrap port. Afterwards the router sends
@@ -229,6 +231,9 @@ pub struct Worker {
     grpc: Option<SglangServiceClient<tonic::transport::Channel>>,
     pub model_ids: Vec<ModelId>,
     pub breaker: Arc<CircuitBreaker>,
+    active_healthy: Arc<AtomicBool>,
+    generation_success: Arc<Mutex<Option<tokio::time::Instant>>>,
+    health_instance: u64,
     pub active_requests: Arc<AtomicUsize>,
     /// Timestamped ledger for requests whose policy reads Engine Load;
     /// answers [`Worker::slots_acquired_since`].
@@ -293,6 +298,9 @@ impl Worker {
             grpc,
             model_ids: spec.model_ids,
             breaker,
+            active_healthy: Arc::new(AtomicBool::new(true)),
+            generation_success: Arc::new(Mutex::new(None)),
+            health_instance: NEXT_HEALTH_INSTANCE.fetch_add(1, Ordering::Relaxed),
             active_requests,
             slots,
             bootstrap_host,
@@ -326,6 +334,32 @@ impl Worker {
         *self.services.write().unwrap() = services;
     }
 
+    pub(crate) fn health_instance(&self) -> u64 {
+        self.health_instance
+    }
+
+    pub(crate) fn record_generation_success(&self) {
+        *self.generation_success.lock().unwrap() = Some(tokio::time::Instant::now());
+    }
+
+    pub(crate) fn recently_generated(&self, freshness: Duration) -> bool {
+        self.generation_success
+            .lock()
+            .unwrap()
+            .is_some_and(|at| at.elapsed() <= freshness)
+    }
+
+    pub fn set_active_healthy(&self, healthy: bool) {
+        self.active_healthy.store(healthy, Ordering::Relaxed);
+    }
+    pub(crate) fn active_health_passes(&self) -> bool {
+        self.active_healthy.load(Ordering::Relaxed)
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        self.active_healthy.load(Ordering::Relaxed) && self.breaker.would_allow()
+    }
+
     /// Hostname carried on PD-disagg request bodies as `bootstrap_host`.
     pub fn bootstrap_host(&self) -> &str {
         &self.bootstrap_host
@@ -345,6 +379,17 @@ impl Worker {
         }
         if prev.breaker.config() == self.breaker.config() {
             self.breaker = Arc::clone(&prev.breaker);
+        }
+        if self.url == prev.url
+            && self.mode() == prev.mode()
+            && self.model_ids == prev.model_ids
+            && self.bootstrap_port == prev.bootstrap_port
+            && self.version_group == prev.version_group
+            && self.protocol == prev.protocol
+        {
+            self.active_healthy = Arc::clone(&prev.active_healthy);
+            self.generation_success = Arc::clone(&prev.generation_success);
+            self.health_instance = prev.health_instance;
         }
         self.active_requests = Arc::clone(&prev.active_requests);
         self.slots = Arc::clone(&prev.slots);

@@ -7,7 +7,7 @@ mod abort;
 pub mod grpc;
 pub mod sse;
 
-use abort::AbortOnDrop;
+pub use abort::AbortOnDrop;
 
 use crate::health::circuit_breaker::CircuitBreaker;
 use crate::server::error::ApiError;
@@ -127,6 +127,7 @@ pub struct Proxy {
     pub request_timeout: Duration,
     /// Maximum silence between streamed upstream chunks; `None` waits forever.
     pub stream_idle_timeout: Option<Duration>,
+    forward_request_headers: Vec<HeaderName>,
 }
 
 /// Build a forwarding client for `protocol`, sharing pool/connect tuning
@@ -196,7 +197,17 @@ impl Proxy {
             h2c_client: build_client(WireProtocol::H2c)?,
             request_timeout,
             stream_idle_timeout: None,
+            forward_request_headers: Vec::new(),
         })
+    }
+
+    pub fn with_forward_request_headers(mut self, headers: Vec<HeaderName>) -> Self {
+        self.forward_request_headers = headers;
+        self
+    }
+
+    fn forwards_header(&self, name: &HeaderName) -> bool {
+        should_forward_request_header(name) || self.forward_request_headers.contains(name)
     }
 
     pub fn with_stream_idle_timeout(mut self, timeout: Duration) -> Self {
@@ -206,11 +217,24 @@ impl Proxy {
 
     /// The forwarding client for `protocol`, taken from the selected worker's
     /// [`crate::workers::Worker::protocol`].
-    fn client_for(&self, protocol: WireProtocol) -> &Client {
+    pub(crate) fn client_for(&self, protocol: WireProtocol) -> &Client {
         match protocol {
             WireProtocol::Http1 => &self.default_client,
             WireProtocol::H2c => &self.h2c_client,
         }
+    }
+
+    pub fn abort_on_drop(
+        &self,
+        worker_url: &str,
+        protocol: WireProtocol,
+        headers: &HeaderMap,
+        rid: Option<&str>,
+    ) -> AbortOnDrop {
+        Url::parse(worker_url).map_or_else(
+            |_| AbortOnDrop::default(),
+            |worker| AbortOnDrop::new(self.client_for(protocol), &worker, headers, rid),
+        )
     }
 
     /// The client for side-channel admin traffic (e.g. `/flush_cache`), which
@@ -274,7 +298,7 @@ impl Proxy {
         })?;
         let mut req = self.client_for(protocol).post(url.clone()).body(body);
         for (k, v) in headers {
-            if should_forward_request_header(k) {
+            if self.forwards_header(k) {
                 req = req.header(k, v);
             }
         }
@@ -375,7 +399,7 @@ impl Proxy {
         })?;
         let mut req = self.client_for(protocol).post(url.clone()).body(body);
         for (k, v) in headers {
-            if should_forward_request_header(k) {
+            if self.forwards_header(k) {
                 req = req.header(k, v);
             }
         }
@@ -383,7 +407,8 @@ impl Proxy {
             .header("content-type", "application/json")
             .header("accept", "text/event-stream");
         let mut abort =
-            AbortOnDrop::new(self.client_for(protocol), &worker_url, headers, abort_rid);
+            AbortOnDrop::new(self.client_for(protocol), &worker_url, headers, abort_rid)
+                .with_guards(stream_guards);
         // A worker that never answers is a fault, unlike a long stream once it answers.
         let resp = match tokio::time::timeout(
             self.request_timeout,
@@ -437,11 +462,11 @@ impl Proxy {
             match breaker_outcome(status) {
                 BreakerOutcome::Failure => {
                     breaker.record_failure();
-                    None
+                    Some(Box::new(move |_| drop(abort)))
                 }
                 BreakerOutcome::Neutral => {
                     breaker.record_backpressure();
-                    None
+                    Some(Box::new(move |_| drop(abort)))
                 }
                 BreakerOutcome::Success => {
                     let breaker_for_hook = Arc::clone(breaker);
@@ -470,7 +495,7 @@ impl Proxy {
         permit.disarm();
         let body = sse::bytes_stream_to_body(
             resp.bytes_stream(),
-            stream_guards,
+            None,
             on_complete,
             first_byte_hook,
             sse::StreamLimits {

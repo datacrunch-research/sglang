@@ -739,6 +739,9 @@ async fn default_pd_groups_apply_configured_inflight_admission() {
         let response = app.clone().oneshot(request(body("hi"))).await.unwrap();
         assert_eq!(response.status(), expected);
         response.into_body().collect().await.unwrap();
+        if expected == StatusCode::OK {
+            prefill.wait_for_request().await;
+        }
         assert_eq!(
             prefill.captured.lock().unwrap().last_body.is_some(),
             expected == StatusCode::OK
@@ -986,6 +989,7 @@ async fn full_decode_group_falls_back_to_another_version_group() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    workers[1].wait_for_request().await;
     let dispatched: Vec<_> = workers
         .iter()
         .map(|w| w.captured.lock().unwrap().last_body.is_some())

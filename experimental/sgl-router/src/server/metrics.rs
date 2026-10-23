@@ -88,6 +88,8 @@
 //!   deliberately does NOT spell `cache_hit*`: a `decision=~"cache_hit.*"`
 //!   hit-rate query must not absorb it, or a fully saturated fleet reads as a
 //!   healthy one.
+//! - `idle_spill` — `--route-by-uncached-tokens` sent the request to an idle DP
+//!   rank in another bucket, skipping the cache-aware selection.
 //!
 //! `sgl_router_input_ids_forwarding_total` records one outcome per dispatched
 //! `/v1/chat/completions` request, so `outcome!="forwarded"` over the sum is
@@ -384,6 +386,7 @@ pub enum CacheAwareDecision {
     CacheMiss,
     CacheWorkerQueued,
     AllQueued,
+    IdleSpill,
 }
 
 impl CacheAwareDecision {
@@ -393,6 +396,7 @@ impl CacheAwareDecision {
             Self::CacheMiss => "cache_miss",
             Self::CacheWorkerQueued => "cache_worker_queued",
             Self::AllQueued => "all_queued",
+            Self::IdleSpill => "idle_spill",
         }
     }
 }
@@ -464,6 +468,8 @@ pub struct MetricsRegistry {
     // on `worker_requests_total` / the worker gauges instead.
     request_duration: Mutex<HashMap<String, Histogram>>,
     ttft_seconds: Mutex<HashMap<String, Histogram>>,
+    pd_prefill_duration: Mutex<HashMap<String, Histogram>>,
+    pd_failures_total: Mutex<HashMap<ModelOutcomeKey, Arc<AtomicU64>>>,
     stream_outcome_total: Mutex<HashMap<StreamOutcomeKey, Arc<AtomicU64>>>,
     router_inflight_load: Mutex<HashMap<RouterInflightLoadKey, Arc<AtomicI64>>>,
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
@@ -482,6 +488,9 @@ pub struct MetricsRegistry {
     retries_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
     input_ids_forwarding_total: Mutex<HashMap<ModelOutcomeKey, Arc<AtomicU64>>>,
     openai_route_total: Mutex<HashMap<ModelOutcomeKey, Arc<AtomicU64>>>,
+    cache_tokens_total: Mutex<HashMap<ModelOutcomeKey, Arc<AtomicU64>>>,
+    cache_prediction_error: Mutex<HashMap<String, Histogram>>,
+    cache_observations_total: Mutex<HashMap<ModelOutcomeKey, Arc<AtomicU64>>>,
     sampling_contract_rejections_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
 }
 
@@ -667,6 +676,29 @@ impl MetricsRegistry {
             .entry(model_id.to_owned())
             .or_insert_with(|| Histogram::new(REQUEST_DURATION_BUCKETS));
         hist.observe(seconds);
+    }
+
+    /// Duration of the prefill leg, through its response body or cancellation.
+    pub fn observe_pd_prefill_duration(&self, model_id: &str, seconds: f64) {
+        if seconds.is_finite() {
+            self.pd_prefill_duration
+                .lock()
+                .entry(model_id.to_owned())
+                .or_insert_with(|| Histogram::new(REQUEST_DURATION_BUCKETS))
+                .observe(seconds);
+        }
+    }
+    /// A failed P/D leg, including rejection and transport failure; this does
+    /// not claim to identify the engine's internal KV-bootstrap failure cause.
+    pub fn record_pd_failure(&self, model_id: &str, phase: &'static str) {
+        self.pd_failures_total
+            .lock()
+            .entry(ModelOutcomeKey {
+                model_id: model_id.to_owned(),
+                outcome: phase,
+            })
+            .or_default()
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Observe time-to-first-token (seconds) for `sgl_router_ttft_seconds` —
@@ -900,8 +932,55 @@ impl MetricsRegistry {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Bump `sgl_router_openai_route_total{model_id,outcome}`: `generate`, or
-    /// why the request went to the engine's own OpenAI route.
+    /// Record known cache estimates/reports; missing reports have their own counter.
+    pub fn record_cache_observation(
+        &self,
+        model_id: &str,
+        predicted: Option<u64>,
+        actual: Option<u64>,
+    ) {
+        if let (Some(predicted), Some(actual)) = (predicted, actual) {
+            self.cache_prediction_error
+                .lock()
+                .entry(model_id.to_owned())
+                .or_insert_with(|| {
+                    Histogram::new(&[
+                        0.0, 1.0, 64.0, 512.0, 2048.0, 8192.0, 32768.0, 131072.0, 524288.0,
+                        1048576.0,
+                    ])
+                })
+                .observe(predicted.abs_diff(actual) as f64);
+        }
+        for (outcome, tokens) in [("predicted", predicted), ("actual", actual)] {
+            if let Some(tokens) = tokens {
+                let key = ModelOutcomeKey {
+                    model_id: model_id.to_owned(),
+                    outcome,
+                };
+                let counter = self
+                    .cache_tokens_total
+                    .lock()
+                    .entry(key)
+                    .or_default()
+                    .clone();
+                counter.fetch_add(tokens, Ordering::Relaxed);
+            }
+        }
+        let key = ModelOutcomeKey {
+            model_id: model_id.to_owned(),
+            outcome: if actual.is_some() {
+                "reported"
+            } else {
+                "missing"
+            },
+        };
+        self.cache_observations_total
+            .lock()
+            .entry(key)
+            .or_default()
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_openai_route(&self, model_id: &str, passthrough: Option<&'static str>) {
         let key = ModelOutcomeKey {
             model_id: model_id.to_owned(),
@@ -1036,6 +1115,21 @@ impl MetricsRegistry {
             );
         }
         drop(guard);
+
+        out.push_str("# HELP sgl_router_pd_prefill_duration_seconds Prefill leg response or cancellation duration in seconds.\n# TYPE sgl_router_pd_prefill_duration_seconds histogram\n");
+        let guard = self.pd_prefill_duration.lock();
+        let mut models: Vec<_> = guard.keys().collect();
+        models.sort();
+        for model in models {
+            render_histogram(
+                &mut out,
+                "sgl_router_pd_prefill_duration_seconds",
+                &format!("model_id=\"{}\"", escape_label(model)),
+                &guard[model],
+            );
+        }
+        drop(guard);
+        render_model_outcomes(&mut out,"sgl_router_pd_failures_total","P/D leg failures by phase, including rejection and transport failure; engine-internal bootstrap cause is reported by engine metrics.",&self.pd_failures_total);
 
         // ttft histogram
         out.push_str(
@@ -1334,7 +1428,7 @@ impl MetricsRegistry {
 
         // cache_aware_decisions_total
         out.push_str(
-            "# HELP sgl_router_cache_aware_decisions_total Final Cache-Aware routing decisions, one per selection that resolved a worker: cache_hit = prefix owner won; cache_miss = no usable owner (a tree miss books here even under saturation, because the gate never fired); cache_worker_queued = queue gate diverted the request off its prefix; all_queued = queue gate fired but every worker is queueing (fleet-saturation signal, not a cache hit).\n",
+            "# HELP sgl_router_cache_aware_decisions_total Final Cache-Aware routing decisions, one per selection that resolved a worker: cache_hit = prefix owner won; cache_miss = no usable owner (a tree miss books here even under saturation, because the gate never fired); cache_worker_queued = queue gate diverted the request off its prefix; all_queued = queue gate fired but every worker is queueing (fleet-saturation signal, not a cache hit); idle_spill = --route-by-uncached-tokens sent a warm request off its busy buckets to an idle DP rank.\n",
         );
         out.push_str("# TYPE sgl_router_cache_aware_decisions_total counter\n");
         let guard = self.cache_aware_decisions_total.lock();
@@ -1413,6 +1507,31 @@ impl MetricsRegistry {
         }
         drop(guard);
 
+        out.push_str("# HELP sgl_router_cache_prediction_error_tokens Absolute predicted versus reported cached-token error, only for paired known observations.\n# TYPE sgl_router_cache_prediction_error_tokens histogram\n");
+        let guard = self.cache_prediction_error.lock();
+        let mut models: Vec<_> = guard.keys().collect();
+        models.sort();
+        for model in models {
+            render_histogram(
+                &mut out,
+                "sgl_router_cache_prediction_error_tokens",
+                &format!("model_id=\"{}\"", escape_label(model)),
+                &guard[model],
+            );
+        }
+        drop(guard);
+        render_model_outcomes(
+            &mut out,
+            "sgl_router_cache_tokens_total",
+            "Cache tokens predicted at selection and reported by completed client responses.",
+            &self.cache_tokens_total,
+        );
+        render_model_outcomes(
+            &mut out,
+            "sgl_router_cache_observations_total",
+            "Completed request cache observations; missing is never counted as a zero hit.",
+            &self.cache_observations_total,
+        );
         render_model_outcomes(
             &mut out,
             "sgl_router_input_ids_forwarding_total",
@@ -2100,5 +2219,21 @@ mod tests {
                 "status {status} must map to `{want}`",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_observation_tests {
+    #[test]
+    fn paired_cache_error_excludes_unknown_observations() {
+        let metrics = super::MetricsRegistry::new();
+        metrics.record_cache_observation("tiny", Some(900), Some(800));
+        metrics.record_cache_observation("tiny", Some(900), None);
+        metrics.record_cache_observation("tiny", None, Some(800));
+        let rendered = metrics.render();
+        assert!(rendered
+            .contains(r#"sgl_router_cache_prediction_error_tokens_count{model_id="tiny"} 1"#));
+        assert!(rendered
+            .contains(r#"sgl_router_cache_prediction_error_tokens_sum{model_id="tiny"} 100"#));
     }
 }

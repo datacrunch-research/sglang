@@ -288,8 +288,7 @@ pub struct KvEventIndex {
     /// Last built snapshot; see [`KvEventIndex::peer_snapshot_body`].
     snapshot_cache: Arc<AsyncMutex<Option<CachedSnapshot>>>,
     /// Worker-sourced `page_size` shared with prefix providers.
-    /// `add_worker` calls `try_set(cfg.block_size)` so the first worker
-    /// establishes the value; subsequent workers that disagree are
+    /// Worker configurations are registered before subscription; mismatches on one URL are
     /// rejected (logged + not subscribed). Prefix providers read it at routing
     /// time to size their `compute_block_hashes` calls.
     block_size_oracle: Arc<BlockSizeOracle>,
@@ -541,27 +540,19 @@ impl KvEventIndex {
                 }
             },
         };
-        // Reconcile this worker's `page_size` with the oracle BEFORE
-        // any subscriber state is created. The first worker establishes
-        // the value; later workers must agree. A mismatch means the
-        // router and at least one engine would compute different block
-        // hashes for the same prompt, silently destroying cache-aware
-        // routing quality — reject loudly instead.
-        if let Err(err) = self.block_size_oracle.try_set(cfg.block_size) {
+        // Register before subscription so every visible event has a matching query hasher.
+        if let Err(err) =
+            self.block_size_oracle
+                .register_worker(worker_url, cfg.block_size, cfg.is_bigram)
+        {
             warn!(
                 worker_url = %worker_url,
                 established_block_size = err.established,
                 worker_block_size = err.candidate,
-                "kv-events: worker page_size disagrees with established block_size; \
-                 skipping worker — cache-aware routing requires every worker to publish \
-                 at the same block size",
+                "kv-events: invalid or changed worker hash configuration; remove before re-registering",
             );
             return;
         }
-        // Establish the bigram flag alongside block_size. EAGLE-family workers
-        // hash KV blocks over token bigrams, so the policy must use the bigram
-        // hasher for its query hashes to match the worker's stored hashes.
-        self.block_size_oracle.set_bigram(cfg.is_bigram);
         let kv_dp_ranks = if self.maintain_tree {
             subscribable_ranks(cfg.port_base, cfg.dp_size)
         } else {
@@ -586,6 +577,7 @@ impl KvEventIndex {
         dp_ranks.sort_unstable();
         dp_ranks.dedup();
         if dp_ranks.is_empty() {
+            self.block_size_oracle.remove_worker(worker_url);
             warn!(
                 worker_url = %worker_url,
                 port_base = cfg.port_base,
@@ -708,6 +700,7 @@ impl KvEventIndex {
         let Some(entry) = self.workers.lock().remove(worker_url) else {
             return;
         };
+        self.block_size_oracle.remove_worker(worker_url);
         let ids: Vec<KvWorkerId> = entry
             .dp_ranks
             .iter()
