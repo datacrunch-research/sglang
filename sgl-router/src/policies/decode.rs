@@ -91,7 +91,9 @@ pub fn resolve_decode_with_capacity_fallback(
     resolve_decode(domain, proposal, request_kv_tokens, snapshot)
 }
 
-/// Samples two workers from a decode domain and orders them by decode pressure.
+/// Orders decode workers by decode pressure. With two workers that is the
+/// sampled pair; with three or more it ranks every worker, so the least-loaded
+/// one is never left out of the comparison.
 #[derive(Debug, Default)]
 pub struct DecodePowerOfTwoPolicy;
 
@@ -113,6 +115,7 @@ impl DecodePolicy for DecodePowerOfTwoPolicy {
                 SelectionProposal::primary(Arc::clone(&domain.workers[0]))
                     .with_kind(ProposalKind::PowerOfTwo),
             ),
+            len if len >= 3 => least_loaded_pair(&domain.workers, ctx.load_snapshot()),
             len => {
                 let mut rng = rand::thread_rng();
                 let i = rng.gen_range(0..len);
@@ -135,6 +138,38 @@ impl DecodePolicy for DecodePowerOfTwoPolicy {
             }
         }
     }
+}
+
+// Published load ranks the scan only when every worker has a fresh sample, so one
+// comparison rule holds across it; the random start spreads ties.
+fn least_loaded_pair(
+    workers: &[Arc<crate::workers::Worker>],
+    snapshot: Option<&EngineReportedLoadSnapshot>,
+) -> Option<SelectionProposal> {
+    let snapshot = snapshot.filter(|snapshot| {
+        workers.iter().all(|worker| {
+            snapshot
+                .fresh_native_cache_load_for_url(&worker.url)
+                .is_some()
+        })
+    });
+    let start = rand::thread_rng().gen_range(0..workers.len());
+    let mut order = workers[start..].iter().chain(&workers[..start]);
+    let (mut primary, mut backup) = (order.next()?, order.next()?);
+    if compare_decode_engines(primary, backup, snapshot).is_gt() {
+        std::mem::swap(&mut primary, &mut backup);
+    }
+    for candidate in order {
+        if compare_decode_engines(candidate, primary, snapshot).is_lt() {
+            backup = std::mem::replace(&mut primary, candidate);
+        } else if compare_decode_engines(candidate, backup, snapshot).is_lt() {
+            backup = candidate;
+        }
+    }
+    Some(
+        SelectionProposal::with_backup(Arc::clone(primary), Arc::clone(backup))
+            .with_kind(ProposalKind::PowerOfTwo),
+    )
 }
 
 /// Compatibility policy for legacy same-host PD decode selection.

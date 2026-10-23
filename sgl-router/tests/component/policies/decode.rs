@@ -245,6 +245,51 @@ fn decode_p2_proposes_a_distinct_lower_pressure_primary_and_backup() {
     );
 }
 
+/// With three or more decode workers, every pick is the least-loaded worker and
+/// the backup the next; a random pair would miss the least-loaded one.
+#[test]
+fn decode_p2_ranks_every_worker_from_three_up() {
+    let workers: Vec<_> = ["d0", "d1", "d2", "d3"].map(worker).into();
+    for (worker, active) in workers.iter().zip([9, 7, 1, 5]) {
+        worker.active_requests.store(active, Ordering::Relaxed);
+    }
+    let domain = CandidateDomain::global_decode(&workers);
+    let policy = DecodePowerOfTwoPolicy::new();
+    for _ in 0..64 {
+        let proposal = policy
+            .propose(&domain, &DecodeSelectionContext::new())
+            .unwrap();
+        assert_eq!(proposal.primary.id.0, "d2");
+        assert_eq!(proposal.backup.expect("a backup").id.0, "d3");
+    }
+
+    // Published load ranks only when every worker has a fresh sample.
+    let all = snapshot(&[
+        (&workers[0], 1, 0, 10, 1000),
+        (&workers[1], 9, 0, 10, 1000),
+        (&workers[2], 8, 0, 10, 1000),
+        (&workers[3], 7, 0, 10, 1000),
+    ]);
+    let ctx = DecodeSelectionContext::new().with_load_snapshot(&all);
+    assert_eq!(policy.propose(&domain, &ctx).unwrap().primary.id.0, "d0");
+    let partial = snapshot(&[(&workers[0], 1, 0, 10, 1000), (&workers[2], 8, 0, 10, 1000)]);
+    let ctx = DecodeSelectionContext::new().with_load_snapshot(&partial);
+    assert_eq!(policy.propose(&domain, &ctx).unwrap().primary.id.0, "d2");
+
+    // Ties spread instead of always landing on the first worker.
+    for worker in &workers {
+        worker.active_requests.store(0, Ordering::Relaxed);
+    }
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..256 {
+        let proposal = policy
+            .propose(&domain, &DecodeSelectionContext::new())
+            .unwrap();
+        seen.insert(proposal.primary.id.0.clone());
+    }
+    assert_eq!(seen.len(), workers.len(), "ties must not pin one worker");
+}
+
 #[test]
 fn legacy_host_affinity_remains_an_explicit_single_primary_compatibility_policy() {
     let same_host = worker("host-a");
