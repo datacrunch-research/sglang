@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -220,7 +221,7 @@ def build_kv_host_pool(
         )
         kwargs["dcp_size"] = parallel.attn_dcp_size
         kwargs["dcp_rank"] = parallel.attn_dcp_rank
-    if use_mla and pool_label == "kv":
+    if use_mla and pool_label == "kv" and envs.SGLANG_HICACHE_MLA_HOST_SHARD.get():
         host_shard = make_mla_host_shard(
             storage_backend=get_memory().hicache_storage_backend,
             layout=get_memory().hicache_mem_layout,

@@ -283,7 +283,6 @@ def make_mla_host_shard(
     """The shard group for the MLA host pool, or None when the env is off.
 
     Refuses configurations the striped host tier does not support."""
-    from sglang.srt.distributed.parallel_state import get_attn_tp_group
     from sglang.srt.environ import envs
     from sglang.srt.runtime_context import get_parallel
 
@@ -304,7 +303,7 @@ def make_mla_host_shard(
             f"SGLANG_HICACHE_MLA_HOST_SHARD needs --hicache-mem-layout in "
             f"{_SUPPORTED_LAYOUTS}, got {layout!r}"
         )
-    group = get_attn_tp_group()
+    group = parallel.attn_tp_group
     if group.world_size <= 1:
         logger.warning("SGLANG_HICACHE_MLA_HOST_SHARD ignored: attention TP size 1")
         return None
