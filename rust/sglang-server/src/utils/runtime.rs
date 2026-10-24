@@ -185,9 +185,13 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         &cfg.server_args.tokenizer_path,
         cfg.server_args.revision.as_deref(),
     );
-    let text_tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>> = dyn_tokenizer.as_ref().map(|t| {
-        Arc::new(tokenizer::DynamoTokenizer::with_kimi_chunks(t.clone(), kimi_chunks)) as _
-    });
+    let text_tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>> =
+        dyn_tokenizer.as_ref().map(|t| {
+            Arc::new(tokenizer::DynamoTokenizer::with_kimi_chunks(
+                t.clone(),
+                kimi_chunks,
+            )) as _
+        });
 
     // The potentially slow/fallible tokenizer load above happens before the
     // ports become visible. Own both sockets before starting any worker or

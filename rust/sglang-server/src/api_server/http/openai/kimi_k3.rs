@@ -159,8 +159,11 @@ impl KimiK3Chat {
                 .map(str::to_owned)
         };
         let routing_key = header("x-smg-routing-key");
-        let custom_labels = (self.settings.tokenizer_metrics_custom_labels_header.as_deref())
-            .and_then(|name| header(name));
+        let custom_labels = (self
+            .settings
+            .tokenizer_metrics_custom_labels_header
+            .as_deref())
+        .and_then(&header);
         let sglext_ids = ["x-sglext-return-input-ids", "x-sglext-return-output-ids"]
             .iter()
             .any(|name| header(name).as_deref() == Some("1"));
@@ -183,7 +186,10 @@ impl KimiK3Chat {
             let lowered = lower_chat(&body, &headers, &this.settings, &this.model, render, None);
             lowered.map_err(|unsupported| match render_error {
                 Some(error) => format!("Kimi-K3 chat render failed: {error}"),
-                None => format!("Kimi-K3 chat request not served by the Rust server: {}", unsupported.0),
+                None => format!(
+                    "Kimi-K3 chat request not served by the Rust server: {}",
+                    unsupported.0
+                ),
             })
         })
         .await;

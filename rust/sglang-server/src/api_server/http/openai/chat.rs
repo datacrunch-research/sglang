@@ -255,6 +255,7 @@ async fn chat_completions(
             uses_tool_call_structural_tag,
             parallel_tool_calls,
             service_tier,
+            state.server_args.enable_cache_report,
         )
         .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
         Sse::new(event_stream).into_response()
@@ -271,6 +272,7 @@ async fn chat_completions(
             tools,
             parallel_tool_calls,
             service_tier,
+            state.server_args.enable_cache_report,
         )
         .await
     }
@@ -464,6 +466,7 @@ pub(super) async fn unary_chat(
     tools: Option<Vec<ToolDefinition>>,
     parallel_tool_calls: bool,
     service_tier: Option<ChatServiceTier>,
+    cache_report: bool,
 ) -> Response {
     let reasoning_options = ReasoningOptions {
         force_reasoning: starts_in_reasoning.then_some(true),
@@ -471,6 +474,7 @@ pub(super) async fn unary_chat(
     };
     let mut choices = Vec::with_capacity(submitted.len());
     let mut prompt_tokens = 0;
+    let mut cached_tokens = 0u32;
     let mut completion_tokens = 0u64;
 
     for (index, call) in submitted {
@@ -483,6 +487,9 @@ pub(super) async fn unary_chat(
 
         if prompt_tokens == 0 {
             prompt_tokens = output.prompt_tokens;
+        }
+        if index == 0 {
+            cached_tokens = output.cached_tokens;
         }
         completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
         let logprobs = want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
@@ -538,6 +545,7 @@ pub(super) async fn unary_chat(
         usage: Some(completion_usage(
             prompt_tokens,
             u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+            cache_report.then_some(cached_tokens),
         )),
     })
     .into_response()
@@ -559,12 +567,14 @@ pub(super) fn chat_event_stream(
     uses_tool_call_structural_tag: bool,
     parallel_tool_calls: bool,
     service_tier: Option<ChatServiceTier>,
+    cache_report: bool,
 ) -> impl futures::Stream<Item = String> {
     let count = submitted.len();
     let raw = async_stream::stream! {
         let count = submitted.len();
         let mut streams = Vec::with_capacity(count);
         let mut prompt_tokens = 0u32;
+        let mut cached_tokens = 0u32;
         let mut completion_tokens = 0u64;
         // One stateful reasoning splitter per choice (Python keeps a
         // `reasoning_parser_dict` per index).
@@ -624,6 +634,9 @@ pub(super) fn chat_event_stream(
             if prompt_tokens == 0 {
                 prompt_tokens = output.prompt_tokens;
             }
+            if index == 0 {
+            cached_tokens = output.cached_tokens;
+        }
             completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
             let finish_reason = chat_finish_reason(&output);
             // Split the step's text into (reasoning, normal) deltas when
@@ -733,6 +746,7 @@ pub(super) fn chat_event_stream(
                     usage: Some(completion_usage(
                         prompt_tokens,
                         u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+                        cache_report.then_some(cached_tokens),
                     )),
                 }),
                 id: None,
@@ -1072,8 +1086,14 @@ mod tests {
     async fn unary_chat_fans_in_choices_and_usage() {
         let (choice0, tx0) = chat_submitted(0, "r0");
         let (choice1, tx1) = chat_submitted(1, "r1");
-        tx0.send(chunk("r0", "Paris", true)).await.unwrap();
-        tx1.send(chunk("r1", "Paris", true)).await.unwrap();
+        for (tx, rid, cached) in [(tx0, "r0", 2), (tx1, "r1", 9)] {
+            let mut event = chunk(rid, "Paris", true);
+            if let crate::message::response::ResponseItem::Done(output) = &mut event {
+                output.prompt_tokens = 12;
+                output.cached_tokens = cached;
+            }
+            tx.send(event).await.unwrap();
+        }
 
         let response = unary_chat(
             vec![choice0, choice1],
@@ -1087,6 +1107,7 @@ mod tests {
             None,
             true,
             None,
+            true,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1097,8 +1118,59 @@ mod tests {
         assert_eq!(value["choices"][0]["message"]["role"], "assistant");
         assert_eq!(value["choices"][0]["message"]["content"], "Paris");
         assert_eq!(value["choices"][1]["index"], 1);
-        assert_eq!(value["usage"]["prompt_tokens"], 5);
+        assert_eq!(value["usage"]["prompt_tokens"], 12);
         assert_eq!(value["usage"]["completion_tokens"], 2);
+        assert_eq!(value["usage"]["prompt_tokens_details"]["cached_tokens"], 2);
+    }
+
+    #[tokio::test]
+    async fn streaming_chat_cache_usage_waits_for_logical_choice_zero() {
+        let (choice0, tx0) = chat_submitted(0, "r0");
+        let (choice1, tx1) = chat_submitted(1, "r1");
+        let event = |rid, text, cached| {
+            let mut event = chunk(rid, text, true);
+            if let crate::message::response::ResponseItem::Done(output) = &mut event {
+                output.prompt_tokens = 12;
+                output.cached_tokens = cached;
+            }
+            event
+        };
+        tx1.send(event("r1", "one", 9)).await.unwrap();
+        let stream = chat_event_stream(
+            vec![choice0, choice1],
+            "response".into(),
+            "model".into(),
+            1,
+            false,
+            true,
+            None,
+            None,
+            false,
+            None,
+            None,
+            false,
+            true,
+            None,
+            true,
+        );
+        futures::pin_mut!(stream);
+        // Choice one produces visible content before choice zero can finish.
+        loop {
+            let frame = stream.next().await.expect("choice one must stream first");
+            let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
+            if value["choices"][0]["delta"]["content"] == "one" {
+                assert_eq!(value["choices"][0]["index"], 1);
+                break;
+            }
+        }
+        tx0.send(event("r0", "zero", 2)).await.unwrap();
+        let rest: Vec<_> = stream.collect().await;
+        let usage = rest
+            .iter()
+            .filter_map(|frame| serde_json::from_str::<serde_json::Value>(frame).ok())
+            .find(|value| value["usage"].is_object())
+            .expect("final usage");
+        assert_eq!(usage["usage"]["prompt_tokens_details"]["cached_tokens"], 2);
     }
 
     #[tokio::test]
@@ -1124,6 +1196,7 @@ mod tests {
             None,
             true,
             None,
+            true,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1165,6 +1238,7 @@ mod tests {
             false,
             true,
             None,
+            true,
         );
         futures::pin_mut!(stream);
         let frames: Vec<String> = stream.collect().await;
@@ -1211,6 +1285,7 @@ mod tests {
             false,
             true,
             None,
+            true,
         );
         futures::pin_mut!(stream);
         let frames: Vec<String> = stream.collect().await;

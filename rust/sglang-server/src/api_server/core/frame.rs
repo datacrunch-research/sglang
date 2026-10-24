@@ -95,6 +95,10 @@ impl CoreOutput {
             .extras
             .get_or_insert_with(|| Box::new(ChunkExtras::default()));
 
+        if delta_extras.cached_tokens_details.is_some() {
+            extras.cached_tokens_details = delta_extras.cached_tokens_details.clone();
+        }
+
         extras
             .out_lp_val
             .extend_from_slice(&delta_extras.out_lp_val);
@@ -224,6 +228,17 @@ impl CoreOutput {
         let Some(extras) = self.extras.as_deref() else {
             return meta;
         };
+
+        meta.cached_tokens_details =
+            extras
+                .cached_tokens_details
+                .as_ref()
+                .map(|details| api::CachedTokensDetails {
+                    device: details.device,
+                    host: details.host,
+                    storage: details.storage,
+                    storage_backend: details.storage_backend.clone(),
+                });
 
         // Python always sets input and output token logprobs together, including
         // the empty input list emitted by a disaggregated decode node.
@@ -484,6 +499,48 @@ mod tests {
             assert_eq!(output.token_ids, [1, 2, 3]);
             assert_eq!(output.stop_trimmed_token_ids(), expected);
         }
+    }
+
+    /// Cache details arrive only on first output and finish. Middle deltas
+    /// may have no extras, or unrelated extras, and must preserve the proof.
+    #[test]
+    fn cache_details_survive_middle_deltas_and_refresh_at_finish() {
+        use crate::message::response::CachedTokensDetails;
+
+        let with_details = |cached_tokens, storage| CoreOutput {
+            cached_tokens,
+            extras: Some(Box::new(ChunkExtras {
+                cached_tokens_details: Some(CachedTokensDetails {
+                    device: 2,
+                    host: 3,
+                    storage: Some(storage),
+                    storage_backend: Some("test-store".into()),
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let mut output = CoreOutput::default();
+        output.append_delta(&with_details(8, 3));
+        for extras in [None, Some(Box::new(ChunkExtras::default()))] {
+            output.append_delta(&CoreOutput {
+                cached_tokens: 8,
+                extras,
+                ..Default::default()
+            });
+            let meta = output.meta_info("rid", None);
+            assert_eq!(meta.cached_tokens, 8);
+            let details = meta.cached_tokens_details.unwrap();
+            assert_eq!(details.storage, Some(3));
+            assert_eq!(details.storage_backend.as_deref(), Some("test-store"));
+        }
+        let mut terminal = with_details(10, 5);
+        terminal.finish_reason = Some(FinishKind::Length { length: Some(3) }.into());
+        output.append_delta(&terminal);
+        let meta = output.meta_info("rid", None);
+        assert_eq!(meta.cached_tokens, 10);
+        assert_eq!(meta.cached_tokens_details.unwrap().storage, Some(5));
+        assert!(meta.finish_reason.is_some());
     }
 
     /// A finish type this build does not know still reaches the client, as

@@ -41,6 +41,10 @@ use crate::message::config::RuntimeConfig;
 use crate::utils::startup::{grpc_listen_addr, listen_addr, value_error};
 use crate::utils::{logging, runtime, shm::ShmSegment};
 
+// Version 1 includes the 19-column generation header. Keep in lockstep with
+// python/sglang/srt/rust_server/server.py when changing the scheduler wire.
+const RUST_SERVER_WIRE_VERSION: u32 = 2;
+
 /// One drained request handed to Python by [`Server::recv_requests`]: the
 /// msgpack scalar header plus every non-scalar payload as a named buffer --
 /// `input_ids`, `token_ids_logprob`, and for a multimodal request the
@@ -354,6 +358,22 @@ impl Server {
 /// Register all Python boundary types used by [`Server`]. External
 /// model-package modules call this before exposing their wrapper server.
 pub fn register_boundary_types(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Check the actual Python producer before exposing a usable extension.
+    // Checking only an extension capability from Python misses the reverse
+    // deployment mistake: an older producer loading a newly built module.
+    let producer = m.py().import("sglang.srt.rust_server.server")?;
+    let python_version = producer
+        .getattr("RUST_SERVER_WIRE_VERSION")
+        .and_then(|version| version.extract::<u32>())
+        .ok();
+    if python_version != Some(RUST_SERVER_WIRE_VERSION) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Rust server wire protocol mismatch: Python={python_version:?}, \
+             extension={RUST_SERVER_WIRE_VERSION}. Install the matching Python code \
+             and Rust extension together."
+        )));
+    }
+    m.add("RUST_SERVER_WIRE_VERSION", RUST_SERVER_WIRE_VERSION)?;
     logging::init_tracing();
     m.add_class::<DisaggregationMode>()?;
     m.add_class::<DefaultSamplingParams>()?;

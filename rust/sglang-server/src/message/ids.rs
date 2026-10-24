@@ -73,9 +73,9 @@ impl Rid {
     /// the rid is an identity downstream: detok `Register` is an insert-overwrite,
     /// so the second would evict the first's sink, 500 that client mid-generation
     /// and deliver its remaining chunks to the second's connection. Uniquifying
-    /// here makes the collision unrepresentable rather than something a duplicate
-    /// check has to catch — no in-flight registry, no admission/release ordering
-    /// to get wrong, and both clients get served instead of the second being 400'd.
+    /// here makes the collision unrepresentable in downstream stage tables,
+    /// and both clients get served instead of the second being 400'd. The public
+    /// abort-selector index does not replace this internal identity.
     ///
     /// The client never sees this: [`client_facing`](Self::client_facing) strips it
     /// back off for `meta_info.id`. Only the scheduler wire and its logs carry the

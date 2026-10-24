@@ -145,6 +145,10 @@ pub struct ServerArgs {
     /// Apply the router's `x-override-*` headers to `/generate` bodies
     /// (`SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES`).
     pub enable_request_header_overrides: bool,
+    /// Explicit opt-in for the public abort-all operation.
+    pub rust_server_allow_abort_all: bool,
+    /// Include cache-hit information in OpenAI usage.
+    pub enable_cache_report: bool,
     /// Streamed `/generate` frames carry per-step deltas instead of cumulative
     /// text. Matches the Python `TokenizerManager`.
     pub incremental_streaming_output: bool,
@@ -219,6 +223,8 @@ impl ServerArgs {
         skip_server_warmup,
         health_generate_headers,
         default_priority_value,
+        rust_server_allow_abort_all,
+        enable_cache_report,
         enable_request_header_overrides,
         incremental_streaming_output,
         disaggregation_mode,
@@ -263,6 +269,8 @@ impl ServerArgs {
         skip_server_warmup: bool,
         health_generate_headers: BTreeMap<String, String>,
         default_priority_value: Option<i64>,
+        rust_server_allow_abort_all: bool,
+        enable_cache_report: bool,
         enable_request_header_overrides: bool,
         incremental_streaming_output: bool,
         disaggregation_mode: DisaggregationMode,
@@ -305,6 +313,8 @@ impl ServerArgs {
             skip_server_warmup,
             health_generate_headers,
             default_priority_value,
+            rust_server_allow_abort_all,
+            enable_cache_report,
             enable_request_header_overrides,
             incremental_streaming_output,
             disaggregation_mode,
@@ -355,6 +365,8 @@ impl Default for ServerArgs {
             skip_server_warmup: false,
             health_generate_headers: BTreeMap::new(),
             default_priority_value: None,
+            rust_server_allow_abort_all: false,
+            enable_cache_report: false,
             enable_request_header_overrides: false,
             incremental_streaming_output: false,
             disaggregation_mode: DisaggregationMode::Null,

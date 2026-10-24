@@ -105,7 +105,11 @@ pub(super) fn tool_call_tag_for_choice(
     };
     let tools_tag = tool_calls_tag(call_tags, parallel_tool_calls);
     let keep = |tokens: &[&'static str]| -> Vec<&'static str> {
-        tokens.iter().copied().filter(|t| !strip.contains(t)).collect()
+        tokens
+            .iter()
+            .copied()
+            .filter(|t| !strip.contains(t))
+            .collect()
     };
     let format = if at_least_one {
         let excludes = keep(&[TOOLS_OPEN, THINK_OPEN, THINK_CLOSE, CALL_OPEN]);
@@ -145,7 +149,11 @@ fn choice_call_tag(function: &Value) -> Result<Value, ()> {
 }
 
 fn xtml_type(json_type: &str) -> &str {
-    if json_type == "integer" { "number" } else { json_type }
+    if json_type == "integer" {
+        "number"
+    } else {
+        json_type
+    }
 }
 
 fn types_of(schema: &Value, root: &Value) -> Result<Vec<&'static str>, ()> {
@@ -272,7 +280,11 @@ fn value_format(schema: Value, json_type: &str, loose_string: bool) -> Value {
             .iter()
             .any(|k| map.contains_key(*k))
     {
-        let int = |key: &str| map.get(key).filter(|v| v.is_i64() || v.is_u64()).and_then(Value::as_i64);
+        let int = |key: &str| {
+            map.get(key)
+                .filter(|v| v.is_i64() || v.is_u64())
+                .and_then(Value::as_i64)
+        };
         let bounds: Vec<i64> = [int("minimum"), int("exclusiveMinimum").map(|v| v + 1)]
             .into_iter()
             .flatten()
@@ -286,7 +298,11 @@ fn value_format(schema: Value, json_type: &str, loose_string: bool) -> Value {
             schema = json!({"anyOf": [negative, nonnegative]});
         }
     }
-    let style = if json_type == "string" { "qwen_xml" } else { "json" };
+    let style = if json_type == "string" {
+        "qwen_xml"
+    } else {
+        "json"
+    };
     json!({"type": "json_schema", "json_schema": schema, "style": style, "any_order": false, "max_whitespace_cnt": null})
 }
 
@@ -299,7 +315,10 @@ fn argument_value_variants(
     let mut variants = Vec::new();
     for json_type in types_of(schema, root)? {
         if let Some(restricted) = restrict_schema_type(schema, json_type, root, 0)? {
-            variants.push((json_type, value_format(restricted, json_type, loose_strings)));
+            variants.push((
+                json_type,
+                value_format(restricted, json_type, loose_strings),
+            ));
         }
     }
     Ok(variants)
@@ -322,7 +341,9 @@ fn dynamic_argument_format(schema: &Value, root: &Value, loose_strings: bool) ->
         1 => variants.into_iter().next().expect("one variant"),
         _ => json!({"type": "or", "elements": variants}),
     };
-    Ok(json!({"type": "tag", "begin": "<|open|>argument key=\"", "content": content, "end": ARGUMENT_CLOSE}))
+    Ok(
+        json!({"type": "tag", "begin": "<|open|>argument key=\"", "content": content, "end": ARGUMENT_CLOSE}),
+    )
 }
 
 /// `_known_argument_format`.
@@ -349,7 +370,11 @@ fn known_argument_format(key: &str, schema: &Value, root: &Value) -> Result<Opti
 /// `_strict_arguments_format`.
 fn strict_arguments_format(parameters: &Value) -> Result<Value, ()> {
     let empty = json!({});
-    let properties = parameters.get("properties").unwrap_or(&empty).as_object().ok_or(())?;
+    let properties = parameters
+        .get("properties")
+        .unwrap_or(&empty)
+        .as_object()
+        .ok_or(())?;
     let no_required = json!([]);
     let required: Vec<&str> = parameters
         .get("required")

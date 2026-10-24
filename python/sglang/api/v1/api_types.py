@@ -308,6 +308,7 @@ class GenerateMetaInfo(msgspec.Struct, kw_only=True, frozen=True):
     e2e_latency: Optional[float] = None
     cached_tokens: int = 0
     reasoning_tokens: int = 0
+    cached_tokens_details: Optional[CachedTokensDetails] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateMetaInfo":
@@ -317,6 +318,24 @@ class GenerateMetaInfo(msgspec.Struct, kw_only=True, frozen=True):
     def to_json_value(self) -> Dict[str, Any]:
         """Encode to a JSON-ready value (json.dumps-compatible)."""
         return encode_GenerateMetaInfo(self)
+
+
+class CachedTokensDetails(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.CachedTokensDetails: JSON object (unknown keys ignored)."""
+
+    device: int = 0
+    host: int = 0
+    storage: Optional[int] = None
+    storage_backend: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "CachedTokensDetails":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_CachedTokensDetails(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_CachedTokensDetails(self)
 
 
 class GenerateResponse(msgspec.Struct, kw_only=True, frozen=True):
@@ -1283,6 +1302,8 @@ def decode_GenerateMetaInfo(value: Any) -> GenerateMetaInfo:
             kw["cached_tokens"] = _expect_uint(x, expected="u32")
         elif key == "reasoning_tokens":
             kw["reasoning_tokens"] = _expect_uint(x, expected="u64")
+        elif key == "cached_tokens_details":
+            kw["cached_tokens_details"] = None if x is None else decode_CachedTokensDetails(x)
     return GenerateMetaInfo(**kw)
 
 
@@ -1310,6 +1331,34 @@ def encode_GenerateMetaInfo(v: GenerateMetaInfo) -> Dict[str, Any]:
         d["e2e_latency"] = float(v.e2e_latency)
     d["cached_tokens"] = v.cached_tokens
     d["reasoning_tokens"] = v.reasoning_tokens
+    if v.cached_tokens_details is not None:
+        d["cached_tokens_details"] = encode_CachedTokensDetails(v.cached_tokens_details)
+    return d
+
+
+def decode_CachedTokensDetails(value: Any) -> CachedTokensDetails:
+    m = _expect_map(value, expected="struct CachedTokensDetails")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "device":
+            kw["device"] = _expect_uint(x, expected="u32")
+        elif key == "host":
+            kw["host"] = _expect_uint(x, expected="u32")
+        elif key == "storage":
+            kw["storage"] = None if x is None else _expect_uint(x, expected="u32")
+        elif key == "storage_backend":
+            kw["storage_backend"] = None if x is None else _expect_str(x, expected="a string")
+    return CachedTokensDetails(**kw)
+
+
+def encode_CachedTokensDetails(v: CachedTokensDetails) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["device"] = v.device
+    d["host"] = v.host
+    if v.storage is not None:
+        d["storage"] = v.storage
+    if v.storage_backend is not None:
+        d["storage_backend"] = v.storage_backend
     return d
 
 

@@ -3,9 +3,9 @@
 //! (model info, server info, flush cache, weights check, tokenize, detokenize,
 //! health probe).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
@@ -15,7 +15,8 @@ use tokio::sync::mpsc;
 use crate::message::config::{DisaggregationMode, ServerArgs};
 use crate::message::ids::Rid;
 use crate::message::io_struct::{
-    CheckWeightsReqInput, ControlRequest, FlushCacheReqInput, GetInternalStateReq,
+    CheckWeightsReqInput, ClearHiCacheReqInput, ControlRequest, FlushCacheReqInput,
+    GetInternalStateReq,
 };
 use crate::message::request::{GenerateRequest, Request, RequestKind};
 use crate::message::response::{ResponseItem, ResponseSink};
@@ -47,6 +48,7 @@ pub(crate) struct CoreConfig {
 /// depend on the full launch-configuration object.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CoreMetadata {
+    allow_abort_all: bool,
     model_path: String,
     served_model_name: String,
     tokenizer_path: String,
@@ -65,6 +67,7 @@ pub(crate) struct CoreMetadata {
 impl From<&ServerArgs> for CoreMetadata {
     fn from(args: &ServerArgs) -> Self {
         Self {
+            allow_abort_all: args.rust_server_allow_abort_all,
             model_path: args.model_path.clone(),
             served_model_name: args.served_model_name.clone(),
             tokenizer_path: args.tokenizer_path.clone(),
@@ -92,6 +95,7 @@ pub(crate) struct CoreHandle {
 }
 
 struct CoreInner {
+    live_generations: Arc<Mutex<HashSet<Rid>>>,
     intake_tx: flume::Sender<TmEvent>,
     abort_tx: flume::Sender<AbortSource>,
     response_capacity: usize,
@@ -110,6 +114,7 @@ impl CoreHandle {
     ) -> Self {
         Self {
             inner: Arc::new(CoreInner {
+                live_generations: Arc::default(),
                 intake_tx,
                 abort_tx,
                 response_capacity: config.response_capacity,
@@ -132,6 +137,77 @@ impl CoreHandle {
         self.inner.startup_ready.store(true, Ordering::Release);
     }
 
+    pub(crate) async fn abort_request(
+        &self,
+        rid_prefix: String,
+        abort_all: bool,
+    ) -> Result<(), CoreError> {
+        if abort_all && !self.inner.metadata.allow_abort_all {
+            return Err(CoreError::InvalidArgument(
+                "abort_all requires --rust-server-allow-abort-all".into(),
+            ));
+        }
+        let rids = if abort_all {
+            HashSet::new()
+        } else {
+            let live = self
+                .inner
+                .live_generations
+                .lock()
+                .expect("live generation index");
+            // Internal identity takes precedence even if another client chose
+            // that string as its public ID. Public duplicates otherwise name
+            // exactly their group, never a starts-with neighbor.
+            let exact = if let Some(rid) = live.iter().find(|rid| rid.as_str() == rid_prefix) {
+                HashSet::from([rid.clone()])
+            } else {
+                live.iter()
+                    .filter(|rid| rid.client_facing() == rid_prefix)
+                    .cloned()
+                    .collect()
+            };
+            if exact.is_empty() {
+                if rid_prefix.chars().count() < 32 {
+                    return Err(CoreError::InvalidArgument(
+                        "abort rid must name a live request or contain at least 32 characters"
+                            .into(),
+                    ));
+                }
+                if rid_prefix.len() > crate::tokenizer_manager::to_scheduler::MAX_RID_LEN {
+                    return Err(CoreError::InvalidArgument("abort rid is too long".into()));
+                }
+                live.iter()
+                    .filter(|rid| rid.starts_with(&rid_prefix))
+                    .cloned()
+                    .collect()
+            } else {
+                exact
+            }
+        };
+        if !abort_all && rids.is_empty() {
+            return Ok(());
+        }
+        let (reply, result) = flume::bounded(1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            self.inner
+                .intake_tx
+                .send_async(TmEvent::AbortRequest {
+                    rids,
+                    abort_all,
+                    reply,
+                })
+                .await
+                .map_err(|_| CoreError::Unavailable)?;
+            result
+                .recv_async()
+                .await
+                .map_err(|_| CoreError::Unavailable)?
+                .map_err(translate_runtime_error)
+        })
+        .await
+        .map_err(|_| CoreError::Unavailable)?
+    }
+
     fn response_activity(&self) -> u64 {
         self.inner.response_activity.load(Ordering::Relaxed)
     }
@@ -140,7 +216,9 @@ impl CoreHandle {
         &self,
         mut request: GenerateRequest,
     ) -> Result<CoreCall, CoreError> {
-        request.received_at.get_or_insert_with(std::time::Instant::now);
+        request
+            .received_at
+            .get_or_insert_with(std::time::Instant::now);
         self.prepare_generations(std::slice::from_mut(&mut request))
             .await?;
         self.submit(RequestKind::Generate(Box::new(request)))
@@ -241,6 +319,17 @@ impl CoreHandle {
             .await?;
         rmp_serde::from_slice::<FlushCacheOutcome>(&bytes).map_err(|error| {
             CoreError::InvalidResponse(format!("invalid flush-cache response: {error}"))
+        })
+    }
+
+    pub(crate) async fn clear_hicache_storage(&self) -> Result<ClearStorageOutcome, CoreError> {
+        let bytes = self
+            .control(ControlRequest::ClearHiCacheReqInput(
+                ClearHiCacheReqInput::new(Rid::new().to_string()),
+            ))
+            .await?;
+        rmp_serde::from_slice(&bytes).map_err(|error| {
+            CoreError::InvalidResponse(format!("invalid storage-clear response: {error}"))
         })
     }
 
@@ -426,6 +515,19 @@ impl CoreHandle {
         let expected_response = ExpectedResponse::for_request(&kind);
         let (response_tx, response_rx) = mpsc::channel(self.inner.response_capacity);
         let admission = RequestAdmission::pending();
+        let live_generation = if matches!(expected_response, ExpectedResponse::Generate) {
+            self.inner
+                .live_generations
+                .lock()
+                .expect("live generation index")
+                .insert(rid.clone());
+            Some(LiveGeneration {
+                rid: rid.clone(),
+                index: self.inner.live_generations.clone(),
+            })
+        } else {
+            None
+        };
         // Arm ownership before awaiting the bounded handoff. If this future is
         // cancelled after the event is queued but before the await observes
         // success, dropping `call` still cancels the request.
@@ -436,6 +538,7 @@ impl CoreHandle {
             admission: admission.clone(),
             expected_response,
             in_flight: true,
+            live_generation,
         };
         let request = Request {
             rid: rid.clone(),
@@ -548,6 +651,7 @@ impl CoreCall {
             admission,
             expected_response: ExpectedResponse::Generate,
             in_flight: true,
+            live_generation: None,
         })
     }
 }
@@ -595,6 +699,11 @@ fn generation_event(item: ResponseItem) -> CoreEvent {
     }
 }
 
+#[derive(serde::Deserialize)]
+pub(crate) struct ClearStorageOutcome {
+    pub success: bool,
+}
+
 /// The scheduler's `FlushCacheReqOutput`: whether the flush ran, and why not.
 #[derive(Debug, serde::Deserialize, PartialEq)]
 pub(crate) struct FlushCacheOutcome {
@@ -634,6 +743,23 @@ struct RuntimeCall {
     admission: RequestAdmission,
     expected_response: ExpectedResponse,
     in_flight: bool,
+    live_generation: Option<LiveGeneration>,
+}
+
+/// A generation's selector exists exactly as long as its call is live. The
+/// lease also covers cancellation while the bounded intake send is pending.
+struct LiveGeneration {
+    rid: Rid,
+    index: Arc<Mutex<HashSet<Rid>>>,
+}
+
+impl Drop for LiveGeneration {
+    fn drop(&mut self) {
+        self.index
+            .lock()
+            .expect("live generation index")
+            .remove(&self.rid);
+    }
 }
 
 impl RuntimeCall {
@@ -650,6 +776,9 @@ impl RuntimeCall {
     }
 
     fn observe(&mut self, item: Option<&ResponseItem>) {
+        if item.is_none() || item.is_some_and(|item| self.expected_response.is_terminal(item)) {
+            self.live_generation.take();
+        }
         if item.is_some_and(|item| self.expected_response.is_terminal(item)) {
             self.in_flight = false;
         }
@@ -747,6 +876,241 @@ mod tests {
                 abort_rx,
             }
         }
+    }
+
+    async fn acknowledged_abort(
+        harness: &Harness,
+        prefix: String,
+        all: bool,
+    ) -> Result<(), CoreError> {
+        let handle = harness.handle.clone();
+        let mut task = tokio::spawn(async move { handle.abort_request(prefix, all).await });
+        tokio::select! {
+            result = &mut task => result.unwrap(),
+            event = harness.intake_rx.recv_async() => {
+                let TmEvent::AbortRequest { reply, .. } = event.unwrap() else {
+                    panic!("expected abort command");
+                };
+                reply.send(Ok(())).unwrap();
+                task.await.unwrap()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_rejects_unknown_short_prefixes_in_characters() {
+        // A short selector can otherwise cancel unrelated concurrent requests.
+        // Eight multibyte characters are still short, despite occupying 32 bytes.
+        for prefix in ["a".to_owned(), "missing".to_owned(), "🦀".repeat(8)] {
+            let harness = Harness::unbounded(8);
+            let error = acknowledged_abort(&harness, prefix, false)
+                .await
+                .expect_err("an unknown short selector must be refused");
+            assert_eq!(error.kind(), CoreErrorKind::InvalidArgument);
+            assert!(harness.intake_rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_rejects_all_without_explicit_launch_opt_in() {
+        let harness = Harness::unbounded(8);
+        let error = acknowledged_abort(&harness, String::new(), true)
+            .await
+            .expect_err("abort-all must be disabled by default");
+        assert_eq!(error.kind(), CoreErrorKind::InvalidArgument);
+        assert!(harness.intake_rx.try_recv().is_err());
+    }
+
+    async fn abort_targets(harness: &Harness, selector: String) -> HashSet<Rid> {
+        let handle = harness.handle.clone();
+        let task = tokio::spawn(async move { handle.abort_request(selector, false).await });
+        let TmEvent::AbortRequest {
+            rids,
+            abort_all,
+            reply,
+        } = harness.intake_rx.recv_async().await.unwrap()
+        else {
+            panic!("expected exact abort command");
+        };
+        assert!(!abort_all);
+        reply.send(Ok(())).unwrap();
+        task.await.unwrap().unwrap();
+        rids
+    }
+
+    #[tokio::test]
+    async fn exact_live_abort_preserves_neighbors_and_removes_dropped_selectors() {
+        let harness = Harness::unbounded(8);
+        let mut calls = Vec::new();
+        let mut requests = Vec::new();
+        let mut ids = Vec::new();
+        for public in ["a", "a", "ab"] {
+            let rid = Rid::from_client(public);
+            let call = harness
+                .handle
+                .submit(RequestKind::Generate(Box::new(GenerateRequest {
+                    rid: rid.clone(),
+                    ..Default::default()
+                })))
+                .await
+                .unwrap();
+            requests.push(accept_intake(harness.intake_rx.recv_async().await.unwrap()));
+            calls.push(call);
+            ids.push(rid);
+        }
+        let shadow = Rid::from_client(ids[0].as_str());
+        calls.push(
+            harness
+                .handle
+                .submit(RequestKind::Generate(Box::new(GenerateRequest {
+                    rid: shadow,
+                    ..Default::default()
+                })))
+                .await
+                .unwrap(),
+        );
+        requests.push(accept_intake(harness.intake_rx.recv_async().await.unwrap()));
+        assert_eq!(
+            abort_targets(&harness, "a".into()).await,
+            ids[..2].iter().cloned().collect()
+        );
+        assert_eq!(
+            abort_targets(&harness, ids[0].to_string()).await,
+            [ids[0].clone()].into()
+        );
+        calls.remove(0);
+        calls.remove(0);
+        assert!(matches!(
+            acknowledged_abort(&harness, "a".into(), false).await,
+            Err(CoreError::InvalidArgument(_))
+        ));
+        assert_eq!(
+            abort_targets(&harness, "ab".into()).await,
+            [ids[2].clone()].into()
+        );
+        drop(calls);
+        assert!(
+            harness
+                .handle
+                .inner
+                .live_generations
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_calls_stop_matching_even_while_the_call_is_retained() {
+        let harness = Harness::unbounded(8);
+        let mut call = harness.handle.submit(generate("short")).await.unwrap();
+        let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+        request
+            .sink
+            .try_send(ResponseItem::Done(ChunkEvent::default()))
+            .unwrap();
+        assert!(matches!(call.recv().await, Some(ResponseItem::Done(_))));
+        assert!(matches!(
+            acknowledged_abort(&harness, "short".into(), false).await,
+            Err(CoreError::InvalidArgument(_))
+        ));
+        assert!(
+            harness
+                .handle
+                .inner
+                .live_generations
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn long_prefix_resolves_live_targets_and_maximum_internal_id_is_exact() {
+        let harness = Harness::unbounded(8);
+        let public = "x".repeat(128);
+        let rid = Rid::from_client(&public);
+        let _call = harness
+            .handle
+            .submit(RequestKind::Generate(Box::new(GenerateRequest {
+                rid: rid.clone(),
+                ..Default::default()
+            })))
+            .await
+            .unwrap();
+        let _request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+        assert_eq!(
+            abort_targets(&harness, "x".repeat(32)).await,
+            [rid.clone()].into()
+        );
+        assert_eq!(abort_targets(&harness, rid.to_string()).await, [rid].into());
+        assert!(
+            harness
+                .handle
+                .abort_request("z".repeat(32), false)
+                .await
+                .is_ok()
+        );
+        assert!(harness.intake_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn abort_request_requires_intake_acknowledgement_and_preserves_failure() {
+        for (prefix, all, outcome) in [("batch-", false, Ok(())), ("", true, Err(Error::QueueFull))]
+        {
+            let mut harness = Harness::unbounded(8);
+            Arc::get_mut(&mut harness.handle.inner)
+                .unwrap()
+                .metadata
+                .allow_abort_all = all;
+            let _live = if all {
+                None
+            } else {
+                let call = harness.handle.submit(generate(prefix)).await.unwrap();
+                let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+                Some((call, request))
+            };
+            let handle = harness.handle.clone();
+            let task = tokio::spawn(async move { handle.abort_request(prefix.into(), all).await });
+            let TmEvent::AbortRequest {
+                rids,
+                abort_all,
+                reply,
+            } = harness.intake_rx.recv_async().await.unwrap()
+            else {
+                panic!("abort must enter the ordered intake lane");
+            };
+            assert_eq!(
+                rids,
+                if all {
+                    HashSet::new()
+                } else {
+                    [Rid::from(prefix)].into()
+                }
+            );
+            assert_eq!(abort_all, all);
+            assert!(
+                !task.is_finished(),
+                "sending a command is not acknowledgement"
+            );
+            let expected_success = outcome.is_ok();
+            reply.send(outcome).unwrap();
+            let result = task.await.unwrap();
+            if expected_success {
+                assert!(result.is_ok());
+            } else {
+                assert_eq!(result.unwrap_err().kind(), CoreErrorKind::ResourceExhausted);
+            }
+            assert!(harness.abort_rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_request_rejects_overlong_prefix_before_intake() {
+        let harness = Harness::unbounded(8);
+        let result = harness.handle.abort_request("x".repeat(129), false).await;
+        assert_eq!(result.unwrap_err().kind(), CoreErrorKind::InvalidArgument);
+        assert!(harness.intake_rx.try_recv().is_err());
     }
 
     fn test_handle(

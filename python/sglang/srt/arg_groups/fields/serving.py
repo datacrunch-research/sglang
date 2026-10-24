@@ -187,6 +187,10 @@ class Serving(msgspec.Struct):
         Optional[str],
         "The path of the file storage in backend.",
     ] = None
+    rust_server_allow_abort_all: A[
+        bool,
+        "Allow the embedded Rust server abort endpoint to cancel every live request.",
+    ] = False
     enable_cache_report: A[
         bool,
         "Return number of cached tokens in usage.prompt_tokens_details for each openai request.",

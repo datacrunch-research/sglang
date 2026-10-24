@@ -243,8 +243,13 @@ class TestResponseParity(CustomTestCase):
             ["id", "prompt_tokens", "completion_tokens", "finish_reason"],
         )
         self.assertEqual(
-            list(GenerateMetaInfo.__struct_fields__)[-3:],
-            ["e2e_latency", "cached_tokens", "reasoning_tokens"],
+            list(GenerateMetaInfo.__struct_fields__)[-4:],
+            [
+                "e2e_latency",
+                "cached_tokens",
+                "reasoning_tokens",
+                "cached_tokens_details",
+            ],
         )
 
 

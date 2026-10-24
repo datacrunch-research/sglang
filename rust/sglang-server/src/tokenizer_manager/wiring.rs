@@ -39,6 +39,12 @@ pub enum TmEvent {
     /// shm) set on it, or `Failed` (bad media URL, unsupported modality,
     /// preprocess error, ...).
     Encoded(Request),
+    /// Ordered with intake and pool returns so cancellation cannot miss accepted work.
+    AbortRequest {
+        rids: std::collections::HashSet<Rid>,
+        abort_all: bool,
+        reply: flume::Sender<Result<(), crate::utils::error::Error>>,
+    },
 }
 
 const ADMISSION_PENDING: u8 = 0;
@@ -85,8 +91,8 @@ impl RequestAdmission {
 /// detok entry for every source and tells the scheduler to stop for all but
 /// [`Self::Local`]; the source is otherwise kept for diagnostics.
 ///
-/// There is no in-flight rid registry to keep consistent, and so no release
-/// ordering to get wrong: [`Rid::from_client`] makes every client-supplied rid
+/// Abort guards own their exact internal ID independently of the public
+/// selector index: [`Rid::from_client`] makes every client-supplied rid
 /// internally unique, so a resubmit of the "same" rid is a different `Rid` and
 /// cannot be tangled up with an abort still in flight for the original.
 #[derive(Clone, Debug)]

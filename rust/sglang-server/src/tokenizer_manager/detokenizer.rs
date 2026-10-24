@@ -287,7 +287,9 @@ fn handle_result(table: &mut HashMap<Rid, DetokState>, rid: &Rid, payload: bytes
 /// A request leaving the table without its finish chunk still counts as a
 /// finished (aborted) request in the TokenizerManager metrics, as in Python.
 fn count_dropped(st: &mut DetokState) {
-    if let (Some(mut times), Some(metrics)) = (st.times.take(), crate::utils::tokenizer_metrics::get()) {
+    if let (Some(mut times), Some(metrics)) =
+        (st.times.take(), crate::utils::tokenizer_metrics::get())
+    {
         metrics.on_dropped(&mut times);
     }
 }
@@ -397,7 +399,9 @@ fn handle_chunk(
     ev.text = delta_text;
     ev.completion_tokens = n_tok;
     ev.stop_token_trimmed = stop_token_trimmed;
-    if let (Some(times), Some(metrics)) = (st.times.as_mut(), crate::utils::tokenizer_metrics::get()) {
+    if let (Some(times), Some(metrics)) =
+        (st.times.as_mut(), crate::utils::tokenizer_metrics::get())
+    {
         metrics.on_chunk(
             times,
             n_tok,

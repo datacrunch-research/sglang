@@ -209,7 +209,10 @@ pub fn lower_chat(
         || raw
             .get("messages")
             .and_then(Value::as_array)
-            .is_some_and(|m| m.iter().any(|message| has_tools_or_media(message, k3_tools)))
+            .is_some_and(|m| {
+                m.iter()
+                    .any(|message| has_tools_or_media(message, k3_tools))
+            })
     {
         return Err(Unsupported("unsupported_chat_feature"));
     }
@@ -241,7 +244,12 @@ pub fn lower_chat(
                 Some(_) => return Err(Unsupported("invalid_request")),
             };
             let declared = raw.get("tools").is_some_and(|t| !t.is_null());
-            for message in raw.get("messages").and_then(Value::as_array).into_iter().flatten() {
+            for message in raw
+                .get("messages")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
                 if matches!(message["role"].as_str(), Some("system" | "developer"))
                     && let Some(tools) = message["tools"].as_array()
                 {
@@ -253,7 +261,11 @@ pub fn lower_chat(
         false => raw.get("tools").cloned(),
     };
     if let Some(Value::Array(all)) = &effective_tools
-        && raw.get("tools").and_then(Value::as_array).map_or(0, Vec::len) != all.len()
+        && raw
+            .get("tools")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
+            != all.len()
     {
         let names: Vec<&Value> = all.iter().map(|tool| &tool["function"]["name"]).collect();
         if (1..names.len()).any(|i| names[..i].contains(&names[i])) {
@@ -393,7 +405,9 @@ pub fn lower_chat(
         let strip: Vec<&str> = strip.into_iter().filter(|t| !t.is_empty()).collect();
         // `get_structure_constraint`: a forced choice, or `auto` with a strict
         // tool, takes the schema-aware tag; plain `auto` the lighter one.
-        let any_strict = definitions.iter().any(|tool| tool["function"]["strict"] == true);
+        let any_strict = definitions
+            .iter()
+            .any(|tool| tool["function"]["strict"] == true);
         let tag = match &forced_choice {
             Some(named) => tool_call_tag_for_choice(
                 definitions,

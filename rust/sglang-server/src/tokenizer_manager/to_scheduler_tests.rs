@@ -23,6 +23,188 @@ fn make_intake() -> (
     make_intake_with(test_limits())
 }
 
+#[test]
+fn abort_request_uses_exact_wire_without_registering_a_control_response() {
+    let (intake, detok_rx, consumer, tm_tx, _mm_rx) = make_intake();
+    let (reply, result) = flume::bounded(1);
+    tm_tx
+        .send(TmEvent::AbortRequest {
+            rids: [Rid::from("batch-0")].into(),
+            abort_all: false,
+            reply,
+        })
+        .unwrap();
+    drop(tm_tx);
+    intake.run();
+    assert!(result.recv().unwrap().is_ok());
+    let frames = consumer.drain(16);
+    assert_eq!(frames.len(), 1);
+    let wire = rmpv::decode::read_value(&mut &frames[0].header[..]).unwrap();
+    let fields = wire.as_array().unwrap();
+    assert_eq!(fields.len(), 8);
+    assert_eq!(fields[0].as_str(), Some("AbortReq"));
+    assert_eq!(fields[1].as_str(), Some(""));
+    assert_eq!(fields[7].as_array().unwrap()[0].as_str(), Some("batch-0"));
+    assert_eq!(fields[3].as_bool(), Some(false));
+    assert!(frames[0].buffers.is_empty());
+    assert!(detok_rx.try_recv().is_err());
+}
+
+/// Cancelling a prefix must prevent late pool returns from reaching the scheduler.
+#[test]
+fn abort_request_cancels_matching_pool_work_and_preserves_other_requests() {
+    for tokenizing in [false, true] {
+        let (mut intake, tok_rx, mm_rx, consumer, detok_rx) = make_intake_with_tokenizer(true);
+        let mut responses = Vec::new();
+        for name in ["batch-0", "batch-1", "batch-0-neighbor"] {
+            let (tx, rx) = mpsc::channel(8);
+            let mut request = if tokenizing {
+                mm_generate_req(name)
+            } else {
+                mm_pretokenized_req(name)
+            };
+            request.sink = ResponseSink::Local(tx);
+            intake.drive(request);
+            responses.push(rx);
+        }
+        let pool = if tokenizing { &tok_rx } else { &mm_rx };
+        let requests = (0..3).map(|_| pool.try_recv().unwrap()).collect::<Vec<_>>();
+        assert_eq!(detok_rx.try_iter().count(), 3);
+        intake
+            .abort_request(&[Rid::from("batch-0"), Rid::from("batch-1")].into(), false)
+            .unwrap();
+        intake
+            .abort_request(&[Rid::from("batch-0"), Rid::from("batch-1")].into(), false)
+            .unwrap();
+        for response in &mut responses[..2] {
+            let ResponseItem::Done(event) = response
+                .try_recv()
+                .expect("pending call terminates immediately")
+            else {
+                panic!("pending abort must be a terminal result");
+            };
+            assert_eq!(event.finish_reason.unwrap().kind_name(), Some("abort"));
+            assert!(
+                response.try_recv().is_err(),
+                "repeated abort must not send another terminal"
+            );
+        }
+        assert!(responses[2].try_recv().is_err());
+        let deregistered = detok_rx
+            .try_iter()
+            .map(|message| {
+                let DetokMsg::Deregister { rid } = message else {
+                    panic!("cancel must deregister pending work")
+                };
+                rid.to_string()
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            deregistered,
+            ["batch-0".to_string(), "batch-1".to_string()].into()
+        );
+        assert_eq!(
+            consumer.drain(16).len(),
+            2,
+            "two explicit commands, no generation yet"
+        );
+        for mut request in requests {
+            if tokenizing {
+                if let RequestKind::Generate(generation) = &mut request.kind {
+                    generation.input_ids = Some(vec![5, 6]);
+                }
+                request.state.apply(Event::TokenizeDone).unwrap();
+                intake.drive(request);
+            } else {
+                encode_like_worker(&mut request, vec![5, 6], Vec::new());
+                intake.drive(request);
+            }
+        }
+        if tokenizing {
+            let mut request = mm_rx.try_recv().expect("only the other request enters mm");
+            assert_eq!(request.rid.as_str(), "batch-0-neighbor");
+            encode_like_worker(&mut request, vec![5, 6], Vec::new());
+            intake.drive(request);
+            assert!(mm_rx.try_recv().is_err());
+        }
+        let generated = consumer.drain(16);
+        assert_eq!(
+            generated.len(),
+            1,
+            "cancelled work must never reach the scheduler"
+        );
+        assert!(intake.request_states.is_empty());
+    }
+}
+
+#[test]
+fn abort_request_backpressure_does_not_claim_or_partially_apply_cancellation() {
+    let (mut intake, _tok_rx, mm_rx, consumer, _detok_rx) = make_intake_with_tokenizer(true);
+    let (tx, mut response) = mpsc::channel(8);
+    let mut request = mm_pretokenized_req("batch-0");
+    request.sink = ResponseSink::Local(tx);
+    intake.drive(request);
+    let mut request = mm_rx.try_recv().unwrap();
+    for _ in 0..16 {
+        assert!(intake.to_scheduler_tx.try_push(SchedulerRequest {
+            header: bytes::Bytes::new(),
+            buffers: Vec::new()
+        }));
+    }
+    assert!(matches!(
+        intake.abort_request(&[Rid::from("batch-0"), Rid::from("batch-1")].into(), false),
+        Err(Error::QueueFull)
+    ));
+    assert!(response.try_recv().is_err());
+    assert_eq!(consumer.drain(16).len(), 16);
+    encode_like_worker(&mut request, vec![5, 6], Vec::new());
+    intake.drive(request);
+    assert_eq!(
+        consumer.drain(16).len(),
+        1,
+        "failed cancellation must preserve the request"
+    );
+}
+
+#[test]
+fn abort_request_requires_explicit_abort_all_to_cancel_unrelated_ids() {
+    let (mut intake, _tok_rx, mm_rx, consumer, _detok_rx) = make_intake_with_tokenizer(true);
+    let mut responses = Vec::new();
+    for name in ["first#0011223344556677", "second#0011223344556678"] {
+        let (tx, rx) = mpsc::channel(8);
+        let mut request = mm_pretokenized_req(name);
+        request.sink = ResponseSink::Local(tx);
+        intake.drive(request);
+        responses.push(rx);
+    }
+    intake.abort_request(&HashSet::new(), false).unwrap();
+    assert!(
+        consumer.drain(16).is_empty(),
+        "empty rid must not become a wildcard"
+    );
+    assert!(
+        responses
+            .iter_mut()
+            .all(|response| response.try_recv().is_err())
+    );
+    intake.abort_request(&HashSet::new(), true).unwrap();
+    assert!(
+        responses
+            .iter_mut()
+            .all(|response| matches!(response.try_recv(), Ok(ResponseItem::Done(_))))
+    );
+    let commands = consumer.drain(16);
+    assert_eq!(commands.len(), 1);
+    let wire = rmpv::decode::read_value(&mut &commands[0].header[..]).unwrap();
+    assert_eq!(wire.as_array().unwrap()[3].as_bool(), Some(true));
+    for mut request in mm_rx.try_iter() {
+        encode_like_worker(&mut request, vec![5, 6], Vec::new());
+        intake.drive(request);
+    }
+    assert!(consumer.drain(16).is_empty());
+    assert!(intake.request_states.is_empty());
+}
+
 fn make_intake_with_abort(
     abort_rx: flume::Receiver<AbortSource>,
 ) -> (

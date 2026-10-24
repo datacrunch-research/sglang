@@ -2287,6 +2287,16 @@ class AbortReq(BaseReq, kw_only=True):
     finished_reason: Optional[FinishReasonDict] = None
     abort_message: Optional[str] = None
     weight_versions: Optional[WeightVersionSpans] = None
+    # Rust resolves public selectors to internal IDs before crossing the wire.
+    # None preserves the legacy Python prefix command; an empty set matches none.
+    exact_rids: Optional[set[str]] = None
+
+    def matches(self, rid: str) -> bool:
+        if self.abort_all:
+            return True
+        if self.exact_rids is not None:
+            return rid in self.exact_rids
+        return rid.startswith(self.rid)
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code

@@ -145,6 +145,14 @@ message GenerateMetaInfo {
   // reasoning so far; reported on every frame.
   uint32 cached_tokens = 13;
   uint64 reasoning_tokens = 14;
+  CachedTokensDetails cached_tokens_details = 15;
+}
+
+message CachedTokensDetails {
+  uint32 device = 1;
+  uint32 host = 2;
+  optional uint32 storage = 3;
+  optional string storage_backend = 4;
 }
 
 message GenerateResponse {

@@ -1,9 +1,14 @@
 """Tests for deferred chunked-prefill aborts."""
 
+import json
 import unittest
 from collections import deque
+from concurrent.futures import Future
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+
+import msgspec
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -15,6 +20,8 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.constrained.grammar_manager import GrammarManager  # noqa: E402
+from sglang.srt.managers.io_struct import msgpack_decode  # noqa: E402
 from sglang.srt.managers.schedule_batch import FINISH_ABORT  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 
@@ -60,6 +67,40 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
 class TestPendingChunkedAbortRace(CustomTestCase):
     def setUp(self):
         enter_scope(self, published_topology())
+
+    def test_rust_exact_abort_cannot_cancel_an_internal_prefix_neighbor(self):
+        """The actual Rust wire fixture must retain exactness in scheduler queues."""
+        fixture = json.loads(
+            (
+                Path(__file__).resolve().parents[4]
+                / "rust/sglang-server/testdata/abort_selection.json"
+            ).read_text()
+        )
+        command = msgpack_decode(msgspec.msgpack.encode(fixture["wire"]))
+        selected = _FakeReq(fixture["selected"])
+        neighbor = _FakeReq(fixture["selected"] + "-neighbor")
+        unrelated = _FakeReq("other")
+        sched = _make_scheduler(
+            None, chunked_req=neighbor, running_reqs=[selected, neighbor, unrelated]
+        )
+        grammar = object.__new__(GrammarManager)
+        grammar.grammar_queue = [selected, neighbor, unrelated]
+        for req in grammar.grammar_queue:
+            req.grammar = Future()
+            req.set_finish_with_abort = lambda reason, request=req: setattr(
+                request, "to_finish", FINISH_ABORT(reason)
+            )
+        sched.grammar_manager = grammar
+
+        sched.abort_request(command)
+
+        self.assertIsInstance(selected.to_finish, FINISH_ABORT)
+        self.assertIsNone(neighbor.to_finish)
+        self.assertIsNone(unrelated.to_finish)
+        self.assertIsNone(sched._pending_chunked_abort_req)
+        self.assertTrue(selected.grammar.cancelled())
+        self.assertFalse(neighbor.grammar.cancelled())
+        self.assertFalse(unrelated.grammar.cancelled())
 
     def test_req_left_chunked_slot_is_aborted(self):
         req = _FakeReq("zombie_rid")

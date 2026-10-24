@@ -57,6 +57,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Version 2 adds exact abort targets after version 1's generation header.
+# Bump both sides for positional changes; Python and the extension deploy together.
+RUST_SERVER_WIRE_VERSION = 2
+
 
 class RustServer:
     """Owns the embedded multi-threaded Rust server (``sglang_server.Server``).
@@ -147,6 +151,24 @@ class RustServer:
         creates. A model the server cannot serve is refused before the port
         is bound.
         """
+        extension = cls._load_extension()
+        try:
+            extension_version = extension.RUST_SERVER_WIRE_VERSION
+        except AttributeError:
+            extension_version = None
+        if extension_version != RUST_SERVER_WIRE_VERSION:
+            raise RuntimeError(
+                "Rust server wire protocol mismatch: "
+                f"Python={RUST_SERVER_WIRE_VERSION}, extension={extension_version}. "
+                "Install the matching Python code and Rust extension together."
+            )
+
+        if not getattr(get_serving(), "enable_cache_report", False):
+            raise RuntimeError(
+                "The Rust server requires --enable-cache-report to include "
+                "cached_tokens in response usage."
+            )
+
         # Force turn off HF tokenizers rayon's unpinned global thread pool.
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -184,7 +206,6 @@ class RustServer:
             else None
         )
 
-        extension = cls._load_extension()
         server = extension.Server(
             _build_server_args(
                 scheduler,
@@ -551,6 +572,12 @@ class RustServer:
             for extra in extras:
                 header_cols += extra.header_cols()
                 data_cols += extra.data_cols()
+
+        details = payload.cached_tokens_details
+        if details is not None and any(detail is not None for detail in details):
+            # BatchHeader puts details after all twelve optional shape columns.
+            header_cols.extend([[] for _ in range(18 - len(header_cols))])
+            header_cols.append(details)
 
         header = msgspec.msgpack.encode(header_cols)
         # Pass the raw column list; the Rust side concatenates it into the frame
