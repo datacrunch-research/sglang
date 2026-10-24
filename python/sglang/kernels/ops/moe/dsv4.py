@@ -165,9 +165,16 @@ def mega_moe_pre_dispatch(
     *,
     shared_x_sf: Optional[torch.Tensor] = None,
     shared_block_m: int = 0,
+    num_valid: Optional[torch.Tensor] = None,
 ) -> None:
+    # num_valid: int32 device scalar; rows at and past it are routed to no
+    # expert (-1, 0). The CUDA-graph buffer is int32 [1]; eager may pass 0-d.
     if x.shape[0] == 0 and x.stride(0) != x.shape[1]:
         x = x.new_empty(x.shape)
+    if num_valid is not None:
+        num_valid = num_valid.reshape(1)
+        if num_valid.dtype != torch.int32:
+            num_valid = num_valid.to(torch.int32)
     # shared_block_m must match the consuming MoE's paged scale layout
     module = _jit_mega_moe_pre_dispatch_module(
         quant_group_size, shared_x_sf is not None
@@ -182,6 +189,7 @@ def mega_moe_pre_dispatch(
         buf_topk_weights,
         shared_x_sf,
         shared_block_m,
+        num_valid,
     )
 
 

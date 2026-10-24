@@ -32,6 +32,9 @@ struct MegaMoEPreDispatchParams {
   int64_t* __restrict__ buf_topk_idx;    // [padded_max, top_k]
   float* __restrict__ buf_topk_weights;  // [padded_max, top_k]
   int32_t* __restrict__ shared_x_sf;     // column-major, BLOCK_M-paged scales
+  // Optional device scalar: rows >= *num_valid are CUDA-graph padding and are
+  // routed to no expert (-1, 0), like the buffer pad rows past num_tokens.
+  const int32_t* __restrict__ num_valid;
 
   uint64_t buf_x_sf_stride_bytes;
   uint64_t shared_x_sf_col_stride;
@@ -137,8 +140,9 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
     // Copy this token's topk row (no alignment assumptions; top_k is small).
     if (tid < params.top_k) {
       const uint32_t off = token_id * params.top_k + tid;
-      params.buf_topk_idx[off] = params.topk_idx[off];
-      params.buf_topk_weights[off] = params.topk_weights[off];
+      const bool is_pad = params.num_valid != nullptr && static_cast<int32_t>(token_id) >= *params.num_valid;
+      params.buf_topk_idx[off] = is_pad ? int64_t{-1} : static_cast<int64_t>(params.topk_idx[off]);
+      params.buf_topk_weights[off] = is_pad ? 0.0f : params.topk_weights[off];
     }
   } else {
     // ---- Pad path: trailing blocks fill [num_tokens, padded_max) with (-1, 0) ----
@@ -175,7 +179,8 @@ struct MegaMoEPreDispatchKernel {
       const tvm::ffi::TensorView buf_topk_idx,
       const tvm::ffi::TensorView buf_topk_weights,
       const tvm::ffi::Optional<tvm::ffi::TensorView> shared_x_sf,
-      const int64_t shared_block_m) {
+      const int64_t shared_block_m,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> num_valid) {
     using namespace host;
 
     auto device = SymbolicDevice{};
@@ -263,6 +268,13 @@ struct MegaMoEPreDispatchKernel {
       shared_sf_stride = sf.stride(1);
     }
 
+    const int32_t* num_valid_ptr = nullptr;
+    if (num_valid.has_value()) {
+      const auto nv = num_valid.value();
+      TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(nv);
+      num_valid_ptr = static_cast<const int32_t*>(nv.data_ptr());
+    }
+
     const auto pad_slots = (padded_max - num_tokens) * top_k;
     const uint32_t num_pad_blocks = pad_slots == 0 ? 0u : ((pad_slots + block_size - 1u) / block_size);
     const auto num_total_blocks = num_tokens + num_pad_blocks;
@@ -276,6 +288,7 @@ struct MegaMoEPreDispatchKernel {
         .buf_topk_idx = static_cast<int64_t*>(buf_topk_idx.data_ptr()),
         .buf_topk_weights = static_cast<float*>(buf_topk_weights.data_ptr()),
         .shared_x_sf = shared_sf_ptr,
+        .num_valid = num_valid_ptr,
         .buf_x_sf_stride_bytes = buf_x_sf_stride_bytes,
         .shared_x_sf_col_stride = shared_sf_stride,
         .shared_block_m = static_cast<uint32_t>(shared_block_m),

@@ -1955,6 +1955,9 @@ class Envs:
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
+    # MegaMoE: route K3's CUDA-graph padding rows to no expert (id -1, weight 0)
+    # in the pre-dispatch, so no EP rank runs expert GEMMs for rows nobody reads.
+    SGLANG_K3_MEGAMOE_MASK_PAD = EnvBool(False)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
