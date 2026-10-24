@@ -64,6 +64,7 @@ fn config() -> Config {
             default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+            roles: Default::default(),
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
@@ -187,7 +188,13 @@ async fn pd_decode_stream_expires_after_prefill_completes() {
         .expect("decode stream must stop when its registration expires")
         .unwrap_err();
     assert!(error.to_string().contains("stale_request_timeout"));
-    assert_eq!(decode_worker.router_inflight_load(), 0);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while decode_worker.router_inflight_load() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("expired decode releases load after its abort acknowledges");
     assert_eq!(decode_worker.breaker.snapshot().state_code, 0);
     let metrics = ctx.metrics.render();
     assert!(metrics

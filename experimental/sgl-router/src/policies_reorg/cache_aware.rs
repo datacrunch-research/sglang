@@ -81,6 +81,7 @@ impl CacheSource {
                 outcome,
                 query_blocks,
                 block_hashes: None,
+                local_queries: Default::default(),
             }))),
             Err(PrefixIndexError::Rejected(code)) => Err(PickError::InvalidSignal(format!(
                 "KV Indexer rejected the query: {code}"
@@ -145,28 +146,21 @@ fn rank(loads: &CandidateLoads<'_>, left: &Candidate<'_>, right: &Candidate<'_>)
 
 /// Each prefix holder's uncached share of `input`, by URL, before hit thresholds.
 fn uncached_by_url(signal: Option<&PrefixLookupResult>, input: u64) -> HashMap<&str, u64> {
-    let Some(PrefixLookupResult {
-        outcome: PrefixOutcome::Matched { matches, .. },
-        query_blocks,
-        ..
-    }) = signal.filter(|signal| signal.query_blocks > 0)
-    else {
+    let Some(signal) = signal else {
         return HashMap::new();
     };
-    let query_blocks = *query_blocks as u64;
-    let mut depths = HashMap::<&str, u64>::new();
+    let PrefixOutcome::Matched { matches, .. } = &signal.outcome else {
+        return HashMap::new();
+    };
+    let mut cached = HashMap::<&str, u64>::new();
     for entry in matches {
-        let depth = depths.entry(entry.address.as_str()).or_default();
-        *depth = (*depth).max(u64::from(entry.matched_prefix_blocks));
+        let tokens = signal.matched_tokens(input, &entry.address, entry.matched_prefix_blocks);
+        let depth = cached.entry(entry.address.as_str()).or_default();
+        *depth = (*depth).max(tokens);
     }
-    depths
+    cached
         .into_iter()
-        .map(|(url, blocks)| {
-            (
-                url,
-                input - input.saturating_mul(blocks.min(query_blocks)) / query_blocks,
-            )
-        })
+        .map(|(url, tokens)| (url, input.saturating_sub(tokens)))
         .collect()
 }
 

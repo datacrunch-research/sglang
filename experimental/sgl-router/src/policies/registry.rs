@@ -286,10 +286,7 @@ pub fn select_decode_with_affinity(
     // and the fallback branch read from it. `would_allow` (non-mutating)
     // is the right filter — `allow()` would claim a half-open probe for
     // every candidate we look at, including ones we never dispatch to.
-    let healthy: Vec<&Arc<Worker>> = candidates
-        .iter()
-        .filter(|w| w.breaker.would_allow())
-        .collect();
+    let healthy: Vec<&Arc<Worker>> = candidates.iter().filter(|w| w.is_healthy()).collect();
 
     // Compute the median load over the closed-breaker subset.  Empty
     // subset → median is 0 (means: every peer's breaker is open; the

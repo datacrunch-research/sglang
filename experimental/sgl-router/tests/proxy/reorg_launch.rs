@@ -28,6 +28,12 @@ async fn existing_policy_flags_launch_reorg_routing() {
                     env!("CARGO_MANIFEST_DIR"),
                     "/tests/fixtures/tiny_tokenizer.json"
                 ),
+                "--health-check-interval-secs",
+                "1",
+                "--health-success-threshold",
+                "1",
+                "--prometheus-port",
+                "0",
                 "--host",
                 "127.0.0.1",
                 "--port",

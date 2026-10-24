@@ -58,6 +58,7 @@ fn config(max_attempts: u32) -> Config {
             default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+            roles: Default::default(),
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig {

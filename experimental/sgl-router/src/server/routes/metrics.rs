@@ -44,7 +44,7 @@ pub async fn metrics(State(ctx): State<Arc<AppContext>>) -> impl IntoResponse {
                     WorkerMode::Prefill => "prefill",
                     WorkerMode::Decode => "decode",
                 },
-                healthy: cb.admit,
+                healthy: cb.admit && w.active_health_passes(),
                 cb_state: cb.state_code,
                 // Saturating rather than `as i64`: a guard-accounting
                 // underflow would wrap usize and render as a nonsensical
@@ -54,6 +54,7 @@ pub async fn metrics(State(ctx): State<Arc<AppContext>>) -> impl IntoResponse {
         })
         .collect();
     let mut body = ctx.metrics.render_with_workers(&workers);
+    body.push_str(&ctx.admission.render_metrics());
     body.push_str(&ctx.tokenizers.stats().render());
     // Pull-on-scrape, like the worker gauges above: the tree and the tally
     // own the numbers, so a worker that goes away stops emitting series
@@ -74,6 +75,14 @@ pub async fn metrics(State(ctx): State<Arc<AppContext>>) -> impl IntoResponse {
             kv,
             ctx.block_size_oracle.get().unwrap_or(0),
         ));
+        body.push_str("# HELP sgl_router_kv_worker_block_size Tokens per native KV block for each worker.\n# TYPE sgl_router_kv_worker_block_size gauge\n");
+        for (url, (size, _)) in ctx.block_size_oracle.worker_configs() {
+            body.push_str(&format!(
+                "sgl_router_kv_worker_block_size{{worker_url=\"{}\"}} {}\n",
+                escape_label(&url),
+                size
+            ));
+        }
     }
     // A local tree alone does not mean peer bootstrap is on; the selector does.
     if let (Some(index), Some(_)) = (ctx.kv_index.as_ref(), ctx.config.discovery.peer_selector()) {
@@ -239,7 +248,7 @@ fn render_kv_tiers(kv: &KvIndexMetrics, block_size: u32) -> String {
     let mut out = String::new();
 
     out.push_str(
-        "# HELP sgl_router_kv_block_size Tokens per KV block hash, as established from the fleet (0 until a worker reports). Multiply sgl_router_kv_tree_blocks by this to compare with the engine's token gauges.\n",
+        "# HELP sgl_router_kv_block_size Uniform fleet tokens per KV block hash; 0 means unknown or mixed page sizes. For mixed fleets use sgl_router_kv_worker_block_size by worker_url.\n",
     );
     out.push_str("# TYPE sgl_router_kv_block_size gauge\n");
     out.push_str(&format!("sgl_router_kv_block_size {block_size}\n"));
@@ -248,7 +257,7 @@ fn render_kv_tiers(kv: &KvIndexMetrics, block_size: u32) -> String {
     // to a device row in the millions is the mismatch signature, and an
     // absent series cannot be told from a tier the tree never tracked.
     out.push_str(
-        "# HELP sgl_router_kv_tree_blocks Blocks the cache-aware tree attributes to a worker rank, by the storage tier the worker holds them on (a block held on device and host counts under both). Times sgl_router_kv_block_size, and divided by the engine's own occupancy of that tier for the same pod (device: sglang_kv_used_tokens + sglang_kv_evictable_tokens; host: sglang_hicache_host_used_tokens; tp_rank=\"0\"), this is the tree's coverage of the tier: ~1 mirrors the engine, ~0 means the engine holds a tier routing cannot see.\n",
+        "# HELP sgl_router_kv_tree_blocks Blocks the cache-aware tree attributes to a worker rank, by the storage tier the worker holds them on (a block held on device and host counts under both). Times the matching sgl_router_kv_worker_block_size (or uniform sgl_router_kv_block_size), and divided by the engine's own occupancy of that tier for the same pod (device: sglang_kv_used_tokens + sglang_kv_evictable_tokens; host: sglang_hicache_host_used_tokens; tp_rank=\"0\"), this is the tree's coverage of the tier: ~1 mirrors the engine, ~0 means the engine holds a tier routing cannot see.\n",
     );
     out.push_str("# TYPE sgl_router_kv_tree_blocks gauge\n");
     for (id, counts) in kv.tree.tier_occupancy() {
@@ -275,7 +284,7 @@ fn render_kv_tiers(kv: &KvIndexMetrics, block_size: u32) -> String {
         ));
     }
     out.push_str(
-        "# HELP sgl_router_kv_event_blocks_total Block hashes carried by the KV-cache events the pump consumed, by kind and storage medium tag. Times sgl_router_kv_block_size this is comparable to the engine's device eviction volume (block_removed/GPU) and, summed without its pool label, to sglang_hicache_backup_tokens_total (block_stored/CPU_PINNED). The two are not equal: the engine also evicts device blocks it never backed up.\n",
+        "# HELP sgl_router_kv_event_blocks_total Block hashes carried by the KV-cache events the pump consumed, by kind and storage medium tag. For uniform page sizes only, times sgl_router_kv_block_size this is comparable to the engine's device eviction volume (block_removed/GPU) and, summed without its pool label, to sglang_hicache_backup_tokens_total (block_stored/CPU_PINNED). The two are not equal: the engine also evicts device blocks it never backed up.\n",
     );
     out.push_str("# TYPE sgl_router_kv_event_blocks_total counter\n");
     for r in &rows {
@@ -659,6 +668,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mixed_page_metrics_report_native_worker_sizes() {
+        use crate::state::kv_events::{EventTally, HashTree};
+        let mut ctx = AppContext::stub();
+        ctx.kv_metrics = Some(KvIndexMetrics::new(
+            Arc::new(HashTree::new()),
+            Arc::new(EventTally::new()),
+        ));
+        ctx.block_size_oracle
+            .register_worker("http://small", 64, false)
+            .unwrap();
+        ctx.block_size_oracle
+            .register_worker("http://large", 512, false)
+            .unwrap();
+        let response = crate::server::app::build_router(Arc::new(ctx))
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        assert!(body.contains("sgl_router_kv_block_size 0\n"));
+        assert!(body.contains("sgl_router_kv_worker_block_size{worker_url=\"http://small\"} 64\n"));
+        assert!(body.contains("sgl_router_kv_worker_block_size{worker_url=\"http://large\"} 512\n"));
+    }
+
+    #[tokio::test]
     async fn metrics_endpoint_samples_worker_gauges_from_registry() {
         use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 
@@ -695,5 +734,18 @@ mod tests {
         assert!(
             body.contains(r#"sgl_router_worker_inflight_requests{worker_url="http://p0:30000"} 0"#)
         );
+        ctx.registry.all()[0].set_active_healthy(false);
+        let res = crate::server::app::build_router(ctx)
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains(r#"sgl_router_worker_health{worker_url="http://p0:30000"} 0"#));
     }
 }

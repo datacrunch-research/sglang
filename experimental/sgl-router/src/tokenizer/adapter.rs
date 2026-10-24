@@ -32,6 +32,17 @@ pub fn load_with(
 
 /// Local tokenizer file for a path or an HF repo id.
 fn resolve(source: &str) -> Result<String> {
+    if Path::new(source).is_dir() {
+        for file in ["tiktoken.model", "tokenizer.json"] {
+            let path = Path::new(source).join(file);
+            if path.is_file() {
+                return Ok(path.to_string_lossy().into_owned());
+            }
+        }
+        anyhow::bail!(
+            "model directory {source} contains neither tiktoken.model nor tokenizer.json"
+        );
+    }
     if Path::new(source).is_file() || looks_like_path(source) {
         return Ok(source.to_owned());
     }
@@ -401,11 +412,15 @@ pub struct ModelFiles {
 
 impl ModelFiles {
     pub fn open(source: &str) -> Self {
-        let local_dir = (Path::new(source).is_file() || looks_like_path(source)).then(|| {
-            Path::new(source)
-                .parent()
-                .map_or_else(Default::default, Path::to_path_buf)
-        });
+        let local_dir = if Path::new(source).is_dir() {
+            Some(Path::new(source).to_path_buf())
+        } else {
+            (Path::new(source).is_file() || looks_like_path(source)).then(|| {
+                Path::new(source)
+                    .parent()
+                    .map_or_else(Default::default, Path::to_path_buf)
+            })
+        };
         let repo_files = match local_dir {
             Some(_) => None,
             None => list_repo_files(source),

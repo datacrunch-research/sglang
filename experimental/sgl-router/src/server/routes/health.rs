@@ -27,7 +27,12 @@ pub async fn healthz() -> StatusCode {
 /// Conditions 3 and 4 latch on the first 200 (`BootstrapTracker::admit_ready`),
 /// so a later scale-up cannot drag a serving replica back to 503.
 pub async fn readyz(State(ctx): State<Arc<AppContext>>) -> StatusCode {
-    if !ctx.is_ready() {
+    if !ctx.is_ready()
+        || ctx
+            .active_health
+            .as_ref()
+            .is_some_and(|health| !health.ready(&ctx))
+    {
         return StatusCode::SERVICE_UNAVAILABLE;
     }
     let model = ModelId(ctx.config.model.id.clone());
@@ -49,6 +54,27 @@ pub async fn readyz(State(ctx): State<Arc<AppContext>>) -> StatusCode {
     }
 }
 
+pub async fn workers(State(ctx): State<Arc<AppContext>>) -> axum::Json<serde_json::Value> {
+    let mut workers = ctx.registry.all();
+    workers.sort_by(|a, b| a.url.cmp(&b.url));
+    axum::Json(
+        serde_json::json!({"workers": workers.iter().map(|w| serde_json::json!({
+        "url": w.url,
+        "worker_type": match w.mode() { crate::discovery::WorkerMode::Plain => "regular", crate::discovery::WorkerMode::Prefill => "prefill", crate::discovery::WorkerMode::Decode => "decode" },
+        "is_healthy": w.is_healthy(),
+    })).collect::<Vec<_>>() }),
+    )
+}
+
+pub async fn server_info(State(ctx): State<Arc<AppContext>>) -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "served_model_name": ctx.config.model.id,
+        "worker_count": ctx.registry.len(),
+        "max_concurrent_requests": ctx.admission.capacity(),
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,6 +82,23 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn health_is_liveness_while_readiness_aliases_reject_an_empty_pool() {
+        let app = crate::server::app::build_router(test_ctx(true, false));
+        for (path, expected) in [
+            ("/health", StatusCode::OK),
+            ("/readiness", StatusCode::SERVICE_UNAVAILABLE),
+            ("/readyz", StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{path}");
+        }
+    }
 
     #[tokio::test]
     async fn healthz_always_200() {

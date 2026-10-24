@@ -66,6 +66,7 @@ fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext
             default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+            roles: Default::default(),
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),

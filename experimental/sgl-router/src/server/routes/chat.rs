@@ -113,14 +113,25 @@ async fn serve_http(
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
-    let (request, routing) = prepare(&ctx, endpoint, &headers, body, false).await?;
-    routing.dispatch(&ctx, request, headers, start).await
+    let scope =
+        crate::server::admission::RequestScope::enter_request(&ctx, endpoint.path(), &headers)?;
+    let client = scope.client();
+    let (mut request, routing) = prepare(&ctx, endpoint, &headers, body, false, &scope)
+        .await
+        .inspect_err(|e| scope.life.fail(e.error_code()))?;
+    request.scope = Some(Arc::clone(&scope));
+    let response = routing
+        .dispatch(&ctx, request, headers, start)
+        .await
+        .inspect_err(|e| scope.life.fail(e.error_code()))?;
+    let successful = response.status().is_success();
+    Ok(response.map(|body| client.body(body, successful)))
 }
 
 /// A gRPC call whose request is `endpoint`'s HTTP body, sent to the engine as `rpc`.
 /// The log context is `None` when the call failed before dispatch.
 pub async fn route_grpc<R: EngineRpc>(
-    ctx: &AppContext,
+    ctx: &Arc<AppContext>,
     endpoint: Endpoint,
     rpc: R,
     headers: HeaderMap,
@@ -130,17 +141,39 @@ pub async fn route_grpc<R: EngineRpc>(
     Option<RequestLogContext>,
 ) {
     let start = Instant::now();
-    match prepare(ctx, endpoint, &headers, body, true).await {
+    let scope =
+        match crate::server::admission::RequestScope::enter_request(ctx, endpoint.path(), &headers)
+        {
+            Ok(scope) => scope,
+            Err(error) => return (Err(error), None),
+        };
+    let client = scope.client();
+    match prepare(ctx, endpoint, &headers, body, true, &scope).await {
         Ok((mut request, routing)) => {
-            forward_request_grpc(rpc, ctx, &mut request, &routing, headers, start).await
+            request.scope = Some(Arc::clone(&scope));
+            let (result, log) =
+                forward_request_grpc(rpc, ctx, &mut request, &routing, headers, start).await;
+            (
+                result
+                    .inspect_err(|e| scope.life.fail(e.error_code()))
+                    .map(|mut response| {
+                        response.replies =
+                            client.replies(response.replies, response.status.is_success());
+                        response
+                    }),
+                log,
+            )
         }
-        Err(error) => (Err(error), None),
+        Err(error) => {
+            scope.life.fail(error.error_code());
+            (Err(error), None)
+        }
     }
 }
 
 /// [`route_grpc`] for a typed request, prepared from its fields as `endpoint` prepares a body.
 pub async fn route_typed<R: TypedRpc>(
-    ctx: &AppContext,
+    ctx: &Arc<AppContext>,
     endpoint: Endpoint,
     request: R,
     headers: HeaderMap,
@@ -148,22 +181,105 @@ pub async fn route_typed<R: TypedRpc>(
     Result<GrpcResponse<R::Reply>, ApiError>,
     Option<RequestLogContext>,
 ) {
-    let start = Instant::now();
-    let prepared = async {
+    let admitted = match AdmittedRequest::enter(ctx, endpoint.path(), &headers) {
+        Ok(admitted) => admitted,
+        Err(error) => return (Err(error), None),
+    };
+    route_typed_admitted(ctx, endpoint, request, headers, admitted).await
+}
+
+pub(crate) struct AdmittedRequest {
+    scope: Arc<crate::server::admission::RequestScope>,
+    client: crate::server::admission::ClientLifetime,
+    start: Instant,
+}
+
+impl AdmittedRequest {
+    fn enter(
+        ctx: &AppContext,
+        endpoint: &'static str,
+        headers: &HeaderMap,
+    ) -> Result<Self, ApiError> {
+        let start = Instant::now();
+        let scope = crate::server::admission::RequestScope::enter_request(ctx, endpoint, headers)?;
+        let client = scope.client();
+        Ok(Self {
+            scope,
+            client,
+            start,
+        })
+    }
+    pub(crate) fn response(self, response: Response<Body>) -> Response<Body> {
+        let successful = response.status().is_success();
+        response.map(|body| self.client.body(body, successful))
+    }
+}
+
+pub(crate) async fn admit_and_prepare<T: Send + 'static>(
+    ctx: &Arc<AppContext>,
+    endpoint: &'static str,
+    headers: &HeaderMap,
+    work: impl FnOnce(&AppContext) -> Result<T, ApiError> + Send + 'static,
+) -> Result<(AdmittedRequest, T), ApiError> {
+    let admitted = AdmittedRequest::enter(ctx, endpoint, headers)?;
+    let prepared = prepare_cpu(ctx, &admitted.scope, work)
+        .await
+        .inspect_err(|error| admitted.scope.life.fail(error.error_code()))?;
+    Ok((admitted, prepared))
+}
+
+pub(crate) async fn route_typed_admitted<R: TypedRpc>(
+    ctx: &Arc<AppContext>,
+    endpoint: Endpoint,
+    request: R,
+    headers: HeaderMap,
+    admitted: AdmittedRequest,
+) -> (
+    Result<GrpcResponse<R::Reply>, ApiError>,
+    Option<RequestLogContext>,
+) {
+    let AdmittedRequest {
+        scope,
+        client,
+        start,
+    } = admitted;
+    let prepared = prepare_cpu(ctx, &scope, move |ctx| {
         let model = ModelId(ctx.config.model.id.clone());
-        let routing = ModelRouting::lookup(ctx, &model)?;
+        ModelRouting::lookup(ctx, &model)?;
         let path = endpoint.path();
         if path != GENERATE_PATH {
             require_plain_workers(ctx, &model, path)?;
         }
         let prepared = PreparedRequest::typed(ctx, path, model, &request.view())?;
-        Ok::<_, ApiError>((prepared, routing))
-    };
+        Ok((request, prepared))
+    });
     match prepared.await {
-        Ok((mut prepared, routing)) => {
-            forward_request_grpc(request, ctx, &mut prepared, &routing, headers, start).await
+        Ok((request, mut prepared)) => {
+            let routing = match ModelRouting::lookup(ctx, &prepared.model) {
+                Ok(routing) => routing,
+                Err(error) => {
+                    scope.life.fail(error.error_code());
+                    return (Err(error), None);
+                }
+            };
+            prepared.scope = Some(Arc::clone(&scope));
+            let (result, log) =
+                forward_request_grpc(request, ctx, &mut prepared, &routing, headers, start).await;
+            (
+                result
+                    .inspect_err(|e| scope.life.fail(e.error_code()))
+                    .map(|mut response| {
+                        response.replies =
+                            client.replies(response.replies, response.status.is_success());
+                        response
+                    }),
+                log,
+            )
         }
-        Err(error) => (Err(error), None),
+        Err(error) => {
+            scope.life.fail(error.error_code());
+            (Err(error), None)
+        }
     }
 }
 
@@ -176,7 +292,7 @@ pub fn prompt_ids(ctx: &AppContext, endpoint: Endpoint, text: &str) -> Option<Ve
 }
 
 impl Endpoint {
-    fn path(self) -> &'static str {
+    pub(crate) fn path(self) -> &'static str {
         match self {
             Endpoint::Chat => CHAT_PATH,
             Endpoint::Completions => COMPLETIONS_PATH,
@@ -190,14 +306,56 @@ impl Endpoint {
 
 /// Validate the body and resolve its routing policy, as `endpoint` does over HTTP.
 async fn prepare<'a>(
-    ctx: &'a AppContext,
+    ctx: &'a Arc<AppContext>,
     endpoint: Endpoint,
     headers: &HeaderMap,
     body: Bytes,
     grpc: bool,
+    scope: &Arc<crate::server::admission::RequestScope>,
 ) -> Result<(PreparedRequest, ModelRouting<'a>), ApiError> {
+    let headers = headers.clone();
+    let request = prepare_cpu(ctx, scope, move |ctx| {
+        prepare_sync(ctx, endpoint, &headers, body, grpc)
+    })
+    .await?;
+    let routing = ModelRouting::lookup(ctx, &request.model)?;
+    Ok((request, routing))
+}
+
+async fn prepare_cpu<T: Send + 'static>(
+    ctx: &Arc<AppContext>,
+    scope: &Arc<crate::server::admission::RequestScope>,
+    work: impl FnOnce(&AppContext) -> Result<T, ApiError> + Send + 'static,
+) -> Result<T, ApiError> {
+    let ctx = Arc::clone(ctx);
+    let scope = Arc::clone(scope);
+    tokio::task::spawn_blocking(move || {
+        // Dropping the client future cannot release admission while this CPU work remains.
+        let _scope = scope;
+        if _scope.cancelled.is_cancelled() {
+            return Err(ApiError::Internal(
+                std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "request cancelled before preparation",
+                )
+                .into(),
+            ));
+        }
+        work(&ctx)
+    })
+    .await
+    .map_err(|error| ApiError::Internal(error.into()))?
+}
+
+fn prepare_sync(
+    ctx: &AppContext,
+    endpoint: Endpoint,
+    headers: &HeaderMap,
+    body: Bytes,
+    grpc: bool,
+) -> Result<PreparedRequest, ApiError> {
     let served_model = || ModelId(ctx.config.model.id.clone());
-    let (routing, request) = match endpoint {
+    let (_routing, request) = match endpoint {
         Endpoint::Chat | Endpoint::Completions => {
             let mut fields = parse_routing_fields(&body)?;
             let model = fields.model.take();
@@ -239,7 +397,7 @@ async fn prepare<'a>(
             (routing, PreparedRequest::rerank(model, body)?)
         }
     };
-    Ok((request, routing))
+    Ok(request)
 }
 
 /// Prefill and decode engines serve generation only.
@@ -401,7 +559,41 @@ async fn select_workers(
 
     let candidates = prefills_with_decode(ctx, request, candidates, resolver, &routing_context);
     let prefill = pick_prefill_worker(ctx, request, policy, &candidates, &routing_context)?;
-    let decode = pick_decode_worker(ctx, request, &prefill, resolver, &routing_context, true)?;
+    let decode = pick_decode_worker(
+        ctx,
+        request,
+        &prefill,
+        resolver,
+        &routing_context,
+        DecodePickMode::Dispatch,
+    )?;
+    if let Some(scope) = &request.scope {
+        if scope.life.selection.is_empty() {
+            let signal = routing_context.prefix_matches.as_ref();
+            let matches = signal.and_then(|s| match &s.outcome {
+                sgl_kv_indexer::PrefixOutcome::Matched { matches, .. } => Some(matches.as_slice()),
+                _ => None,
+            });
+            let cached = |url: &str| {
+                matches.map(|entries| {
+                    let blocks = entries
+                        .iter()
+                        .find(|m| m.address == url)
+                        .map_or(0, |m| m.matched_prefix_blocks);
+                    signal
+                        .unwrap()
+                        .matched_tokens(request.input_token_count as u64, url, blocks)
+                })
+            };
+            let rows=candidates.iter().filter(|w|w.id==prefill.id).chain(candidates.iter().filter(|w|w.id!=prefill.id)).take(64).map(|w| {
+                let matched=cached(&w.url);
+                serde_json::json!({"worker_id":w.id.0,"url":w.url,"selected":w.id==prefill.id,"matched_prefix_tokens":matched,
+                    "uncached_tokens":matched.map(|n|(request.input_token_count as u64).saturating_sub(n)),"router_inflight":w.router_inflight_load(),
+                    "score_kind":ctx.config.model.policy.to_string(),"decision_reason":"ordinary_selection"})
+            }).collect();
+            scope.life.candidates(rows, cached(&prefill.url));
+        }
+    }
     record_prefill_route(ctx, routing_context.prefix_matches.as_ref(), &prefill.url);
     Ok(SelectedWorkers {
         prefill,
@@ -440,8 +632,17 @@ fn prefills_with_decode(
             .iter()
             .filter(|p| {
                 *fits.entry(p.version_group()).or_insert_with(|| {
-                    pick_decode_worker(ctx, request, p, resolver, routing, allow_capacity_fallback)
-                        .is_ok()
+                    pick_decode_worker(
+                        ctx,
+                        request,
+                        p,
+                        resolver,
+                        routing,
+                        DecodePickMode::Probe {
+                            allow_capacity_fallback,
+                        },
+                    )
+                    .is_ok()
                 })
             })
             .cloned()
@@ -530,6 +731,7 @@ fn pick_prefill_worker(
         policy_kind: ctx.config.model.policy,
         bucket_selector: ctx.bucket_selector.as_ref(),
         metrics: ctx.metrics.as_ref(),
+        diagnostics: request.scope.as_ref().map(|s| &s.life.selection),
         model_id: &request.model,
         body: Some(&request.body),
         routing_key: routing.routing_key,
@@ -551,8 +753,14 @@ fn pick_prefill_worker(
         min_load_choices: affinity
             .map(|config| config.min_load_choices)
             .unwrap_or(DEFAULT_MIN_LOAD_CHOICES),
+        route_by_uncached_tokens: affinity.is_some_and(|config| config.route_by_uncached_tokens),
     })
     .map_err(|reason| policy_selection_failed(ctx, &request.model.0, reason))
+}
+
+enum DecodePickMode {
+    Dispatch,
+    Probe { allow_capacity_fallback: bool },
 }
 
 fn pick_decode_worker(
@@ -561,7 +769,7 @@ fn pick_decode_worker(
     prefill: &Worker,
     resolver: &PdPoolResolver,
     routing: &RoutingContext<'_>,
-    allow_capacity_fallback: bool,
+    mode: DecodePickMode,
 ) -> Result<Option<Arc<Worker>>, ApiError> {
     if prefill.mode() != WorkerMode::Prefill {
         return Ok(None);
@@ -570,9 +778,18 @@ fn pick_decode_worker(
     let candidates = resolver
         .decode_peers(&request.model, prefill)
         .map_err(|error| pool_error(error, &request.model))?;
+    // Eligibility probes must not advance the serving policy's rotation.
+    let preview = matches!(mode, DecodePickMode::Probe { .. })
+        .then(|| crate::policies::decode::build_decode_policy(ctx.config.model.decode_policy));
     let decode = select_decode_peer(&DecodeSelectionInputs {
+        decode_policy: preview.as_deref().unwrap_or(ctx.decode_policy.as_ref()),
         decode_policy_kind: ctx.config.model.decode_policy,
-        allow_capacity_fallback,
+        allow_capacity_fallback: match mode {
+            DecodePickMode::Dispatch => true,
+            DecodePickMode::Probe {
+                allow_capacity_fallback,
+            } => allow_capacity_fallback,
+        },
         bucket_selector: ctx.bucket_selector.as_ref(),
         model_id: &request.model,
         prefill_url: &prefill.url,
@@ -619,6 +836,7 @@ async fn lookup_prefix_matches(
                 outcome,
                 query_blocks,
                 block_hashes: None,
+                local_queries: Default::default(),
             })
         }
         // Without usable indexer inputs, try the in-process radix tree.
@@ -719,6 +937,67 @@ fn parse_optional_positive_f64_header(
         )));
     }
     Ok(Some(parsed))
+}
+
+/// Startup/recovery probe uses the same preparation and HTTP forwarding as clients,
+/// with explicit workers to avoid requiring health proof in order to obtain it.
+pub(crate) async fn generation_probe(
+    ctx: &AppContext,
+    prefill: Arc<Worker>,
+    decode: Option<Arc<Worker>>,
+) -> bool {
+    let scope = crate::server::admission::RequestScope::enter(
+        &crate::server::admission::Admission::default(),
+    )
+    .expect("unlimited health admission");
+    let mut client = scope.client();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-sgl-router-probe",
+        axum::http::HeaderValue::from_static("health"),
+    );
+    if let Some(auth) = &ctx.config.server.worker_auth {
+        headers.insert(axum::http::header::AUTHORIZATION, auth.clone());
+    }
+    // A single explicit token avoids chat-template overhead and minimizes cache footprint.
+    // Use an ordinary unique rid: engine health-special ids can skip generation when busy.
+    let body = Bytes::from(serde_json::json!({"input_ids":[1],"stream":false,"sampling_params":{"max_new_tokens":1,"temperature":0}}).to_string());
+    let Ok(mut request) = prepare_sync(ctx, Endpoint::Generate, &headers, body, false) else {
+        return false;
+    };
+    request.scope = Some(scope);
+    request.wait_for_prefill = true;
+    let started = Instant::now();
+    let duration = RequestDurationGuard::new(ctx, &request.model, started);
+    let selected = SelectedWorkers {
+        prefill,
+        decode,
+        track_dispatch_timestamps: false,
+    };
+    let Ok(dispatched) =
+        forward_request(ctx, &mut request, selected, headers, started, &duration).await
+    else {
+        return false;
+    };
+    if !dispatched.response.status().is_success() {
+        return false;
+    }
+    let Ok(bytes) = axum::body::to_bytes(dispatched.response.into_body(), 64 << 10).await else {
+        return false;
+    };
+    let Ok(body) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    let ok = body["usage"]["completion_tokens"]
+        .as_u64()
+        .is_some_and(|n| n > 0)
+        || body["meta_info"]["completion_tokens"]
+            .as_u64()
+            .is_some_and(|n| n > 0);
+    if ok {
+        client.complete();
+    }
+    ok
 }
 
 #[cfg(test)]

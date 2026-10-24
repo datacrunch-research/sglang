@@ -173,6 +173,7 @@ pub struct SelectionContext<'a> {
     prefill_cache_bucket: Option<(&'a BucketSelector, BucketRequest)>,
     affinity_lookup_enabled: bool,
     affinity_assignment_enabled: bool,
+    pub(crate) round_robin: Arc<round_robin::RequestRotation>,
 }
 
 impl<'a> SelectionContext<'a> {
@@ -191,6 +192,7 @@ impl<'a> SelectionContext<'a> {
             prefill_cache_bucket: None,
             affinity_lookup_enabled: true,
             affinity_assignment_enabled: true,
+            round_robin: Arc::default(),
         }
     }
 
@@ -213,7 +215,16 @@ impl<'a> SelectionContext<'a> {
             prefill_cache_bucket: None,
             affinity_lookup_enabled: true,
             affinity_assignment_enabled: true,
+            round_robin: Arc::default(),
         }
+    }
+
+    pub(crate) fn with_round_robin_rotation(
+        mut self,
+        rotation: Arc<round_robin::RequestRotation>,
+    ) -> Self {
+        self.round_robin = rotation;
+        self
     }
 
     /// Attaches ingress-computed routing tokens.
@@ -921,6 +932,7 @@ mod tests {
             },
             query_blocks: 8,
             block_hashes: None,
+            local_queries: Default::default(),
         };
         let ctx = SelectionContext::new(&model, None)
             .with_request_tokens(Some(&[1, 2, 3, 4, 5, 6, 7, 8]))
@@ -965,6 +977,7 @@ mod tests {
             },
             query_blocks: 8,
             block_hashes: None,
+            local_queries: Default::default(),
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(8_000)
@@ -1015,6 +1028,7 @@ mod tests {
             },
             query_blocks: 64,
             block_hashes: None,
+            local_queries: Default::default(),
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(64_000)
@@ -1072,6 +1086,7 @@ mod tests {
             },
             query_blocks: 4,
             block_hashes: None,
+            local_queries: Default::default(),
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(4_000)
@@ -1124,6 +1139,7 @@ mod tests {
             },
             query_blocks: 8,
             block_hashes: None,
+            local_queries: Default::default(),
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(80)
@@ -1164,6 +1180,7 @@ mod tests {
             },
             query_blocks: 8,
             block_hashes: None,
+            local_queries: Default::default(),
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(80)
@@ -1196,6 +1213,7 @@ mod tests {
             },
             query_blocks: 4_125,
             block_hashes: None,
+            local_queries: Default::default(),
         };
         let ctx = SelectionContext::new(&model, None)
             .with_input_tokens(4_125)

@@ -6,6 +6,9 @@ pub mod chat_formatter;
 mod kimi;
 pub mod stats;
 
+#[cfg(test)]
+mod preparation_tests;
+
 use anyhow::Result;
 use chat_formatter::ChatFormatter;
 use dashmap::DashMap;
@@ -341,6 +344,7 @@ mod tests {
             },
             discovery: crate::config::DiscoveryBackend::StaticUrls(
                 crate::config::StaticUrlsDiscoveryConfig {
+                    roles: Default::default(),
                     urls: vec!["http://placeholder:0".into()],
                 },
             ),

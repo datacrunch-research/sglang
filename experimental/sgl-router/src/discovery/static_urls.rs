@@ -22,7 +22,7 @@
 //! the K8s backend (which can still classify via pod labels).
 
 use crate::config::StaticUrlsDiscoveryConfig;
-use crate::discovery::{DiscoveryEvent, WorkerId, WorkerMode, WorkerSpec};
+use crate::discovery::{DiscoveryEvent, WorkerId, WorkerSpec};
 use anyhow::Result;
 use tokio::sync::mpsc;
 
@@ -37,10 +37,12 @@ pub async fn spawn(
 ) -> Result<tokio::task::JoinHandle<()>> {
     let handle = tokio::spawn(async move {
         for url in cfg.urls {
+            let (mode, bootstrap_port) = cfg.roles.get(&url).copied().unwrap_or_default();
             let spec = WorkerSpec {
                 id: WorkerId(url.clone()),
                 url,
-                mode: WorkerMode::Plain,
+                mode,
+                bootstrap_port,
                 model_ids: Vec::new(),
                 ..Default::default()
             };
@@ -88,6 +90,7 @@ mod tests {
     #[tokio::test]
     async fn exits_when_receiver_dropped() {
         let cfg = StaticUrlsDiscoveryConfig {
+            roles: Default::default(),
             urls: (0..10).map(|i| format!("http://w{i}:30000")).collect(),
         };
         let (tx, rx) = mpsc::channel(1);
@@ -111,6 +114,7 @@ mod tests {
         use std::time::Duration;
 
         let cfg = StaticUrlsDiscoveryConfig {
+            roles: Default::default(),
             urls: vec!["http://w0:30000".into(), "http://w1:30000".into()],
         };
         let (tx, mut rx) = mpsc::channel(8);

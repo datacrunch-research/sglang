@@ -58,12 +58,32 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let routing = cli.routing.chat_routing;
     init_tracing(&cli.server.log_level, cli.server.log_format)?;
-    let config = cli
+    let mut config = cli
         .into_config()
         .context("resolve configuration from CLI flags")?;
 
     // Buffer termination signals before tokenizer loading or discovery can block startup.
     let (sigterm, sigint) = install_signal_handlers()?;
+    // Serve liveness on the final socket while metadata/tokenizer startup is pending.
+    let listen_addr = format!("{}:{}", config.server.host, config.server.port);
+    let socket =
+        std::net::TcpListener::bind(&listen_addr).with_context(|| format!("bind {listen_addr}"))?;
+    socket.set_nonblocking(true)?;
+    let startup_listener = TcpListener::from_std(socket.try_clone()?)?;
+    let listener = TcpListener::from_std(socket)?;
+    let startup_app = axum::Router::new()
+        .route(
+            "/liveness",
+            axum::routing::get(|| async { axum::http::StatusCode::OK }),
+        )
+        .route(
+            "/healthz",
+            axum::routing::get(|| async { axum::http::StatusCode::OK }),
+        )
+        .fallback(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE });
+    let startup_handle =
+        tokio::spawn(async move { axum::serve(startup_listener, startup_app).await });
+    sgl_router::config::resolve_worker_model(&mut config).await?;
     log_startup(&config);
 
     // Load tokenizers used to prepare requests for routing.
@@ -121,6 +141,9 @@ async fn main() -> Result<()> {
 
     // Discovery feeds worker changes to the manager, which maintains this routing catalog.
     let worker_registry = Arc::new(WorkerRegistry::default());
+    if config.server.health_check.mode != sgl_router::config::HealthCheckMode::Off {
+        worker_registry.require_active_health();
+    }
     let (discovery_handle, worker_manager_handle) = start_worker_discovery_and_manager(
         &config,
         &worker_registry,
@@ -140,14 +163,20 @@ async fn main() -> Result<()> {
         external_kv_indexer_client,
     )?;
     app_context.chat_routing = chat_routing;
+    if config.server.health_check.mode != sgl_router::config::HealthCheckMode::Off {
+        app_context.active_health = Some(Arc::new(sgl_router::health::active::ActiveHealth::new(
+            config.server.health_check.clone(),
+        )));
+    }
     let app_context = Arc::new(app_context);
     app_context.mark_ready();
+    let health_handle = app_context.active_health.as_ref().map(|_| {
+        tokio::spawn(sgl_router::health::active::ActiveHealth::run(Arc::clone(
+            &app_context,
+        )))
+    });
 
     // Serve HTTP requests until shutdown, allowing in-flight requests to finish.
-    let listen_addr = format!("{}:{}", config.server.host, config.server.port);
-    let listener = TcpListener::bind(&listen_addr)
-        .await
-        .with_context(|| format!("bind {listen_addr}"))?;
     tracing::info!("listening on {listen_addr}");
     let grpc_listener = match config.server.grpc_port {
         Some(port) => {
@@ -160,7 +189,47 @@ async fn main() -> Result<()> {
         }
         None => None,
     };
+    let metrics_handle = if let Some(port) = config.server.prometheus_port {
+        let metrics_addr = format!("{}:{port}", config.server.host);
+        let metrics_listener = TcpListener::bind(&metrics_addr)
+            .await
+            .with_context(|| format!("bind metrics {metrics_addr}"))?;
+        let metrics_app = axum::Router::new()
+            .route(
+                "/metrics",
+                axum::routing::get(sgl_router::server::routes::metrics::metrics),
+            )
+            .with_state(Arc::clone(&app_context));
+        Some(tokio::spawn(async move {
+            axum::serve(metrics_listener, metrics_app).await
+        }))
+    } else {
+        None
+    };
+    let admin_handle = if let Some(port) = config.server.admin_port {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .context("bind loopback admin listener")?;
+        tracing::info!(address=%listener.local_addr()?,"serving loopback admin");
+        let app = sgl_router::server::admin::router(Arc::clone(&app_context));
+        Some(tokio::spawn(
+            async move { axum::serve(listener, app).await },
+        ))
+    } else {
+        None
+    };
+    startup_handle.abort();
+    let _ = startup_handle.await;
     let outcome = serve(listener, grpc_listener, app_context, sigterm, sigint).await;
+    if let Some(handle) = admin_handle {
+        handle.abort();
+    }
+    if let Some(handle) = metrics_handle {
+        handle.abort();
+    }
+    if let Some(handle) = health_handle {
+        handle.abort();
+    }
 
     // Stop background tasks once the HTTP server has finished draining.
     discovery_handle.abort();
@@ -177,17 +246,26 @@ async fn main() -> Result<()> {
 fn init_tracing(default_level: &str, format: LogFormat) -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level));
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    let (filter, handle) = tracing_subscriber::reload::Layer::new(filter);
     let install_result = match format {
-        LogFormat::Json => tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(true)
-            .json()
+        LogFormat::Json => tracing_subscriber::registry()
+            .with(filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_target(true)
+                    .json()
+                    .event_format(sgl_router::server::logging::StructuredJson),
+            )
             .try_init(),
-        LogFormat::Text => tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(true)
+        LogFormat::Text => tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().with_target(true))
             .try_init(),
     };
+    if install_result.is_ok() {
+        sgl_router::server::logging::set_reload_handle(handle);
+    }
     if let Err(e) = install_result {
         tracing::debug!(
             default_level = %default_level,
@@ -361,7 +439,8 @@ fn build_app_context(
     let proxy = Arc::new(
         Proxy::new(Duration::from_secs(config.proxy.request_timeout_secs))
             .context("build proxy client")?
-            .with_stream_idle_timeout(Duration::from_secs(config.proxy.stream_idle_timeout_secs)),
+            .with_stream_idle_timeout(Duration::from_secs(config.proxy.stream_idle_timeout_secs))
+            .with_forward_request_headers(config.server.forward_request_headers.clone()),
     );
 
     let mut app_context = AppContext::with_router_inflight_load(

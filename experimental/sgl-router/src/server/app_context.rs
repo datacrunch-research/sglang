@@ -16,7 +16,7 @@ use crate::state::kv_events::{
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadRegistry;
 use crate::tokenizer::TokenizerRegistry;
-use crate::workers::WorkerRegistry;
+use crate::workers::{DecodeGate, WorkerRegistry};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -51,10 +51,13 @@ impl ChatRouting {
 
 pub struct AppContext {
     pub config: Config,
+    pub active_health: Option<Arc<crate::health::active::ActiveHealth>>,
+    pub admission: crate::server::admission::Admission,
     pub tokenizers: Arc<TokenizerRegistry>,
     pub proxy: Arc<Proxy>,
     pub registry: Arc<WorkerRegistry>,
     pub policies: Arc<PolicyRegistry>,
+    pub decode_policy: Box<dyn crate::policies::decode::DecodePolicy>,
     /// Converts static Bucket configuration into request candidate domains.
     pub bucket_selector: Arc<BucketSelector>,
     /// Select legacy policies or model-specific bucket-first routing.
@@ -62,6 +65,7 @@ pub struct AppContext {
     /// Per-worker active-load bookkeeping shared by the proxy, policies,
     /// timeout janitor, and metrics.
     pub router_inflight_load: Arc<RouterInflightLoadRegistry>,
+    pub decode_gate: DecodeGate,
     /// Lightweight Prometheus-format metrics registry served via
     /// `/metrics`. Shared with the edge middleware (requests_total /
     /// responses_total), the chat handler (worker_requests_total), the
@@ -97,19 +101,23 @@ impl AppContext {
         registry: Arc<WorkerRegistry>,
         policies: Arc<PolicyRegistry>,
     ) -> Self {
+        let router_inflight_load = RouterInflightLoadRegistry::new(
+            Arc::new(crate::state::load_monitor::router_inflight_load::SystemTimeClock),
+            std::time::Duration::from_secs(config.router_inflight_load.stale_request_timeout_secs),
+        );
         Self::with_router_inflight_load(
             config,
             tokenizers,
             proxy,
             registry,
             policies,
-            RouterInflightLoadRegistry::with_defaults(),
+            router_inflight_load,
         )
     }
 
     /// Construct an [`AppContext`] with an explicit [`RouterInflightLoadRegistry`].
-    /// Production wires the default (5-minute timeout, SystemTimeClock)
-    /// via [`Self::new`]; tests that exercise the janitor pass a registry
+    /// [`Self::new`] uses the configured budget and a system clock;
+    /// tests that exercise the janitor pass a registry
     /// built with a `MockClock`.
     pub fn with_router_inflight_load(
         config: Config,
@@ -129,15 +137,22 @@ impl AppContext {
         // it here for policies that emit their own counters.
         policies.attach_metrics(Arc::clone(&metrics));
         let bucket_selector = Arc::new(BucketSelector::new(config.model.bucket_config.clone()));
+        let decode_gate = DecodeGate::new(config.proxy.decode_dispatch_limit);
+        let decode_policy =
+            crate::policies::decode::build_decode_policy(config.model.decode_policy);
         Self {
+            active_health: None,
+            admission: crate::server::admission::Admission::new(&config.server.admission),
             config,
             tokenizers,
             proxy,
             registry,
             policies,
+            decode_policy,
             bucket_selector,
             chat_routing: ChatRouting::Legacy,
             router_inflight_load,
+            decode_gate,
             metrics,
             prefix_index: None,
             radix_tree_prefix_provider: None,
@@ -202,6 +217,9 @@ impl AppContext {
     #[cfg(test)]
     pub fn stub() -> Self {
         Self {
+            active_health: None,
+            admission: crate::server::admission::Admission::default(),
+            decode_policy: crate::policies::decode::build_decode_policy(Default::default()),
             config: Config {
                 server: crate::config::ServerConfig {
                     host: "x".into(),
@@ -232,6 +250,7 @@ impl AppContext {
                 },
                 discovery: crate::config::DiscoveryBackend::StaticUrls(
                     crate::config::StaticUrlsDiscoveryConfig {
+                        roles: Default::default(),
                         urls: vec!["http://placeholder:0".into()],
                     },
                 ),
@@ -245,6 +264,7 @@ impl AppContext {
             bucket_selector: Arc::new(BucketSelector::new(None)),
             chat_routing: ChatRouting::Legacy,
             router_inflight_load: RouterInflightLoadRegistry::with_defaults(),
+            decode_gate: DecodeGate::new(None),
             metrics: MetricsRegistry::new(),
             prefix_index: None,
             radix_tree_prefix_provider: None,

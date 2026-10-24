@@ -11,7 +11,7 @@ use crate::config::SamplingField;
 use crate::server::error::{router_grpc_status, ApiError};
 use crate::server::header_utils::should_forward_request_header;
 use crate::workers::Worker;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderName, StatusCode};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::stream::{BoxStream, StreamExt, TryStreamExt};
@@ -34,6 +34,12 @@ pub struct GrpcResponse<T> {
     pub replies: Replies<T>,
 }
 
+#[derive(Default)]
+pub struct GenerationEvidence {
+    pub generated: bool,
+    pub failed: bool,
+}
+
 /// One engine RPC, sent with the body the router prepared for its HTTP sibling.
 pub trait EngineRpc: Send + Sync + 'static {
     type Reply: PumpItem;
@@ -50,6 +56,10 @@ pub trait EngineRpc: Send + Sync + 'static {
     /// The HTTP status a reply carries, for RPCs that report one.
     fn status(_reply: &Self::Reply) -> Option<StatusCode> {
         None
+    }
+
+    fn generation_evidence(_reply: &Self::Reply) -> GenerationEvidence {
+        GenerationEvidence::default()
     }
 }
 
@@ -121,6 +131,16 @@ impl EngineRpc for OpenAiRpc {
 
     fn status(reply: &Self::Reply) -> Option<StatusCode> {
         reply.status_code.and_then(http_status)
+    }
+
+    fn generation_evidence(reply: &Self::Reply) -> GenerationEvidence {
+        serde_json::from_slice::<Value>(&reply.json_chunk).map_or_else(
+            |_| GenerationEvidence::default(),
+            |value| GenerationEvidence {
+                generated: crate::server::request_log::generated_output(&value),
+                failed: crate::server::request_log::is_error(&value),
+            },
+        )
     }
 }
 
@@ -195,12 +215,20 @@ pub trait TypedRpc: Clone + Send + Sync + 'static {
     fn trace_headers(&mut self) -> &mut HashMap<String, String>;
 
     fn send(self, client: SglangServiceClient<Channel>) -> RpcFuture<Self::Reply>;
+
+    fn generation_evidence(_reply: &Self::Reply) -> GenerationEvidence {
+        GenerationEvidence::default()
+    }
 }
 
 type RpcFuture<T> = BoxFuture<'static, Result<Replies<T>, Status>>;
 
 impl<T: TypedRpc> EngineRpc for T {
     type Reply = T::Reply;
+
+    fn generation_evidence(reply: &Self::Reply) -> GenerationEvidence {
+        T::generation_evidence(reply)
+    }
 
     fn call(
         &self,
@@ -281,6 +309,14 @@ fn apply_generation(
 impl TypedRpc for proto::GenerateRequest {
     type Reply = proto::GenerateResponse;
 
+    fn generation_evidence(reply: &Self::Reply) -> GenerationEvidence {
+        native_generation_evidence(
+            &reply.meta_info,
+            !reply.output_ids.is_empty()
+                || reply.text.as_ref().is_some_and(|text| !text.is_empty()),
+        )
+    }
+
     fn view(&self) -> RoutingView<'_> {
         RoutingView {
             input_ids: &self.input_ids,
@@ -313,6 +349,10 @@ impl TypedRpc for proto::GenerateRequest {
 impl TypedRpc for proto::TextGenerateRequest {
     type Reply = proto::TextGenerateResponse;
 
+    fn generation_evidence(reply: &Self::Reply) -> GenerationEvidence {
+        native_generation_evidence(&reply.meta_info, !reply.text.is_empty())
+    }
+
     fn view(&self) -> RoutingView<'_> {
         RoutingView {
             input_ids: &[],
@@ -339,6 +379,20 @@ impl TypedRpc for proto::TextGenerateRequest {
 
     fn send(self, mut client: SglangServiceClient<Channel>) -> RpcFuture<Self::Reply> {
         Box::pin(async move { Ok(client.text_generate(self).await?.into_inner().boxed()) })
+    }
+}
+
+fn native_generation_evidence(meta: &HashMap<String, String>, output: bool) -> GenerationEvidence {
+    GenerationEvidence {
+        generated: output
+            || meta
+                .get("completion_tokens")
+                .and_then(|n| n.parse::<u64>().ok())
+                .is_some_and(|n| n > 0),
+        failed: meta
+            .get("finish_reason")
+            .and_then(|reason| serde_json::from_str::<Value>(reason).ok())
+            .is_some_and(|reason| reason["type"] == "abort"),
     }
 }
 
@@ -516,26 +570,34 @@ fn into_status(error: std::io::Error) -> Status {
 /// Aborts the engine request by the router's rid unless disarmed, as
 /// `/abort_request` does over HTTP. A dropped call alone is not enough: the
 /// engine's OpenAI RPCs abort an id of their own, not the request's rid.
-struct AbortOnDrop(Option<(SglangServiceClient<Channel>, String)>);
+struct AbortOnDrop {
+    request: Option<(SglangServiceClient<Channel>, String)>,
+    guards: Option<Box<dyn Send + 'static>>,
+}
 
 impl AbortOnDrop {
     fn new(client: &SglangServiceClient<Channel>, rid: Option<&str>) -> Self {
         let rid = rid.filter(|rid| !rid.is_empty());
-        Self(rid.map(|rid| (client.clone(), rid.to_owned())))
+        Self {
+            request: rid.map(|rid| (client.clone(), rid.to_owned())),
+            guards: None,
+        }
     }
 
     fn disarm(&mut self) {
-        self.0 = None;
+        self.request = None;
     }
 }
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        let Some((mut client, rid)) = self.0.take() else {
+        let Some((mut client, rid)) = self.request.take() else {
             return;
         };
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let guards = self.guards.take();
             runtime.spawn(async move {
+                let _guards = guards;
                 let abort = client.abort(proto::AbortRequest {
                     rid,
                     abort_all: false,
@@ -551,10 +613,10 @@ impl Drop for AbortOnDrop {
 }
 
 /// The headers the HTTP path forwards; the engine reads these as request headers.
-fn trace_headers(headers: &HeaderMap) -> HashMap<String, String> {
+fn trace_headers(headers: &HeaderMap, extra: &[HeaderName]) -> HashMap<String, String> {
     headers
         .iter()
-        .filter(|(name, _)| should_forward_request_header(name))
+        .filter(|(name, _)| should_forward_request_header(name) || extra.contains(name))
         .filter_map(|(name, value)| Some((name.to_string(), value.to_str().ok()?.to_owned())))
         .collect()
 }
@@ -588,7 +650,13 @@ impl Proxy {
             worker: worker.url.clone(),
         })?;
         let mut abort = AbortOnDrop::new(&client, abort_rid);
-        let call = rpc.call(client, body, additions, trace_headers(headers));
+        abort.guards = stream_guards;
+        let call = rpc.call(
+            client,
+            body,
+            additions,
+            trace_headers(headers, &self.forward_request_headers),
+        );
         let failed = |status: &Status| status_breaker_outcome(status.code()).record(breaker);
         let respond = |status, replies: Vec<_>, mut abort: AbortOnDrop| {
             breaker_outcome(status).record(breaker);
@@ -607,7 +675,6 @@ impl Proxy {
                 .map_err(ApiError::UpstreamGrpc)?;
             let status = replies.last().and_then(R::status).unwrap_or(StatusCode::OK);
             permit.disarm();
-            drop(stream_guards);
             return Ok(respond(status, replies, abort));
         }
         let call = async {
@@ -627,7 +694,6 @@ impl Proxy {
         };
         if let Some(status) = first.as_ref().and_then(R::status) {
             permit.disarm();
-            drop(stream_guards);
             return Ok(respond(status, first.into_iter().collect(), abort));
         }
         // A status the engine ends the stream with decides the breaker outcome.
@@ -654,7 +720,7 @@ impl Proxy {
         permit.disarm();
         let replies = sse::pump(
             stream,
-            stream_guards,
+            None,
             Some(on_complete),
             on_first_byte,
             StreamLimits {
@@ -672,6 +738,26 @@ impl Proxy {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn grpc_headers_include_only_standard_and_configured_names() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-client-context", "configured".parse().unwrap());
+        headers.insert("x-private-context", "unconfigured".parse().unwrap());
+        headers.insert("traceparent", "trace".parse().unwrap());
+        let extra = [HeaderName::from_static("x-client-context")];
+        let forwarded = trace_headers(&headers, &extra);
+        assert_eq!(
+            forwarded.get("x-client-context").map(String::as_str),
+            Some("configured")
+        );
+        assert_eq!(
+            forwarded.get("traceparent").map(String::as_str),
+            Some("trace")
+        );
+        assert!(!forwarded.contains_key("x-private-context"));
+        assert!(!trace_headers(&headers, &[]).contains_key("x-client-context"));
+    }
+
     use super::*;
 
     #[test]

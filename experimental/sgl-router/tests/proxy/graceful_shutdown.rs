@@ -72,6 +72,7 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
             default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+            roles: Default::default(),
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),

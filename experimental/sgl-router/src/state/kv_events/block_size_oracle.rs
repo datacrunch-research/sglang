@@ -1,31 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Process-shared KV-cache block size, sourced from the workers.
-//!
-//! # Why an oracle instead of a config field?
-//!
-//! `compute_block_hashes` must hash with the **same** block size the
-//! worker uses to publish KV-cache events; otherwise every cache-aware
-//! lookup misses silently. The worker advertises its `page_size` via
-//! `/server_info` (parsed into [`crate::state::kv_events::EventConfig::block_size`]).
-//! Dynamo's design treats `kv_cache_block_size` as a property of the
-//! `ModelDeploymentCard` populated by the worker registrar (see
-//! `~/dynamo/components/src/dynamo/sglang/register.py`); a mismatch
-//! across workers for the same model is rejected loudly
-//! (`lib/kv-router/src/standalone_indexer/registry.rs::bail!`). The
-//! oracle here is the sgl-router analog — first worker establishes the
-//! value, mismatches are refused.
-//!
-//! # Single oracle vs per-model
-//!
-//! For now the oracle is process-wide. Realistic deployments use one
-//! `page_size` across the cluster, so a single value suffices and
-//! mismatches across models indicate misconfiguration the operator
-//! should see. A per-model oracle would require threading `ModelId`
-//! through `KvEventIndex::add_worker`; that refactor can land later
-//! without changing the oracle's public surface.
+//! Worker-reported KV hashing configurations. Local lookups hash separately for
+//! each page-size/bigram group. Single-configuration consumers (remote indexer
+//! and peer snapshots) receive no global configuration for a heterogeneous fleet.
 
+use parking_lot::RwLock;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -38,22 +19,12 @@ const BIGRAM_UNKNOWN: u8 = 0;
 const BIGRAM_UNIGRAM: u8 = 1;
 const BIGRAM_BIGRAM: u8 = 2;
 
-/// First-wins, idempotent block-size publisher.
-///
-/// Internally an `AtomicU32` where 0 means "not yet known". Use
-/// [`Self::try_set`] to publish a worker-reported value and
-/// [`Self::get`] to read at routing time.
-///
-/// Also carries a `bigram` flag — EAGLE-family workers hash KV blocks over
-/// token bigrams, so the policy must pick the bigram hasher. Like `value` it
-/// is a per-cluster property (all workers run the same model) and is
-/// established first-wins with a loud warning on disagreement, mirroring
-/// `try_set` — a heterogeneous EAGLE/non-EAGLE cluster would otherwise let the
-/// last registrant silently flip the global hashing mode.
+/// Worker hashing metadata; legacy setters support callers without discovery.
 #[derive(Debug, Default)]
 pub struct BlockSizeOracle {
     value: AtomicU32,
     bigram: AtomicU8,
+    workers: RwLock<BTreeMap<String, (u32, bool)>>,
 }
 
 /// Returned by [`BlockSizeOracle::try_set`] when the candidate disagrees
@@ -69,9 +40,15 @@ impl BlockSizeOracle {
         Arc::new(Self::default())
     }
 
-    /// Returns the established block size, or `None` if no worker has
-    /// reported one yet.
+    /// Uniform fleet block size, or `None` for unknown or mixed page sizes.
     pub fn get(&self) -> Option<u32> {
+        let workers = self.workers.read();
+        if let Some(&(size, _)) = workers.values().next() {
+            return workers
+                .values()
+                .all(|(other, _)| *other == size)
+                .then_some(size);
+        }
         let v = self.value.load(Ordering::Relaxed);
         if v == 0 {
             None
@@ -117,12 +94,24 @@ impl BlockSizeOracle {
     /// ([`super::hash::compute_block_hashes_bigram`]). Defaults to `false`
     /// until a worker reports an EAGLE-family `speculative_algorithm`.
     pub fn is_bigram(&self) -> bool {
+        let workers = self.workers.read();
+        if let Some(&(_, bigram)) = workers.values().next() {
+            return bigram && workers.values().all(|(_, other)| *other);
+        }
         self.bigram.load(Ordering::Relaxed) == BIGRAM_BIGRAM
     }
 
     /// The prompt's block hashes as workers publish them; `None` until the
     /// block size is known.
     pub fn block_hashes(&self, token_ids: &[u32], namespace: &CacheNamespace) -> Option<Vec<i64>> {
+        let workers = self.workers.read();
+        if let Some(&config) = workers.values().next() {
+            if !workers.values().all(|other| *other == config) {
+                return None;
+            }
+            return Some(namespace.block_hashes(token_ids, config.0 as usize, config.1));
+        }
+        drop(workers);
         let block_size = self.get()? as usize;
         Some(namespace.block_hashes(token_ids, block_size, self.is_bigram()))
     }
@@ -132,11 +121,52 @@ impl BlockSizeOracle {
     /// between `is_bigram()` defaults to `false`, which would misreport a
     /// bigram fleet as unigram.
     pub fn hash_config(&self) -> Option<(u32, bool)> {
+        let workers = self.workers.read();
+        if let Some(&config) = workers.values().next() {
+            return workers
+                .values()
+                .all(|other| *other == config)
+                .then_some(config);
+        }
+        drop(workers);
         let size = self.get()?;
         match self.bigram.load(Ordering::Relaxed) {
             BIGRAM_UNKNOWN => None,
             mode => Some((size, mode == BIGRAM_BIGRAM)),
         }
+    }
+
+    pub fn register_worker(
+        &self,
+        url: &str,
+        size: u32,
+        bigram: bool,
+    ) -> Result<(), BlockSizeMismatch> {
+        if size == 0 {
+            return Err(BlockSizeMismatch {
+                established: self.get().unwrap_or(0),
+                candidate: 0,
+            });
+        }
+        let mut workers = self.workers.write();
+        if let Some(&(old_size, old_bigram)) = workers.get(url) {
+            if (old_size, old_bigram) != (size, bigram) {
+                return Err(BlockSizeMismatch {
+                    established: old_size,
+                    candidate: size,
+                });
+            }
+        }
+        workers.insert(url.to_string(), (size, bigram));
+        Ok(())
+    }
+
+    pub fn remove_worker(&self, url: &str) {
+        self.workers.write().remove(url);
+    }
+
+    pub fn worker_configs(&self) -> BTreeMap<String, (u32, bool)> {
+        self.workers.read().clone()
     }
 
     /// Publish a candidate block size. Returns the established value on
@@ -169,6 +199,22 @@ impl BlockSizeOracle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heterogeneous_workers_have_no_global_hash_configuration() {
+        let oracle = BlockSizeOracle::new();
+        oracle.register_worker("small", 64, false).unwrap();
+        oracle.register_worker("large", 512, false).unwrap();
+        assert_eq!(oracle.get(), None);
+        assert_eq!(oracle.hash_config(), None);
+        assert_eq!(oracle.block_hashes(&[1, 2], CacheNamespace::NONE), None);
+        assert!(oracle.register_worker("small", 512, false).is_err());
+        oracle.remove_worker("small");
+        assert_eq!(oracle.hash_config(), Some((512, false)));
+        assert!(oracle.register_worker("invalid", 0, false).is_err());
+        oracle.remove_worker("large");
+        assert_eq!(oracle.get(), None);
+    }
 
     #[test]
     fn fresh_oracle_returns_none() {

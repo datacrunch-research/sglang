@@ -71,6 +71,7 @@ async fn errors_with_one_dead_worker(max_attempts: u32) -> usize {
             default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+            roles: Default::default(),
             urls: vec![w1.url.clone(), w2.url.clone(), w3.url.clone()],
         }),
         proxy: ProxyConfig {

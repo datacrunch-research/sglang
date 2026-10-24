@@ -565,6 +565,44 @@ async fn register_one(
             spec.bootstrap_port = new_port;
         }
     }
+    let explicit_role = cfg.as_ref().and_then(|config| match &config.discovery {
+        crate::config::DiscoveryBackend::StaticUrls(workers) => {
+            workers.roles.get(&worker_url).copied()
+        }
+        _ => None,
+    });
+    if let Some((mode, port)) = explicit_role {
+        spec.mode = mode;
+        spec.bootstrap_port = port;
+    }
+    // `--decode-dispatch-limit` sends a request to decode only once earlier
+    // KV has arrived, and a default prefill engine computes only once decode
+    // has bootstrapped, so the two would wait on each other: at most N
+    // requests per rank ever run and the rest die at the bootstrap timeout.
+    // Refuse such a prefill rather than register a worker that cannot serve.
+    if spec.mode == WorkerMode::Prefill
+        && cfg
+            .as_ref()
+            .is_some_and(|c| c.proxy.decode_dispatch_limit.is_some())
+    {
+        match info.prefill_before_bootstrap {
+            Some(true) => {}
+            Some(false) => {
+                tracing::error!(
+                    worker_url = %worker_url,
+                    "worker manager: refused to register prefill worker: --decode-dispatch-limit \
+                     needs prefill engines with --optimistic-prefill-attempts above 0 or \
+                     --disaggregation-decode-allocation-policy prefill_complete",
+                );
+                return;
+            }
+            None => tracing::warn!(
+                worker_url = %worker_url,
+                "worker manager: /server_info does not report optimistic_prefill_attempts; \
+                 --decode-dispatch-limit needs prefill engines that compute before decode connects",
+            ),
+        }
+    }
     let cleartext = dials_cleartext(&worker_url);
     let protocol = resolve_protocol(info.enable_http2, cleartext);
     // Captured before the insert: `reconcile_unresolved_workers` re-runs this
@@ -661,6 +699,7 @@ mod tests {
                 default_chat_template_kwargs: Default::default(),
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+                roles: Default::default(),
                 urls: vec!["http://test:30000".into()],
             }),
             proxy: ProxyConfig::default(),
@@ -1177,6 +1216,51 @@ mod tests {
 
         drop(tx);
         let _ = manager_handle.await;
+    }
+
+    /// Under `--decode-dispatch-limit`, a prefill that computes only after
+    /// decode bootstraps could never start a gated request, so it is refused;
+    /// one with optimistic prefill registers as usual.
+    #[tokio::test]
+    async fn manager_refuses_prefill_that_cannot_compute_before_bootstrap() {
+        let mut cfg = cfg_with_model_cb("m", 5, 60);
+        cfg.proxy.decode_dispatch_limit = NonZeroU32::new(1);
+        let cfg = Some(Arc::new(cfg));
+        for (attempts, registered) in [(0, false), (2, true)] {
+            let (worker_url, _shutdown) = spawn_fake_server_info_worker(json!({
+                "served_model_name": "m",
+                "disaggregation_mode": "prefill",
+                "disaggregation_bootstrap_port": 8998,
+                "optimistic_prefill_attempts": attempts,
+            }))
+            .await;
+            let registry = Arc::new(WorkerRegistry::default());
+            let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+            let manager_handle = tokio::spawn(run_with_introspector(
+                rx,
+                registry.clone(),
+                cfg.clone(),
+                None,
+                None,
+                fast_introspector(),
+            ));
+            let spec = WorkerSpec {
+                id: WorkerId("w-prefill".into()),
+                url: worker_url,
+                mode: WorkerMode::Prefill,
+                model_ids: Vec::new(),
+                ..Default::default()
+            };
+            tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
+            // Shutdown joins the in-flight registration.
+            drop(tx);
+            let _ = manager_handle.await;
+            assert_eq!(
+                registry.get(&spec.id).is_some(),
+                registered,
+                "optimistic_prefill_attempts={attempts}"
+            );
+        }
     }
 
     /// Fake worker whose readiness is switchable at runtime. While `ready` is

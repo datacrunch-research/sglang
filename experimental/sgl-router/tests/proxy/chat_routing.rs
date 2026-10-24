@@ -59,6 +59,7 @@ fn config_for(_worker_url: &str) -> Config {
             default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+            roles: Default::default(),
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
@@ -710,7 +711,7 @@ async fn dispatched_error_names_its_worker_in_the_access_log() {
     let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
     let line = logs
         .lines()
-        .find(|l| l.contains("rid-dispatched-error"))
+        .find(|l| l.contains("rid-dispatched-error") && l.contains("http_request"))
         .unwrap_or_else(|| panic!("no access-log line for the request; captured:\n{logs}"));
     assert!(
         line.contains(&format!(r#"worker="{}""#, worker.url)),
@@ -1765,11 +1766,13 @@ async fn non_streaming_error_path_drops_active_load_guard() {
 
     // Drain so any drop-on-body-end work runs.
     let _ = res.into_body().collect().await.unwrap().to_bytes();
-    assert_eq!(
-        router_inflight_load.inflight_count(),
-        0,
-        "error path must drop the active-load guard",
-    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while router_inflight_load.inflight_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("error cleanup must release its load after the abort attempt");
 }
 
 fn has_metric_line(metrics: &str, expected: &str) -> bool {

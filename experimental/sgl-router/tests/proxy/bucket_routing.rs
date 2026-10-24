@@ -80,6 +80,7 @@ fn build_app_context(
             default_chat_template_kwargs: Default::default(),
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+            roles: Default::default(),
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
@@ -462,7 +463,7 @@ async fn decode_bucket_uses_input_plus_requested_output_budget() {
 }
 
 #[tokio::test]
-async fn decode_tries_later_compatible_bucket_before_capacity_fallback() {
+async fn decode_keeps_the_first_compatible_bucket_when_kv_is_full() {
     let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let full = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let available = crate::common::mock_worker::MockWorker::start(vec![]).await;
@@ -499,8 +500,8 @@ async fn decode_tries_later_compatible_bucket_before_capacity_fallback() {
             .headers()
             .get("x-sgl-decode-url")
             .and_then(|value| value.to_str().ok()),
-        Some(available.url.as_str()),
-        "capacity fallback must wait until all compatible decode buckets are exhausted"
+        Some(full.url.as_str()),
+        "projected KV must not replace the configured decode domain"
     );
 }
 
@@ -1036,6 +1037,7 @@ async fn decode_bucket_mismatch_falls_back_to_another_version_group() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    workers[1].wait_for_request().await;
     let dispatched: Vec<_> = workers
         .iter()
         .map(|w| w.captured.lock().unwrap().last_body.is_some())
@@ -1051,10 +1053,10 @@ async fn decode_bucket_mismatch_falls_back_to_another_version_group() {
     assert_eq!(prefill_picks, 1);
 }
 
-/// Prefer a group with decode capacity, but retain capacity fallback when all
-/// groups are full, without relaxing their token-length limits.
+/// Keep the first compatible version group regardless of projected decode KV,
+/// without relaxing its token-length limits.
 #[tokio::test]
-async fn version_group_capacity_fallback_preserves_decode_limits() {
+async fn version_group_decode_queueing_preserves_sequence_limits() {
     use crate::common::mock_worker::MockWorker;
     for (short_first, second_full) in [(false, false), (false, true), (true, true)] {
         let workers: Vec<_> =
@@ -1103,11 +1105,12 @@ async fn version_group_capacity_fallback_preserves_decode_limits() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let use_first = !short_first;
+        workers[usize::from(!use_first)].wait_for_request().await;
         let dispatched: Vec<_> = workers
             .iter()
             .map(|w| w.captured.lock().unwrap().last_body.is_some())
             .collect();
-        let use_first = second_full && !short_first;
         assert_eq!(
             dispatched,
             [use_first, !use_first, use_first, !use_first],

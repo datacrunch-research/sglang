@@ -55,6 +55,7 @@ impl Harness {
                 listener,
                 Router::new()
                     .route("/v1/chat/completions", post(chat))
+                    .route("/generate", post(chat))
                     .route("/abort_request", post(abort))
                     .with_state(events),
             )
@@ -202,4 +203,31 @@ async fn concurrent_requests_with_the_same_header_get_distinct_abort_ids() {
         rids.remove(index);
     }
     h.quiet().await;
+}
+
+#[tokio::test]
+async fn native_fanout_uses_one_unique_abort_prefix_for_all_samples() {
+    for mut body in [
+        json!({"input_ids":[1],"sampling_params":{"n":2,"max_new_tokens":10}}),
+        json!({"input_ids":[[1],[2]],"sampling_params":{"max_new_tokens":10}}),
+    ] {
+        let mut h = Harness::new().await;
+        body["before_headers"] = json!(true);
+        let request = Request::post("/generate")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer test")
+            .header("x-request-id", "reused-gateway-id")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let task = tokio::spawn(build_router(Arc::clone(&h.ctx)).oneshot(request));
+        let forwarded = h.event("chat").await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let rid = forwarded["rid"]
+            .as_str()
+            .expect("native fan-out needs a router-owned abort prefix");
+        assert!(crate::common::is_engine_shaped_rid(rid));
+        assert_eq!(h.event("abort").await, json!({"rid":rid,"abort_all":false}));
+        h.quiet().await;
+    }
 }
