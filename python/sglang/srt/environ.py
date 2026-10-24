@@ -785,6 +785,10 @@ class Envs:
     SGLANG_HICACHE_TMA_TRANSFER = EnvBool(True)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
+    # Stripe the MLA HiCache host tier over the attention-TP ranks (device copy stays full).
+    SGLANG_HICACHE_MLA_HOST_SHARD = EnvBool(False)
+    # Rows per load-back all-gather chunk of the striped MLA host tier; sizes its staging.
+    SGLANG_HICACHE_MLA_HOST_SHARD_CHUNK_TOKENS = EnvInt(16384)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
