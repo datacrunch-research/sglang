@@ -696,15 +696,15 @@ def _dp_gather_via_all_gather(
             get_parallel().tp_group.all_gather_into_tensor(global_tokens, local_tokens)
         return
 
-    if not is_partial:
-        if get_parallel().attn_tp_rank != 0:
-            local_tokens.fill_(0)
     scattered_local_tokens = local_tokens.tensor_split(get_parallel().attn_tp_size)[
         get_parallel().attn_tp_rank
     ]
-    get_parallel().attn_tp_group.reduce_scatter_tensor(
-        scattered_local_tokens, local_tokens
-    )
+    # A replicated input is complete on every attention-TP rank, so its slice
+    # is local; only partial sums need the reduce-scatter.
+    if is_partial:
+        get_parallel().attn_tp_group.reduce_scatter_tensor(
+            scattered_local_tokens, local_tokens
+        )
     if use_world:
         all_gather_single(
             global_tokens,
