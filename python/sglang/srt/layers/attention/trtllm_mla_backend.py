@@ -194,6 +194,11 @@ class TRTLLMMLADecodeMetadata:
     seq_lens_q: Optional[torch.Tensor] = None
     seq_lens_k: Optional[torch.Tensor] = None
     global_seq_lens_k: Optional[torch.Tensor] = None
+    # cute-dsl DCP decode, length-balanced split-KV (cutedsl_mla_var_split.py):
+    # per-request split counts [bs] int32, the grid split cap and the stock split.
+    block_split_kvs: Optional[torch.Tensor] = None
+    var_split_smax: int = 0
+    var_split_base: int = 0
 
 
 class TRTLLMMLABackend(FlashInferMLAAttnBackend):
