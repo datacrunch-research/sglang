@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Optional
 
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
@@ -129,7 +129,14 @@ def handle_hicache_ratio_default(server_args: Any):
 def resolve_hicache_dcp_compatibility(server_args: Any):
 
     cfg = resolving_view(server_args)
-    if cfg.dcp_size <= 1 or not cfg.enable_hierarchical_cache:
+    if cfg.dcp_size <= 1 or not (
+        cfg.enable_hierarchical_cache
+        or cfg.disaggregation_decode_enable_offload_kvcache
+    ):
+        return
+    if cfg.hicache_storage_backend is not None:
+        validate_hicache_dcp_decode_storage(server_args)
+    if not cfg.enable_hierarchical_cache:
         return
     if (
         cfg.hicache_storage_backend is not None
@@ -166,6 +173,30 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
         "the transfer boundary (dcp_size=%d).",
         cfg.dcp_size,
     )
+
+
+def validate_hicache_dcp_decode_storage(
+    server_args: Any, *, prefetch_policy: Optional[str] = None
+):
+    """Decode-side limits of HiCache L3 under DCP in P/D serving."""
+    cfg = resolving_view(server_args)
+    if cfg.dcp_size <= 1 or cfg.disaggregation_mode != "decode":
+        return
+    if cfg.disaggregation_decode_enable_offload_kvcache:
+        raise NotImplementedError(
+            "HiCache L3 with DCP does not support decode offload."
+        )
+    # Decode promises the probed L3 span to prefill before the read completes.
+    policy = (
+        cfg.hicache_storage_prefetch_policy
+        if prefetch_policy is None
+        else prefetch_policy
+    )
+    if policy != "wait_complete":
+        raise NotImplementedError(
+            "Decode HiCache L3 with DCP requires "
+            "--hicache-storage-prefetch-policy wait_complete."
+        )
 
 
 def resolve_layout_io_compatibility(server_args: Any):
