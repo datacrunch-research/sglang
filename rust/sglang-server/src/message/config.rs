@@ -140,6 +140,8 @@ pub struct ServerArgs {
     pub reasoning_parser: Option<String>,
     /// Python's global default for whether an SSE stream ends with a usage chunk.
     pub stream_response_default_include_usage: bool,
+    /// `--enable-cache-report`: OpenAI usage reports `prompt_tokens_details.cached_tokens`.
+    pub enable_cache_report: bool,
     /// Pinned tokenizer threads / detok shards (Python asserts both ≥ 1).
     pub tokenizer_worker_num: usize,
     pub detokenizer_worker_num: usize,
@@ -243,6 +245,7 @@ impl ServerArgs {
         tool_call_parser,
         reasoning_parser,
         stream_response_default_include_usage,
+        enable_cache_report,
         tokenizer_worker_num,
         detokenizer_worker_num,
         skip_tokenizer_init,
@@ -296,6 +299,7 @@ impl ServerArgs {
         tool_call_parser: Option<String>,
         reasoning_parser: Option<String>,
         stream_response_default_include_usage: bool,
+        enable_cache_report: bool,
         tokenizer_worker_num: usize,
         detokenizer_worker_num: usize,
         skip_tokenizer_init: bool,
@@ -348,6 +352,7 @@ impl ServerArgs {
             tool_call_parser,
             reasoning_parser,
             stream_response_default_include_usage,
+            enable_cache_report,
             tokenizer_worker_num,
             detokenizer_worker_num,
             skip_tokenizer_init,
@@ -407,6 +412,7 @@ impl Default for ServerArgs {
             tool_call_parser: None,
             reasoning_parser: None,
             stream_response_default_include_usage: false,
+            enable_cache_report: false,
             tokenizer_worker_num: 1,
             detokenizer_worker_num: 1,
             skip_tokenizer_init: false,

@@ -102,6 +102,7 @@ impl OpenAiChat {
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect(),
                 ),
+                enable_cache_report: server_args.enable_cache_report,
                 incremental_streaming_output: server_args.incremental_streaming_output,
                 reasoning_parser: server_args.reasoning_parser.clone(),
                 served_model_name: Some(server_args.served_model_name.clone()),
@@ -505,6 +506,31 @@ mod tests {
         let state =
             answering_app_state_with_item(Arc::new(args), formatter, Some(tokenizer()), answer);
         super::super::routes().with_state(state)
+    }
+
+    /// `--enable-cache-report` reaches chat usage: the API layer bills cached
+    /// prompt tokens from `prompt_tokens_details.cached_tokens`, as with Python.
+    #[tokio::test]
+    async fn cache_report_reaches_chat_usage() {
+        for (enable_cache_report, expected) in
+            [(true, json!({"cached_tokens": 4})), (false, Value::Null)]
+        {
+            let args = ServerArgs {
+                enable_cache_report,
+                ..ServerArgs::default()
+            };
+            let app = lowered_state_with(args, |rid| {
+                let mut item = chunk(rid, "ok", true);
+                let ResponseItem::Done(output) = &mut item else {
+                    unreachable!()
+                };
+                output.cached_tokens = 4;
+                item
+            });
+            let body = json!({"model": "model", "messages": [{"role": "user", "content": "hi"}]});
+            let value = body_json(post_json(app, "/v1/chat/completions", body).await).await;
+            assert_eq!(value["usage"]["prompt_tokens_details"], expected, "{value}");
+        }
     }
 
     /// An `n` past the batch cap is a 400 before the prompt is copied, not a
