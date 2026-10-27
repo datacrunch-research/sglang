@@ -138,8 +138,9 @@ def _quantize_fp8_qkv(q, k, v, layer):
     if k_scale is None:
         k_scale = 1.0
     if k.dtype == torch.float8_e4m3fn:
-        # Already packed to unit-scale fp8 by pack_prefix_chunk_kv.
-        pass
+        # Already packed to unit-scale fp8 by pack_prefix_chunk_kv, so the
+        # checkpoint's k_scale must not reach BMM1.
+        k_scale = 1.0
     elif k_scale != 1.0:
         assert hasattr(layer, "k_scale"), "k_scale is not set"
         k_2d, _ = scaled_fp8_quant(
@@ -153,7 +154,7 @@ def _quantize_fp8_qkv(q, k, v, layer):
     if v_scale is None:
         v_scale = 1.0
     if v.dtype == torch.float8_e4m3fn:
-        pass
+        v_scale = 1.0
     elif v_scale != 1.0:
         assert hasattr(layer, "v_scale"), "v_scale is not set"
         v_2d, _ = scaled_fp8_quant(
