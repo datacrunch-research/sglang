@@ -259,12 +259,17 @@ def ensure_mamba_capacity(
     state: Optional[StateStorage],
     reqs: list[Req],
     tree_cache: BasePrefixCache | None,
+    *,
+    reserved_slots: int = 0,
 ) -> bool:
-    """Reclaim the Mamba slots needed before binding any request rows."""
+    """Reclaim the Mamba slots needed before binding any request rows,
+    keeping ``reserved_slots`` free for pending checkpoint restores."""
     if not req_to_token_pool.holds_state_slots:
         return True
 
-    needed = sum(state.pending_request_slots(req_to_token_pool, req) for req in reqs)
+    needed = reserved_slots + sum(
+        state.pending_request_slots(req_to_token_pool, req) for req in reqs
+    )
     supports_mamba = tree_cache is not None and tree_cache.supports_mamba()
     if req_to_token_pool.binds_row_units and supports_mamba:
         # The rows these requests bind take request units from the same bytes,

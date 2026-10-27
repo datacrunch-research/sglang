@@ -4535,7 +4535,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 and best_match_node_id in self.ongoing_load_back
             ):
                 return None
-            if self.load_back(best_match_node_id, mem_quota, req=req):
+            # req still drives prefix bookkeeping; only the state copy is skipped.
+            state_req = req if params.restore_request_state else None
+            if self.load_back(best_match_node_id, mem_quota, req=state_req):
                 new_indices = self.tree_core.collect_full_device_indices(
                     best_match_node_id, last_best_match_device_node_id
                 )

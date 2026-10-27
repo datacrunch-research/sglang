@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.common import _req_radix_key
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
@@ -182,6 +183,21 @@ class DecodeHiCachePreallocMixin:
             if dr.prefix_match is not None and dr.hicache_restore_lock is None
         )
 
+    def _hicache_pending_restore_states(self) -> int:
+        """Canonical recurrent-state slots reserved for pending hybrid restores."""
+        if not (
+            isinstance(self.req_to_token_pool, HybridReqToTokenPool)
+            and self.scheduler.enable_decode_hicache
+        ):
+            return 0
+        return sum(
+            dr.prefix_match.needs_local_restore
+            for dr in self.transfer_queue.queue
+            if dr.prefix_match is not None
+            and dr.hicache_restore_status == HiCacheRestoreResult.PENDING
+            and dr.hicache_restore_lock is None
+        )
+
 
 class HiCacheRestoreGatedKVReceiver:
     """Wraps a kv_receiver so the HiCache restore outcome enters the KV poll."""
@@ -257,6 +273,7 @@ class DecodeHiCacheTransferMixin:
                     best_match_node=rematch.best_match_node,
                     host_hit_length=rematch.host_hit_length,
                     req=dr.req,
+                    restore_request_state=False,
                 )
             )
         finally:
