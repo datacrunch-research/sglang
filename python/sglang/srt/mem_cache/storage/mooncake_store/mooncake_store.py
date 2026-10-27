@@ -985,6 +985,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 reason="External L3 lookup requires rank-replicated/MLA pools",
             )
             return layout
+        # DCP keys embed the DCP rank (one MLA shard per rank and page), which one
+        # scheduler cannot enumerate either.
+        if self.dcp_size > 1:
+            layout.update(
+                enabled=False,
+                reason="External L3 lookup does not support DCP-sharded MLA pools",
+            )
+            return layout
 
         # A HiCache host pool describes KV here; the direct linker's device pool
         # group has no kv_buffer, and its KV entry is described with the others.
