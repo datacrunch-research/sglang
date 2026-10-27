@@ -50,6 +50,7 @@ from sglang.srt.model_executor.model_runner_components.capture_state import (
     prepare_capture_state,
 )
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    autotune_dummy_input_ids,
     autotune_dummy_run_ctx,
     maybe_flashinfer_autotune_extend,
     run_flashinfer_autotune_forward,
@@ -455,9 +456,12 @@ class BaseRunner(ABC):
                 run_ctx=autotune_dummy_run_ctx(mr, buffers),
             )
 
-        run_flashinfer_autotune_forward(
-            self.model_runner, forward_fn, run_lm_head=False
-        )
+        with autotune_dummy_input_ids(
+            buffers.input_ids, vocab_size=mr.model_config.vocab_size
+        ):
+            run_flashinfer_autotune_forward(
+                self.model_runner, forward_fn, run_lm_head=False
+            )
 
     def _alloc_dummy_decode_buffers(
         self,
