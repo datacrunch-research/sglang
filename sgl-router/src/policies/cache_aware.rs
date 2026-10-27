@@ -56,12 +56,9 @@ impl CacheAwarePolicy {
                 continue;
             }
             let matched_prefix_blocks =
-                cap_matched_prefix_blocks(signal.query_blocks, entry.matched_prefix_blocks);
-            let matched_prefix_tokens = estimate_matched_prefix_tokens(
-                input_tokens,
-                signal.query_blocks,
-                matched_prefix_blocks,
-            );
+                signal.matched_blocks(&entry.address, entry.matched_prefix_blocks);
+            let matched_prefix_tokens =
+                signal.matched_tokens(input_tokens, &entry.address, matched_prefix_blocks);
             if !self.passes_cache_gate(input_tokens, matched_prefix_tokens) {
                 continue;
             }
@@ -199,7 +196,7 @@ impl Policy for CacheAwarePolicy {
 /// actually asked about: a query cannot match more blocks than it contains.
 /// Both the token estimate and the diverted-overlap histogram read the capped
 /// value, so the clamp lives here rather than at each use.
-fn cap_matched_prefix_blocks(query_blocks: usize, matched_prefix_blocks: u32) -> u32 {
+pub(crate) fn cap_matched_prefix_blocks(query_blocks: usize, matched_prefix_blocks: u32) -> u32 {
     matched_prefix_blocks.min(u32::try_from(query_blocks).unwrap_or(u32::MAX))
 }
 

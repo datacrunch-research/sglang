@@ -4,7 +4,6 @@
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{outcome_from_status, RequestLogContext};
-use crate::server::routes::chat::MAX_CHAT_BODY_BYTES;
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
@@ -97,9 +96,19 @@ pub(crate) fn pod_id() -> &'static str {
 ///     lines; `stream_outcome_total` carries their real ending.
 async fn access_log_and_record(
     State(ctx): State<Arc<AppContext>>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
+    let request_id_header = req
+        .headers()
+        .get("x-request-id")
+        .cloned()
+        .unwrap_or_else(|| {
+            axum::http::HeaderValue::from_str(&uuid::Uuid::new_v4().to_string())
+                .expect("UUID header")
+        });
+    req.headers_mut()
+        .insert("x-request-id", request_id_header.clone());
     let method = req.method().clone();
     let method_label = normalize_method(&method);
     let path = req.uri().path().to_owned();
@@ -118,7 +127,8 @@ async fn access_log_and_record(
 
     ctx.metrics.record_ingress(&route, method_label);
     let inflight = ctx.inflight_http.enter();
-    let resp = next.run(req).await;
+    let mut resp = next.run(req).await;
+    resp.headers_mut().insert("x-request-id", request_id_header);
     let status = resp.status();
     let latency_ms = start.elapsed().as_millis() as u64;
     ctx.metrics
@@ -139,25 +149,34 @@ async fn access_log_and_record(
         // them empty and falls back to the status for its outcome, which is all
         // the status can say.
         let log_ctx = resp.extensions().get::<RequestLogContext>();
-        tracing::info!(
-            pod_id = %pod_id(),
-            request_id = %request_id,
-            method = %method,
-            path = %path,
-            status = status.as_u16(),
-            outcome = log_ctx
-                .map(|c| c.outcome)
-                .unwrap_or_else(|| outcome_from_status(status.as_u16()))
-                .as_str(),
-            worker = log_ctx.map(|c| c.worker_url.as_str()).unwrap_or(""),
-            engine_rid = log_ctx
-                .and_then(|c| c.engine_rid.as_deref())
-                .unwrap_or(""),
-            model = log_ctx.map(|c| c.model_id.as_str()).unwrap_or(""),
-            stream = log_ctx.is_some_and(|c| c.streaming),
-            latency_ms,
-            "http_request",
-        );
+        macro_rules! record_request {
+            ($level:ident) => {
+                tracing::$level!(
+                    pod_id = %pod_id(),
+                    request_id = %request_id,
+                    method = %method,
+                    path = %path,
+                    status = status.as_u16(),
+                    outcome = log_ctx
+                        .map(|c| c.outcome)
+                        .unwrap_or_else(|| outcome_from_status(status.as_u16()))
+                        .as_str(),
+                    worker = log_ctx.map(|c| c.worker_url.as_str()).unwrap_or(""),
+                    engine_rid = log_ctx
+                        .and_then(|c| c.engine_rid.as_deref())
+                        .unwrap_or(""),
+                    model = log_ctx.map(|c| c.model_id.as_str()).unwrap_or(""),
+                    stream = log_ctx.is_some_and(|c| c.streaming),
+                    latency_ms,
+                    "http_request",
+                );
+            };
+        }
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            record_request!(debug);
+        } else {
+            record_request!(info);
+        }
     }
     resp.map(|body| crate::server::inflight::track_body(body, inflight))
 }
@@ -183,9 +202,12 @@ async fn log_413(req: Request, next: Next) -> Response {
 }
 
 /// A Messages route: body limit, 413 logging and the Anthropic 413 envelope.
-fn messages_route(route: MethodRouter<Arc<AppContext>>) -> MethodRouter<Arc<AppContext>> {
+fn messages_route(
+    route: MethodRouter<Arc<AppContext>>,
+    max_payload_size: usize,
+) -> MethodRouter<Arc<AppContext>> {
     route
-        .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+        .layer(DefaultBodyLimit::max(max_payload_size))
         .layer(middleware::from_fn(log_413))
         .layer(middleware::from_fn(
             crate::server::routes::messages::envelope_413,
@@ -193,8 +215,21 @@ fn messages_route(route: MethodRouter<Arc<AppContext>>) -> MethodRouter<Arc<AppC
 }
 
 pub fn build_router(ctx: Arc<AppContext>) -> Router {
+    let max_payload_size = ctx.config.server.max_payload_size;
     let router = Router::new()
         .route("/healthz", get(crate::server::routes::health::healthz))
+        .route("/liveness", get(crate::server::routes::health::healthz))
+        .route("/readiness", get(crate::server::routes::health::readyz))
+        .route("/health", get(crate::server::routes::health::healthz))
+        .route(
+            "/health_generate",
+            get(crate::server::routes::health::readyz),
+        )
+        .route("/workers", get(crate::server::routes::health::workers))
+        .route(
+            "/server_info",
+            get(crate::server::routes::health::server_info),
+        )
         .route("/readyz", get(crate::server::routes::health::readyz))
         .route("/metrics", get(crate::server::routes::metrics::metrics))
         .route(
@@ -212,47 +247,53 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route(
             "/v1/chat/completions",
             post(crate::server::routes::chat::chat_completions)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(max_payload_size))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
             "/v1/messages",
-            messages_route(post(crate::server::routes::messages::messages)),
+            messages_route(
+                post(crate::server::routes::messages::messages),
+                max_payload_size,
+            ),
         )
         .route(
             "/v1/messages/count_tokens",
-            messages_route(post(crate::server::routes::messages::count_tokens)),
+            messages_route(
+                post(crate::server::routes::messages::count_tokens),
+                max_payload_size,
+            ),
         )
         .route(
             "/v1/completions",
             post(crate::server::routes::chat::completions)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(max_payload_size))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
             "/generate",
             post(crate::server::routes::chat::generate)
                 .put(crate::server::routes::chat::generate)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(max_payload_size))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
             "/v1/embeddings",
             post(crate::server::routes::chat::embeddings)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(max_payload_size))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
             "/v1/classify",
             post(crate::server::routes::chat::classify)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(max_payload_size))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
             "/v1/rerank",
             post(crate::server::routes::chat::rerank)
                 .put(crate::server::routes::chat::rerank)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(max_payload_size))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
@@ -368,6 +409,68 @@ mod tests {
 
     fn captured(buf: &Arc<Mutex<Vec<u8>>>) -> String {
         String::from_utf8(buf.lock().unwrap().clone()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn lifecycle_and_429_logs_require_debug_without_losing_metrics() {
+        use crate::server::admission::{Admission, RequestScope};
+        for level in [tracing::Level::INFO, tracing::Level::DEBUG] {
+            prime_tracing_callsites();
+            let buf = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(level)
+                .with_writer(VecWriter(buf.clone()))
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let mut ctx = AppContext::stub();
+            ctx.config.server.admission.max_concurrent_requests = Some(1);
+            ctx.admission = Admission::new(&ctx.config.server.admission);
+            let ctx = Arc::new(ctx);
+            let headers = axum::http::HeaderMap::new();
+            let scope = RequestScope::enter_request(&ctx, "/v1/completions", &headers).unwrap();
+            scope.life.progress("worker");
+            assert!(RequestScope::enter_request(&ctx, "/v1/completions", &headers).is_err());
+            scope.life.complete();
+            drop(scope);
+            let response = Router::new()
+                .route("/reject", get(|| async { StatusCode::TOO_MANY_REQUESTS }))
+                .layer(middleware::from_fn_with_state(
+                    ctx.clone(),
+                    access_log_and_record,
+                ))
+                .oneshot(
+                    Request::builder()
+                        .uri("/reject")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            drop(response);
+            assert!(ctx
+                .admission
+                .render_metrics()
+                .contains("outcome=\"rejected\"} 1"));
+            assert!(ctx.metrics.render().contains("status_code=\"429\""));
+            let logs = captured(&buf);
+            assert_eq!(
+                logs.contains("request_lifecycle"),
+                level == tracing::Level::DEBUG,
+                "{logs}"
+            );
+            assert_eq!(
+                logs.contains("http_request"),
+                level == tracing::Level::DEBUG,
+                "{logs}"
+            );
+            if level == tracing::Level::DEBUG {
+                for event in ["admit", "first_progress", "finish", "reject"] {
+                    assert!(logs.contains(event), "{event}: {logs}");
+                }
+            }
+        }
     }
 
     /// Metric labels must stay bounded: standard verbs pass through, but an

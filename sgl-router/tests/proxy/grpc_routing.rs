@@ -287,6 +287,71 @@ async fn collect<T>(
         .collect()
 }
 
+#[tokio::test]
+async fn completed_grpc_generation_supplies_health_proof_when_http_health_is_unavailable() {
+    let port = MockEngine::default()
+        .stream("Generate", |_: proto::GenerateRequest| {
+            stream::iter([Ok(proto::GenerateResponse {
+                output_ids: vec![7],
+                finished: true,
+                ..Default::default()
+            })])
+            .boxed()
+        })
+        .start()
+        .await;
+    for streaming in [false, true] {
+        let mut ctx = router_ctx(&[(WorkerMode::Plain, "http://127.0.0.1:1", Some(port))]);
+        let health = Arc::new(sgl_router::health::active::ActiveHealth::new(
+            sgl_router::config::HealthCheckConfig {
+                mode: sgl_router::config::HealthCheckMode::Generation,
+                interval_secs: 1,
+                timeout_secs: 1,
+                failure_threshold: 1,
+                success_threshold: 1,
+            },
+        ));
+        Arc::get_mut(&mut ctx).unwrap().active_health = Some(Arc::clone(&health));
+        ctx.mark_ready();
+        let mut client = serve_grpc(Arc::clone(&ctx)).await;
+        let replies = collect(
+            client
+                .generate(proto::GenerateRequest {
+                    input_ids: vec![1],
+                    stream: Some(streaming),
+                    ..Default::default()
+                })
+                .await,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replies[0].output_ids, [7]);
+        ctx.registry.all()[0].set_active_healthy(false);
+        let checker = tokio::spawn(sgl_router::health::active::ActiveHealth::run(Arc::clone(
+            &ctx,
+        )));
+        let ready = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if sgl_router::server::routes::health::readyz(axum::extract::State(Arc::clone(
+                    &ctx,
+                )))
+                .await
+                    == axum::http::StatusCode::OK
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        checker.abort();
+        assert!(
+            ready.is_ok(),
+            "completed gRPC output must prove health; streaming={streaming}"
+        );
+    }
+}
+
 fn without_rid(mut body: Value) -> Value {
     assert!(body["rid"].is_string(), "the router mints an engine rid");
     body.as_object_mut().unwrap().remove("rid");
@@ -741,4 +806,50 @@ async fn errors_arrive_as_grpc_status() {
     }
     codes.sort_by_key(|code| *code as i32);
     assert_eq!(codes, [Code::Internal, Code::Unavailable]);
+}
+
+#[tokio::test]
+async fn grpc_and_http_share_admission_through_the_response_stream() {
+    let port = MockEngine::default()
+        .stream("ChatComplete", |_request: proto::OpenAiRequest| {
+            stream::once(async { Ok(chunk("data: first\n\n", false, None)) })
+                .chain(stream::pending())
+                .boxed()
+        })
+        .start()
+        .await;
+    let mut ctx = router_ctx(&[(WorkerMode::Plain, "http://127.0.0.1:1", Some(port))]);
+    let config = sgl_router::config::AdmissionConfig {
+        max_concurrent_requests: Some(1),
+        refill_per_second: 1,
+    };
+    Arc::get_mut(&mut ctx).unwrap().admission =
+        sgl_router::server::admission::Admission::new(&config);
+    let mut client = serve_grpc(Arc::clone(&ctx)).await;
+    let mut first = client
+        .chat_complete(openai(chat(true)))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(first.message().await.unwrap().is_some());
+    let second = client.chat_complete(openai(chat(true))).await;
+    assert_eq!(second.unwrap_err().code(), Code::ResourceExhausted);
+    let response = build_router(Arc::clone(&ctx))
+        .oneshot(
+            HttpRequest::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+    drop(first);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while ctx.admission.active() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
 }

@@ -4,7 +4,25 @@
 use crate::policies::{Policy, SelectionContext};
 use crate::workers::Worker;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// Round-robin tickets retained for one request across ladder proposals.
+#[derive(Debug, Default)]
+pub(crate) struct RequestRotation {
+    tickets: Mutex<Vec<(usize, usize)>>,
+}
+impl RequestRotation {
+    pub(crate) fn ticket(&self, counter: &AtomicUsize) -> usize {
+        let key = std::ptr::from_ref(counter).addr();
+        let mut tickets = self.tickets.lock().unwrap();
+        if let Some((_, value)) = tickets.iter().find(|(policy, _)| *policy == key) {
+            return *value;
+        }
+        let value = counter.fetch_add(1, Ordering::Relaxed);
+        tickets.push((key, value));
+        value
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct RoundRobinPolicy {
@@ -18,11 +36,11 @@ impl RoundRobinPolicy {
 }
 
 impl Policy for RoundRobinPolicy {
-    fn select(&self, workers: &[Arc<Worker>], _ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
+    fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
         if workers.is_empty() {
             return None;
         }
-        let i = self.counter.fetch_add(1, Ordering::Relaxed) % workers.len();
+        let i = ctx.round_robin.ticket(&self.counter) % workers.len();
         Some(workers[i].clone())
     }
 }

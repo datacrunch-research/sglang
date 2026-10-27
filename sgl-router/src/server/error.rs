@@ -26,6 +26,7 @@ pub const X_ROUTER_UPSTREAM_STATUS: HeaderName =
 enum ErrorClass {
     /// 400 — request rejected at ingress as malformed / invalid.
     BadRequest,
+    Admission,
     /// 404 — requested model / resource not found.
     NotFound,
     /// 502 — a selected worker failed to return a usable response (unreachable,
@@ -43,6 +44,7 @@ impl ErrorClass {
     fn status(self) -> StatusCode {
         match self {
             ErrorClass::BadRequest => StatusCode::BAD_REQUEST,
+            ErrorClass::Admission => StatusCode::TOO_MANY_REQUESTS,
             ErrorClass::NotFound => StatusCode::NOT_FOUND,
             ErrorClass::Upstream => StatusCode::BAD_GATEWAY,
             ErrorClass::NoTarget => StatusCode::SERVICE_UNAVAILABLE,
@@ -68,6 +70,8 @@ fn grpc_error_class(code: tonic::Code) -> ErrorClass {
 
 #[derive(Debug, Error)]
 pub enum ApiError {
+    #[error("router concurrent-request limit reached")]
+    AdmissionRejected,
     #[error("bad request: {0}")]
     BadRequest(String),
 
@@ -199,6 +203,7 @@ impl ApiError {
     /// pick a different one.
     fn class(&self) -> ErrorClass {
         match self {
+            ApiError::AdmissionRejected => ErrorClass::Admission,
             ApiError::BadRequest(_) => ErrorClass::BadRequest,
             ApiError::SamplingContract { .. } => ErrorClass::BadRequest,
             ApiError::ModelNotFound(_) => ErrorClass::NotFound,
@@ -223,8 +228,9 @@ impl ApiError {
     /// a gateway converts on. Distinct per condition even when two conditions
     /// share a class (and thus a status): `upstream_timeout` and
     /// `stale_request_expired` both map to 504 but stay tellable apart here.
-    fn error_code(&self) -> &'static str {
+    pub(crate) fn error_code(&self) -> &'static str {
         match self {
+            ApiError::AdmissionRejected => "admission_rejected",
             ApiError::BadRequest(_) => "bad_request",
             // Shares `ErrorClass::BadRequest` (and thus the 400) with
             // `BadRequest`, but keeps its own code: an operator rolling a
@@ -261,7 +267,8 @@ impl ApiError {
         match self {
             ApiError::UpstreamStatus { status } => Some(*status),
             ApiError::PrefillFailed { status } => *status,
-            ApiError::BadRequest(_)
+            ApiError::AdmissionRejected
+            | ApiError::BadRequest(_)
             | ApiError::SamplingContract { .. }
             | ApiError::ModelNotFound(_)
             | ApiError::UpstreamUnreachable { .. }
@@ -337,6 +344,7 @@ impl ApiError {
             return status;
         }
         let code = match self.class() {
+            ErrorClass::Admission => Code::ResourceExhausted,
             ErrorClass::BadRequest => Code::InvalidArgument,
             ErrorClass::NotFound => Code::NotFound,
             ErrorClass::Upstream | ErrorClass::NoTarget => Code::Unavailable,
@@ -350,6 +358,7 @@ impl ApiError {
     /// which are logged here instead.
     fn client_message(&self) -> String {
         match self {
+            ApiError::AdmissionRejected => self.to_string(),
             ApiError::Internal(e) => {
                 // `{:#}` prints the anyhow chain (top error + sources) — `?e`
                 // would only show the outermost message.

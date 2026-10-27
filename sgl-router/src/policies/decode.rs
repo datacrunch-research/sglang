@@ -5,19 +5,20 @@
 
 use crate::config::DecodePolicyKind;
 use crate::policies::admission::{
-    compare_decode_engines, resolve_decode, CandidateDomain, DecisionReason, FinalDecision,
-    RoutingStage,
+    compare_decode_engines, resolve_decode, CandidateDomain, FinalDecision,
 };
 use crate::policies::registry::select_decode_with_affinity;
 use crate::policies::{ProposalKind, SelectionProposal};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use rand::Rng;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 #[derive(Debug, Default)]
 pub struct DecodeSelectionContext<'a> {
     load_snapshot: Option<&'a EngineReportedLoadSnapshot>,
     prefill_url: Option<&'a str>,
+    rotation: super::round_robin::RequestRotation,
 }
 
 impl<'a> DecodeSelectionContext<'a> {
@@ -25,6 +26,7 @@ impl<'a> DecodeSelectionContext<'a> {
         Self {
             load_snapshot: None,
             prefill_url: None,
+            rotation: Default::default(),
         }
     }
 
@@ -57,44 +59,41 @@ pub trait DecodePolicy: Send + Sync + std::fmt::Debug {
     ) -> Option<SelectionProposal>;
 }
 
-/// Resolves decode admission and degrades to Power-of-Two when capacity is exhausted.
+#[derive(Debug, Default)]
+pub struct DecodeRoundRobinPolicy {
+    counter: AtomicUsize,
+}
+
+impl DecodePolicy for DecodeRoundRobinPolicy {
+    fn propose(
+        &self,
+        domain: &CandidateDomain,
+        ctx: &DecodeSelectionContext<'_>,
+    ) -> Option<SelectionProposal> {
+        if domain.workers.is_empty() {
+            return None;
+        }
+        // Registry iteration order must not change the rotation between requests.
+        let mut workers: Vec<_> = domain.workers.iter().collect();
+        workers.sort_unstable_by(|a, b| a.id.0.cmp(&b.id.0));
+        let index = ctx.rotation.ticket(&self.counter) % workers.len();
+        Some(SelectionProposal::primary(Arc::clone(workers[index])))
+    }
+}
+
+/// Compatibility entry point: decode capacity is scheduled by the engine.
 pub fn resolve_decode_with_capacity_fallback(
     domain: &CandidateDomain,
     proposal: &SelectionProposal,
     request_kv_tokens: u64,
     snapshot: &EngineReportedLoadSnapshot,
 ) -> Option<FinalDecision> {
-    if let Some(decision) = resolve_decode(domain, proposal, request_kv_tokens, snapshot) {
-        return Some(decision);
-    }
-    if domain.stage != RoutingStage::Decode
-        || !domain
-            .workers
-            .iter()
-            .any(|worker| worker.id == proposal.primary.id)
-    {
-        return None;
-    }
-
-    let fallback = DecodePowerOfTwoPolicy::new().propose(
-        domain,
-        &DecodeSelectionContext::new().with_load_snapshot(snapshot),
-    )?;
-    Some(FinalDecision {
-        selected: fallback.primary,
-        primary: Arc::clone(&proposal.primary),
-        backup: proposal
-            .backup
-            .as_ref()
-            .filter(|backup| domain.workers.iter().any(|worker| worker.id == backup.id))
-            .cloned(),
-        reason: DecisionReason::CapacityFallbackPowerOfTwo,
-        candidate_range_id: domain.id.clone(),
-        load_snapshot_version: snapshot.version,
-    })
+    resolve_decode(domain, proposal, request_kv_tokens, snapshot)
 }
 
-/// Samples two workers from a decode domain and orders them by decode pressure.
+/// Orders decode workers by decode pressure. With two workers that is the
+/// sampled pair; with three or more it ranks every worker, so the least-loaded
+/// one is never left out of the comparison.
 #[derive(Debug, Default)]
 pub struct DecodePowerOfTwoPolicy;
 
@@ -116,6 +115,7 @@ impl DecodePolicy for DecodePowerOfTwoPolicy {
                 SelectionProposal::primary(Arc::clone(&domain.workers[0]))
                     .with_kind(ProposalKind::PowerOfTwo),
             ),
+            len if len >= 3 => least_loaded_pair(&domain.workers, ctx.load_snapshot()),
             len => {
                 let mut rng = rand::thread_rng();
                 let i = rng.gen_range(0..len);
@@ -140,6 +140,38 @@ impl DecodePolicy for DecodePowerOfTwoPolicy {
     }
 }
 
+// Published load ranks the scan only when every worker has a fresh sample, so one
+// comparison rule holds across it; the random start spreads ties.
+fn least_loaded_pair(
+    workers: &[Arc<crate::workers::Worker>],
+    snapshot: Option<&EngineReportedLoadSnapshot>,
+) -> Option<SelectionProposal> {
+    let snapshot = snapshot.filter(|snapshot| {
+        workers.iter().all(|worker| {
+            snapshot
+                .fresh_native_cache_load_for_url(&worker.url)
+                .is_some()
+        })
+    });
+    let start = rand::thread_rng().gen_range(0..workers.len());
+    let mut order = workers[start..].iter().chain(&workers[..start]);
+    let (mut primary, mut backup) = (order.next()?, order.next()?);
+    if compare_decode_engines(primary, backup, snapshot).is_gt() {
+        std::mem::swap(&mut primary, &mut backup);
+    }
+    for candidate in order {
+        if compare_decode_engines(candidate, primary, snapshot).is_lt() {
+            backup = std::mem::replace(&mut primary, candidate);
+        } else if compare_decode_engines(candidate, backup, snapshot).is_lt() {
+            backup = candidate;
+        }
+    }
+    Some(
+        SelectionProposal::with_backup(Arc::clone(primary), Arc::clone(backup))
+            .with_kind(ProposalKind::PowerOfTwo),
+    )
+}
+
 /// Compatibility policy for legacy same-host PD decode selection.
 #[derive(Debug, Default)]
 pub struct LegacyHostAffinityDecodePolicy;
@@ -158,6 +190,7 @@ impl DecodePolicy for LegacyHostAffinityDecodePolicy {
 /// Builds a decode policy scoped to one role.
 pub fn build_decode_policy(kind: DecodePolicyKind) -> Box<dyn DecodePolicy> {
     match kind {
+        DecodePolicyKind::RoundRobin => Box::new(DecodeRoundRobinPolicy::default()),
         DecodePolicyKind::PowerOfTwo => Box::new(DecodePowerOfTwoPolicy::new()),
         DecodePolicyKind::LegacyHostAffinity => Box::new(LegacyHostAffinityDecodePolicy),
     }

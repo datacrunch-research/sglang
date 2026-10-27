@@ -14,7 +14,8 @@ use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{outcome_from_status, RequestLogContext};
 use crate::server::routes::chat::{
-    prompt_ids, route_grpc, route_typed, Endpoint, MAX_CHAT_BODY_BYTES,
+    admit_and_prepare, prompt_ids, route_grpc, route_typed, route_typed_admitted, Endpoint,
+    MAX_CHAT_BODY_BYTES,
 };
 use crate::workers::GRPC_MAX_MESSAGE_BYTES;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
@@ -178,17 +179,49 @@ impl RouterGrpc {
         request: Request<proto::TextGenerateRequest>,
     ) -> Result<Replies<proto::TextGenerateResponse>, Status> {
         let (headers, request) = request_headers(request, |r| &r.trace_headers);
-        let ids = (request.return_text_in_logprobs != Some(true))
-            .then(|| prompt_ids(&self.ctx, Endpoint::Generate, &request.text))
-            .flatten();
-        let Some(ids) = ids else {
-            let call = route_typed(&self.ctx, Endpoint::Generate, request, headers.clone());
-            return self.finish("TextGenerate", headers, call).await;
+        let call = async {
+            let prepared =
+                admit_and_prepare(&self.ctx, Endpoint::Generate.path(), &headers, move |ctx| {
+                    let ids = (request.return_text_in_logprobs != Some(true))
+                        .then(|| prompt_ids(ctx, Endpoint::Generate, &request.text))
+                        .flatten();
+                    Ok((request, ids))
+                })
+                .await;
+            let (admitted, (request, ids)) = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => return (Err(error), None),
+            };
+            let Some(ids) = ids else {
+                return route_typed_admitted(
+                    &self.ctx,
+                    Endpoint::Generate,
+                    request,
+                    headers.clone(),
+                    admitted,
+                )
+                .await;
+            };
+            let (result, log) = route_typed_admitted(
+                &self.ctx,
+                Endpoint::Generate,
+                text_to_generate(request, ids),
+                headers.clone(),
+                admitted,
+            )
+            .await;
+            (
+                result.map(|response| GrpcResponse {
+                    status: response.status,
+                    replies: response
+                        .replies
+                        .map(|reply| reply.map(generate_to_text))
+                        .boxed(),
+                }),
+                log,
+            )
         };
-        let request = text_to_generate(request, ids);
-        let call = route_typed(&self.ctx, Endpoint::Generate, request, headers.clone());
-        let replies = self.finish("TextGenerate", headers, call).await?;
-        Ok(replies.map(|reply| reply.map(generate_to_text)).boxed())
+        self.finish("TextGenerate", headers.clone(), call).await
     }
 
     /// Tokenized here, as `/v1/embeddings` tokenizes text, then sent as `Embed`.
@@ -197,18 +230,83 @@ impl RouterGrpc {
         request: Request<proto::TextEmbedRequest>,
     ) -> RpcResult<proto::TextEmbedResponse> {
         let (headers, request) = request_headers(request, |r| &r.trace_headers);
-        let Some(ids) = prompt_ids(&self.ctx, Endpoint::Embeddings, &request.text) else {
-            let call = route_typed(&self.ctx, Endpoint::Embeddings, request, headers.clone());
-            return self.finish_unary("TextEmbed", headers, call).await;
+        let call = async {
+            let prepared = admit_and_prepare(
+                &self.ctx,
+                Endpoint::Embeddings.path(),
+                &headers,
+                move |ctx| {
+                    let ids = prompt_ids(ctx, Endpoint::Embeddings, &request.text);
+                    Ok((request, ids))
+                },
+            )
+            .await;
+            let (admitted, (request, ids)) = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => return (Err(error), None),
+            };
+            let Some(ids) = ids else {
+                return route_typed_admitted(
+                    &self.ctx,
+                    Endpoint::Embeddings,
+                    request,
+                    headers.clone(),
+                    admitted,
+                )
+                .await;
+            };
+            let (result, log) = route_typed_admitted(
+                &self.ctx,
+                Endpoint::Embeddings,
+                text_to_embed(request, ids),
+                headers.clone(),
+                admitted,
+            )
+            .await;
+            (
+                result.map(|response| GrpcResponse {
+                    status: response.status,
+                    replies: response
+                        .replies
+                        .map(|reply| reply.map(embed_to_text))
+                        .boxed(),
+                }),
+                log,
+            )
         };
-        let call = route_typed(
-            &self.ctx,
-            Endpoint::Embeddings,
-            text_to_embed(request, ids),
-            headers.clone(),
-        );
-        let reply = self.finish_unary("TextEmbed", headers, call).await?;
-        Ok(reply.map(embed_to_text))
+        self.finish_unary("TextEmbed", headers.clone(), call).await
+    }
+
+    async fn classify(
+        &self,
+        request: Request<proto::ClassifyRequest>,
+    ) -> RpcResult<proto::ClassifyResponse> {
+        let (headers, mut request) = request_headers(request, |r| &r.trace_headers);
+        let call = async {
+            let prepared =
+                admit_and_prepare(&self.ctx, Endpoint::Classify.path(), &headers, move |ctx| {
+                    if request.input_ids.is_empty() {
+                        if let Some(ids) = prompt_ids(ctx, Endpoint::Classify, &request.text) {
+                            (request.input_ids, request.text) = (ids, String::new());
+                        }
+                    }
+                    Ok(request)
+                })
+                .await;
+            let (admitted, request) = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => return (Err(error), None),
+            };
+            route_typed_admitted(
+                &self.ctx,
+                Endpoint::Classify,
+                request,
+                headers.clone(),
+                admitted,
+            )
+            .await
+        };
+        self.finish_unary("Classify", headers.clone(), call).await
     }
 
     async fn openai_unary(
@@ -289,15 +387,8 @@ sglang_service! {
             self.text_embed(request).await
         }
 
-        async fn classify(&self, mut request: Request<proto::ClassifyRequest>) -> RpcResult<proto::ClassifyResponse> {
-            // A text prompt is sent as ids, as `/v1/classify` forwards it.
-            let classify = request.get_mut();
-            if classify.input_ids.is_empty() {
-                if let Some(ids) = prompt_ids(&self.ctx, Endpoint::Classify, &classify.text) {
-                    (classify.input_ids, classify.text) = (ids, String::new());
-                }
-            }
-            typed!(self, request, Classify, "Classify", finish_unary)
+        async fn classify(&self, request: Request<proto::ClassifyRequest>) -> RpcResult<proto::ClassifyResponse> {
+            self.classify(request).await
         }
 
         async fn open_ai_embed(&self, request: Request<proto::OpenAiRequest>) -> RpcResult<proto::OpenAiResponse> {

@@ -5,21 +5,21 @@
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use clap::Parser;
-use reqwest::header::HeaderValue;
+use reqwest::header::{HeaderName, HeaderValue};
 use std::num::NonZeroU32;
 
 use crate::config::sampling::{parse_sampling_overrides, ConflictPolicy};
 use crate::config::types::is_selector_empty;
 use crate::config::{
     default_cb_cool_down, default_cb_threshold, default_host, default_port,
-    default_proxy_request_timeout_secs, default_shutdown_drain_secs,
-    default_stale_request_timeout_secs, resolve_mode, AffinityConfig, AffinityMode, BalancedBy,
-    CacheAwareConfig, CachePrefixProvider, ChatRoutingKind, CircuitBreakerConfig, Config,
-    DecodePolicyKind, DiscoveryBackend, DpRankPolicy, EligibilityConfig, FilterKind, FusedTerm,
-    InflightLoadConfig, K8sDiscoveryConfig, K8sDiscoveryMode, KvIndexerEndpointConfig, LogFormat,
-    ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
-    StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig,
-    DEFAULT_FUSE, DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
+    default_proxy_request_timeout_secs, default_shutdown_drain_secs, resolve_mode, AffinityConfig,
+    AffinityMode, BalancedBy, CacheAwareConfig, CachePrefixProvider, ChatRoutingKind,
+    CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend, DpRankPolicy,
+    EligibilityConfig, FilterKind, FusedTerm, InflightLoadConfig, K8sDiscoveryConfig,
+    K8sDiscoveryMode, KvIndexerEndpointConfig, LogFormat, ModelConfig, ObservabilityConfig,
+    PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode, StaticUrlsDiscoveryConfig,
+    StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig, DEFAULT_FUSE,
+    DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
 };
 use crate::policies_reorg::admission::AdmissionLimits;
 use crate::policies_reorg::factory::AffinitySpec;
@@ -64,8 +64,16 @@ pub struct Cli {
 #[derive(clap::Args, Debug)]
 pub struct ModelArgs {
     /// Model id this router serves (the OpenAI `model` field).
+    #[arg(
+        long,
+        visible_alias = "served-model-name",
+        required_unless_present = "model_path"
+    )]
+    pub model_id: Option<String>,
+
+    /// Gateway-compatible tokenizer/model path. Without --model-id, use the workers' served name.
     #[arg(long)]
-    pub model_id: String,
+    pub model_path: Option<String>,
 
     /// Local tokenizer.json or HuggingFace repo id. Defaults to --model-id; honors HF_TOKEN / HF_HOME.
     #[arg(long)]
@@ -147,6 +155,61 @@ pub struct ServerArgs {
     #[arg(long)]
     pub worker_api_key: Option<String>,
 
+    /// Additional client header to forward to workers; repeat for each name.
+    #[arg(long = "forward-request-header", value_name = "HEADER")]
+    pub forward_request_headers: Vec<HeaderName>,
+
+    /// Startup budget for resolving the served model from static workers.
+    #[arg(long, default_value_t = 1800)]
+    pub worker_startup_timeout_secs: u64,
+
+    /// Maximum inference request body size, in bytes.
+    #[arg(long, default_value_t = 32 << 20)]
+    pub max_payload_size: usize,
+
+    /// Enable a Prometheus listener on --host at this port; 0 chooses a free port.
+    #[arg(long)]
+    pub prometheus_port: Option<u16>,
+
+    /// Optional admin port, bound only on IPv4 loopback (0 chooses a free port).
+    #[arg(long)]
+    pub admin_port: Option<u16>,
+
+    /// Disable dispatch retries.
+    #[arg(long, conflicts_with = "retry_max_attempts")]
+    pub disable_retries: bool,
+
+    /// Worker probes: HTTP status, full-path generation, or disabled.
+    #[arg(long, value_enum, default_value = "http")]
+    pub health_check_mode: super::HealthCheckMode,
+
+    /// Seconds between active worker check cycles.
+    #[arg(long, default_value_t = 60)]
+    pub health_check_interval_secs: u64,
+    /// Timeout for each worker status or full-path generation probe.
+    #[arg(long, default_value_t = 5)]
+    pub health_check_timeout_secs: u64,
+    /// Consecutive failed check cycles before excluding a worker.
+    #[arg(long, default_value_t = 3)]
+    pub health_failure_threshold: u32,
+    /// Consecutive successful full-path check cycles before admitting a worker.
+    #[arg(long, default_value_t = 2)]
+    pub health_success_threshold: u32,
+
+    /// Global generation-request ceiling, held through response and abort cleanup. -1 disables.
+    #[arg(long, default_value_t = -1, allow_hyphen_values = true)]
+    pub max_concurrent_requests: i64,
+
+    /// Pending admission queue size. Only immediate rejection (0) is supported.
+    #[arg(long, default_value_t = 0)]
+    pub queue_size: usize,
+
+    /// Accepted for gateway command-line compatibility; currently has no effect.
+    /// Admission is a strict in-flight ceiling: a request is admitted whenever
+    /// fewer than --max-concurrent-requests are in flight, so refill never decides.
+    #[arg(long, default_value_t = 0)]
+    pub rate_limit_tokens_per_second: u32,
+
     /// Upstream timeout in seconds: the whole response of a non-streaming request,
     /// the response headers of a streaming one. SGLang's chat endpoint sends those
     /// headers with the first token, so for streaming chat this bounds time to
@@ -154,8 +217,9 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = default_proxy_request_timeout_secs())]
     pub request_timeout_secs: u64,
     /// Maximum silence between upstream stream chunks, in seconds.
-    #[arg(long, default_value_t = ProxyConfig::default().stream_idle_timeout_secs)]
-    pub stream_idle_timeout_secs: u64,
+    /// Defaults to --request-timeout-secs unless explicitly overridden.
+    #[arg(long)]
+    pub stream_idle_timeout_secs: Option<u64>,
 
     /// Dispatch attempts per request, including the first. A request that fails
     /// before any response reaches the client (transport error, 5xx, 429) is
@@ -183,8 +247,9 @@ pub struct ServerArgs {
     /// Maximum in-flight request lifetime in seconds, including streaming responses.
     /// Expiry returns 504 `stale_request_expired` before response headers are sent;
     /// after streaming starts, it aborts the body without changing the HTTP status.
-    #[arg(long, default_value_t = default_stale_request_timeout_secs())]
-    pub stale_request_timeout_secs: u64,
+    /// Defaults to --request-timeout-secs unless explicitly overridden.
+    #[arg(long)]
+    pub stale_request_timeout_secs: Option<u64>,
 
     /// Default tracing level (overridden by `RUST_LOG`).
     #[arg(long, default_value = "info")]
@@ -197,6 +262,18 @@ pub struct ServerArgs {
 
 #[derive(clap::Args, Debug)]
 pub struct DiscoveryArgs {
+    /// Use explicit static prefill and decode lists.
+    #[arg(long, requires_all = ["prefill", "decode"], conflicts_with_all = ["worker_urls", "service_discovery"])]
+    pub pd_disaggregation: bool,
+
+    /// Prefill API URL and KV bootstrap port; repeat for each prefill worker.
+    #[arg(long, num_args = 2, value_names = ["URL", "BOOTSTRAP_PORT"], action = clap::ArgAction::Append, requires = "pd_disaggregation")]
+    pub prefill: Vec<String>,
+
+    /// Decode API URL; repeat for each decode worker.
+    #[arg(long, action = clap::ArgAction::Append, requires = "pd_disaggregation")]
+    pub decode: Vec<String>,
+
     /// Static worker URLs, space-separated or repeated. Conflicts with --service-discovery.
     #[arg(long, num_args = 1..)]
     pub worker_urls: Vec<String>,
@@ -246,6 +323,7 @@ pub struct RoutingArgs {
     /// Routing policy (defaults to power_of_two with reorg routing).
     #[arg(
         long,
+        visible_alias = "prefill-policy",
         value_enum,
         default_value = "round_robin",
         default_value_if("chat_routing", "reorg", "power_of_two")
@@ -511,6 +589,17 @@ pub struct AffinityArgs {
 impl Cli {
     /// Resolve CLI options and validate the resulting configuration.
     pub fn into_config(mut self) -> Result<Config> {
+        let infer_model_from_workers = self.model.model_id.is_none();
+        let model_id = self
+            .model
+            .model_id
+            .clone()
+            .or(self.model.model_path.clone())
+            .context("pass --model-id or --model-path")?;
+        ensure!(
+            self.server.worker_startup_timeout_secs > 0,
+            "--worker-startup-timeout-secs must be positive"
+        );
         let reorg = self.routing.chat_routing == ChatRoutingKind::Reorg;
         if reorg {
             ensure!(
@@ -573,6 +662,8 @@ impl Cli {
             .affinity
             .build_config(&self.cache, self.routing.policy)?;
         let discovery = self.discovery.into_config()?;
+        ensure!(!infer_model_from_workers || matches!(&discovery, DiscoveryBackend::StaticUrls(_)),
+            "--model-path without --model-id requires static workers; use --served-model-name with Kubernetes discovery");
         let path = self.routing.bucket_config.as_deref();
         let (bucket_config, reorg_buckets) = match path {
             Some(path) if reorg => (None, Some(load_bucket_config(path)?)),
@@ -638,6 +729,19 @@ impl Cli {
             .as_deref()
             .map(bearer)
             .transpose()?;
+        ensure!(
+            self.server.queue_size == 0,
+            "--queue-size must be 0 (admission does not queue)"
+        );
+        ensure!(
+            self.server.max_concurrent_requests == -1 || self.server.max_concurrent_requests > 0,
+            "--max-concurrent-requests must be -1 or positive"
+        );
+        let admission = super::AdmissionConfig {
+            max_concurrent_requests: (self.server.max_concurrent_requests > 0)
+                .then_some(self.server.max_concurrent_requests as usize),
+            refill_per_second: self.server.rate_limit_tokens_per_second,
+        };
         let config = Config {
             server: ServerConfig {
                 host: self.server.host,
@@ -646,6 +750,20 @@ impl Cli {
                 shutdown_drain_secs: self.server.shutdown_drain_secs,
                 termination_grace_secs: self.server.termination_grace_secs,
                 worker_auth,
+                forward_request_headers: self.server.forward_request_headers,
+                infer_model_from_workers,
+                worker_startup_timeout_secs: self.server.worker_startup_timeout_secs,
+                admission,
+                max_payload_size: self.server.max_payload_size,
+                prometheus_port: self.server.prometheus_port,
+                admin_port: self.server.admin_port,
+                health_check: super::HealthCheckConfig {
+                    mode: self.server.health_check_mode,
+                    interval_secs: self.server.health_check_interval_secs,
+                    timeout_secs: self.server.health_check_timeout_secs,
+                    failure_threshold: self.server.health_failure_threshold,
+                    success_threshold: self.server.health_success_threshold,
+                },
             },
             observability: ObservabilityConfig {
                 log_level: self.server.log_level,
@@ -655,9 +773,10 @@ impl Cli {
                 tokenizer_path: (!self.model.no_tokenizer).then(|| {
                     self.model
                         .tokenizer_path
-                        .unwrap_or_else(|| self.model.model_id.clone())
+                        .or(self.model.model_path)
+                        .unwrap_or_else(|| model_id.clone())
                 }),
-                id: self.model.model_id,
+                id: model_id,
                 disable_input_ids_forwarding: self.model.disable_input_ids_forwarding,
                 tokenizer: TokenizerConfig {
                     backend: self.model.tokenizer_backend,
@@ -682,15 +801,25 @@ impl Cli {
             discovery,
             proxy: ProxyConfig {
                 request_timeout_secs: self.server.request_timeout_secs,
-                stream_idle_timeout_secs: self.server.stream_idle_timeout_secs,
-                max_attempts: self.server.retry_max_attempts,
+                stream_idle_timeout_secs: self
+                    .server
+                    .stream_idle_timeout_secs
+                    .unwrap_or(self.server.request_timeout_secs),
+                max_attempts: if self.server.disable_retries {
+                    NonZeroU32::new(1).unwrap()
+                } else {
+                    self.server.retry_max_attempts
+                },
                 initial_backoff_ms: self.server.retry_initial_backoff_ms,
                 max_backoff_ms: self.server.retry_max_backoff_ms,
                 decode_dispatch_limit: self.server.decode_dispatch_limit,
                 stream_after_prefill: self.server.pd_stream_after_prefill,
             },
             router_inflight_load: InflightLoadConfig {
-                stale_request_timeout_secs: self.server.stale_request_timeout_secs,
+                stale_request_timeout_secs: self
+                    .server
+                    .stale_request_timeout_secs
+                    .unwrap_or(self.server.request_timeout_secs),
             },
         };
         config.validate()?;
@@ -702,7 +831,24 @@ impl Cli {
 }
 
 impl DiscoveryArgs {
-    fn into_config(self) -> Result<DiscoveryBackend> {
+    fn into_config(mut self) -> Result<DiscoveryBackend> {
+        let mut roles = std::collections::HashMap::new();
+        if self.pd_disaggregation {
+            for pair in self.prefill.chunks_exact(2) {
+                let port = pair[1]
+                    .parse::<std::num::NonZeroU16>()
+                    .context("--prefill bootstrap port must be between 1 and 65535")?;
+                self.worker_urls.push(pair[0].clone());
+                roles.insert(
+                    pair[0].clone(),
+                    (crate::discovery::WorkerMode::Prefill, Some(port.get())),
+                );
+            }
+            for url in self.decode {
+                self.worker_urls.push(url.clone());
+                roles.insert(url, (crate::discovery::WorkerMode::Decode, None));
+            }
+        }
         let has_static = !self.worker_urls.is_empty();
         let backend = match (has_static, self.service_discovery) {
             (true, true) => {
@@ -736,6 +882,7 @@ impl DiscoveryArgs {
                 );
                 DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                     urls: self.worker_urls,
+                    roles,
                 })
             }
             (false, true) => {
@@ -1052,7 +1199,7 @@ impl AffinityArgs {
             .session_id_header
             .clone()
             .unwrap_or(defaults.session_id_header);
-        axum::http::HeaderName::try_from(session_id_header.as_str()).map_err(|e| {
+        HeaderName::try_from(session_id_header.as_str()).map_err(|e| {
             anyhow!(
                 "--session-id-header {session_id_header:?} is not a valid HTTP header name: {e}"
             )
@@ -1164,7 +1311,7 @@ impl AffinityArgs {
         }
         let defaults = StickyConfig::default();
         let header_name = self.routing_key_header.unwrap_or(defaults.header_name);
-        axum::http::HeaderName::try_from(header_name.as_str()).map_err(|e| {
+        HeaderName::try_from(header_name.as_str()).map_err(|e| {
             anyhow!("--routing-key-header {header_name:?} is not a valid HTTP header name: {e}")
         })?;
         let fallback_policy = self
@@ -1218,6 +1365,37 @@ mod tests {
         DiscoveryBackend, ScoreTermKind, MAX_KV_BOOTSTRAP_TIMEOUT_MS,
         MIN_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
     };
+
+    #[test]
+    fn accepts_explicit_health_check_modes_and_rejects_unknown_modes() {
+        let base = [
+            "router",
+            "--model-id",
+            "tiny",
+            "--worker-urls",
+            "http://localhost:30000",
+        ];
+        for mode in ["generation", "http", "off"] {
+            assert!(
+                Cli::try_parse_from(base.into_iter().chain(["--health-check-mode", mode])).is_ok(),
+                "{mode}"
+            );
+        }
+        assert_eq!(
+            Cli::try_parse_from(base)
+                .unwrap()
+                .into_config()
+                .unwrap()
+                .server
+                .health_check
+                .mode,
+            super::super::HealthCheckMode::Http
+        );
+        assert!(
+            Cli::try_parse_from(base.into_iter().chain(["--health-check-mode", "unknown"]))
+                .is_err()
+        );
+    }
 
     #[test]
     fn chat_routing_selects_policy_implementation_without_another_config() {
@@ -1466,15 +1644,73 @@ mod tests {
     }
 
     #[test]
+    fn auxiliary_timeout_defaults_follow_the_request_budget() {
+        for seconds in ["1800", "7200"] {
+            let c = into_config_owned(with_model(&[
+                "--worker-urls",
+                "http://worker:30000",
+                "--request-timeout-secs",
+                seconds,
+            ]))
+            .unwrap();
+            let seconds: u64 = seconds.parse().unwrap();
+            assert_eq!(c.proxy.stream_idle_timeout_secs, seconds);
+            assert_eq!(c.router_inflight_load.stale_request_timeout_secs, seconds);
+        }
+    }
+
+    #[test]
+    fn default_request_budget_matches_the_gateway() {
+        let c = into_config_owned(with_model(&["--worker-urls", "http://worker:30000"])).unwrap();
+        assert_eq!(c.proxy.request_timeout_secs, 1800);
+        assert_eq!(c.proxy.stream_idle_timeout_secs, 1800);
+        assert_eq!(c.router_inflight_load.stale_request_timeout_secs, 1800);
+    }
+
+    #[test]
+    fn configured_request_survives_the_former_stale_deadline() {
+        use crate::state::load_monitor::router_inflight_load::{
+            MockClock, RouterInflightLoadRegistry,
+        };
+        use std::{sync::Arc, time::Duration};
+
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://worker:30000",
+            "--request-timeout-secs",
+            "7200",
+        ]))
+        .unwrap();
+        let clock = Arc::new(MockClock::new(std::time::Instant::now()));
+        let registry = RouterInflightLoadRegistry::new(
+            clock.clone(),
+            Duration::from_secs(c.router_inflight_load.stale_request_timeout_secs),
+        );
+        let guard = registry.register(
+            crate::discovery::WorkerId("worker".into()),
+            "http://worker:30000",
+            1,
+            1,
+        );
+        clock.advance(Duration::from_secs(601));
+        assert_eq!(registry.sweep_stale(), 0);
+        assert_eq!(registry.inflight_count(), 1);
+        clock.advance(Duration::from_secs(7200 - 601));
+        assert_eq!(registry.sweep_stale(), 1);
+        drop(guard);
+        assert_eq!(registry.inflight_count(), 0);
+    }
+
+    #[test]
     fn defaults_host_port_and_policy() {
         let c = into_config_owned(with_model(&["--worker-urls", "http://10.0.0.1:30000"])).unwrap();
         assert_eq!(c.server.host, "127.0.0.1");
         assert_eq!(c.server.port, 30000);
         assert_eq!(c.model.policy, PolicyKind::RoundRobin);
         assert_eq!(c.model.id, "qwen3-0.6b");
-        assert_eq!(c.proxy.request_timeout_secs, 300);
-        assert_eq!(c.router_inflight_load.stale_request_timeout_secs, 600);
-        assert_eq!(c.server.shutdown_drain_secs, 30);
+        assert_eq!(c.proxy.request_timeout_secs, 1800);
+        assert_eq!(c.router_inflight_load.stale_request_timeout_secs, 1800);
+        assert_eq!(c.server.shutdown_drain_secs, 300);
     }
 
     /// Several values, not just the default: a clamp or a rescale in the
@@ -2326,9 +2562,12 @@ mod tests {
             "120",
             "--stale-request-timeout-secs",
             "240",
+            "--stream-idle-timeout-secs",
+            "60",
         ]))
         .unwrap();
         assert_eq!(c.proxy.request_timeout_secs, 120);
+        assert_eq!(c.proxy.stream_idle_timeout_secs, 60);
         assert_eq!(c.router_inflight_load.stale_request_timeout_secs, 240);
     }
 
@@ -3439,5 +3678,40 @@ mod tests {
             err.contains("cache candidate tuning flags require --policy cache_aware"),
             "got: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod forward_header_tests {
+    use super::*;
+    #[test]
+    fn configured_forward_headers_are_validated_and_repeatable() {
+        let cli = Cli::try_parse_from([
+            "sgl-router",
+            "--model-id",
+            "m",
+            "--no-tokenizer",
+            "--forward-request-header",
+            "X-Client-Context",
+            "--forward-request-header",
+            "x-client-zone",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.server.forward_request_headers,
+            [
+                HeaderName::from_static("x-client-context"),
+                HeaderName::from_static("x-client-zone")
+            ]
+        );
+        assert!(Cli::try_parse_from([
+            "sgl-router",
+            "--model-id",
+            "m",
+            "--no-tokenizer",
+            "--forward-request-header",
+            "invalid header"
+        ])
+        .is_err());
     }
 }

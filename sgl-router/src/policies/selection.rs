@@ -32,9 +32,8 @@ use crate::policies::admission::{
     CandidateDomain, CandidateRange, DecisionReason,
 };
 use crate::policies::buckets::{BucketRequest, BucketSelector};
-use crate::policies::cache_aware::estimate_matched_prefix_tokens;
 use crate::policies::decode::{
-    build_decode_policy, resolve_decode_with_capacity_fallback, DecodeSelectionContext,
+    resolve_decode_with_capacity_fallback, DecodePolicy, DecodeSelectionContext,
 };
 use crate::policies::{
     Policy, PrefillProposal, PrefixLookupResult, ProposalKind, SelectionContext,
@@ -44,6 +43,24 @@ use crate::state::kv_events::CacheNamespace;
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::workers::Worker;
 
+/// Optional request-local selection evidence; never changes a policy decision.
+#[derive(Default)]
+pub(crate) struct SelectionDiagnostics(
+    std::sync::Mutex<Option<(Vec<serde_json::Value>, Option<u64>)>>,
+);
+impl SelectionDiagnostics {
+    pub fn record(&self, mut candidates: Vec<serde_json::Value>, predicted: Option<u64>) {
+        candidates.truncate(64);
+        *self.0.lock().unwrap() = Some((candidates, predicted));
+    }
+    pub fn take(&self) -> Option<(Vec<serde_json::Value>, Option<u64>)> {
+        self.0.lock().unwrap().take()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.lock().unwrap().is_none()
+    }
+}
+
 /// Everything one prefill selection reads. Collaborators first, then the
 /// per-request facts.
 pub(crate) struct PrefillSelectionInputs<'a> {
@@ -51,6 +68,7 @@ pub(crate) struct PrefillSelectionInputs<'a> {
     pub policy_kind: PolicyKind,
     pub bucket_selector: &'a BucketSelector,
     pub metrics: &'a MetricsRegistry,
+    pub diagnostics: Option<&'a SelectionDiagnostics>,
     /// Names the model in the selection context and in the log lines.
     pub model_id: &'a ModelId,
     pub body: Option<&'a [u8]>,
@@ -149,6 +167,7 @@ pub(crate) fn select_prefill_worker(
         },
         failure_reason: PolicySelectionFailureReason::ProposalEmpty,
         cache_gate_audit: None,
+        round_robin: Arc::default(),
         // E: the input beyond the longest prefix any prefill worker can reuse.
         // None (cold) when nothing is reusable.
         uncached_tokens: inputs
@@ -178,9 +197,9 @@ fn best_reusable_tokens(inputs: &PrefillSelectionInputs<'_>) -> u64 {
                 .any(|worker| worker.url == entry.address)
         })
         .map(|entry| {
-            estimate_matched_prefix_tokens(
+            signal.matched_tokens(
                 inputs.request_sequence_tokens,
-                signal.query_blocks,
+                &entry.address,
                 entry.matched_prefix_blocks,
             )
         })
@@ -193,6 +212,7 @@ fn best_reusable_tokens(inputs: &PrefillSelectionInputs<'_>) -> u64 {
 /// the last rung to record any gave — a rung that returns `None` without
 /// recording leaves the previous reason standing.
 struct Selector<'a> {
+    round_robin: Arc<super::round_robin::RequestRotation>,
     inputs: &'a PrefillSelectionInputs<'a>,
     bucket_request: BucketRequest,
     failure_reason: PolicySelectionFailureReason,
@@ -407,6 +427,7 @@ impl<'a> Selector<'a> {
     fn base_context(&self, candidate_range_id: &'a str) -> SelectionContext<'a> {
         let inputs = self.inputs;
         SelectionContext::with_routing_key(inputs.model_id, inputs.body, inputs.routing_key)
+            .with_round_robin_rotation(Arc::clone(&self.round_robin))
             .with_session_id(inputs.session_id)
             .with_candidate_range_id(candidate_range_id)
             .with_input_tokens(inputs.request_input_tokens)
@@ -501,6 +522,17 @@ impl<'a> Selector<'a> {
             .candidates
             .iter()
             .find(|candidate| candidate.worker.id == decision.selected.id)?;
+        if let Some(diagnostics) = inputs.diagnostics {
+            let chosen = &decision.selected.id;
+            let rows=proposal.candidates.iter().filter(|c|&c.worker.id==chosen)
+                .chain(proposal.candidates.iter().filter(|c|&c.worker.id!=chosen)).take(64)
+                .map(|c|serde_json::json!({"worker_id":c.worker.id.0,"url":c.worker.url,"selected":&c.worker.id==chosen,
+                    "matched_prefix_tokens":c.matched_prefix_tokens,"uncached_tokens":c.uncached_tokens,
+                    "router_inflight":c.worker.router_inflight_load(),"candidate_range_id":c.candidate_range_id,
+                    "decision_reason":format!("{:?}",decision.reason),"load_snapshot_version":decision.load_snapshot_version,
+                    "prefill_pressure_source":cache_decision.prefill_pressure_source,"score_kind":"cache_affinity"})).collect();
+            diagnostics.record(rows, Some(selected_candidate.matched_prefix_tokens));
+        }
         tracing::debug!(
             model = %inputs.model_id,
             policy = ?ProposalKind::CacheAffinity,
@@ -742,6 +774,7 @@ fn prefill_policy_reason(
 /// Everything one decode-peer selection reads. Collaborators first, then the
 /// per-request facts.
 pub(crate) struct DecodeSelectionInputs<'a> {
+    pub decode_policy: &'a dyn DecodePolicy,
     pub decode_policy_kind: DecodePolicyKind,
     /// Disable for version-group probes so full groups do not count as admissible.
     pub allow_capacity_fallback: bool,
@@ -793,7 +826,7 @@ pub(crate) fn select_decode_peer(inputs: &DecodeSelectionInputs<'_>) -> Option<A
             tps_slo: inputs.tps_slo,
         },
     );
-    let decode_policy = build_decode_policy(inputs.decode_policy_kind);
+    let decode_policy = inputs.decode_policy;
     let decode_ctx = DecodeSelectionContext::new()
         .with_load_snapshot(snapshot)
         .with_prefill_url(inputs.prefill_url);
@@ -949,7 +982,45 @@ mod tests {
             query_blocks,
             pending_winners: Vec::new(),
             block_hashes: None,
+            local_queries: Default::default(),
         }
+    }
+
+    #[test]
+    fn cache_selection_diagnostics_report_the_actual_bounded_candidate_costs() {
+        let owner = worker("owner");
+        let shallow = worker("shallow");
+        let workers = vec![Arc::clone(&owner), Arc::clone(&shallow)];
+        let loads = queued_snapshot(&[(&owner, 0, 10, 10_000_000), (&shallow, 0, 10, 10_000_000)]);
+        let signal = prefix_signal(&[(&owner, 9), (&shallow, 4)], 10);
+        let policy = CacheAwarePolicy::new(AffinityConfig::default());
+        let buckets = BucketSelector::new(None);
+        let metrics = MetricsRegistry::new();
+        let model = ModelId("model".into());
+        let diagnostics = super::SelectionDiagnostics::default();
+        let mut inputs = prefill_inputs(
+            &policy,
+            &buckets,
+            &metrics,
+            &model,
+            &workers,
+            Some(&loads),
+            100_000,
+        );
+        inputs.policy_kind = PolicyKind::CacheAware;
+        inputs.external_prefix = Some(&signal);
+        inputs.diagnostics = Some(&diagnostics);
+        let selected = select_prefill_worker(&inputs).unwrap();
+        assert_eq!(selected.id, owner.id);
+        let (candidates, predicted) = diagnostics
+            .take()
+            .expect("selection must publish its actual cost inputs");
+        assert_eq!(predicted, Some(90_000));
+        assert_eq!(candidates.len(), 2);
+        let selected = candidates.iter().find(|c| c["selected"] == true).unwrap();
+        assert_eq!(selected["matched_prefix_tokens"], 90_000);
+        assert_eq!(selected["uncached_tokens"], 10_000);
+        assert!(selected["decision_reason"].is_string());
     }
 
     fn booked_decisions(metrics: &MetricsRegistry) -> Vec<String> {
@@ -978,6 +1049,7 @@ mod tests {
             policy_kind: PolicyKind::PowerOfTwo,
             bucket_selector,
             metrics,
+            diagnostics: None,
             model_id,
             body: None,
             routing_key: None,
@@ -999,6 +1071,64 @@ mod tests {
         }
     }
 
+    #[test]
+    fn prefill_capacity_fallback_retains_one_round_robin_ticket() {
+        #[derive(Debug, Default)]
+        struct SharedRoundRobin(crate::policies::round_robin::RoundRobinPolicy);
+        impl Policy for SharedRoundRobin {
+            fn select(
+                &self,
+                workers: &[Arc<Worker>],
+                context: &crate::policies::SelectionContext<'_>,
+            ) -> Option<Arc<Worker>> {
+                self.0.select(workers, context)
+            }
+            fn uses_shared_prefill_admission(&self) -> bool {
+                true
+            }
+        }
+        let policy = SharedRoundRobin::default();
+        let first = worker("p0");
+        let second = worker("p1");
+        let workers = vec![first.clone(), second.clone()];
+        let full = snapshot(&[(&first, 100, 100), (&second, 100, 100)]);
+        let free = snapshot(&[(&first, 0, 10000), (&second, 0, 10000)]);
+        let buckets = BucketSelector::new(None);
+        let metrics = MetricsRegistry::new();
+        let model = ModelId("model".into());
+        let mut inputs = prefill_inputs(
+            &policy,
+            &buckets,
+            &metrics,
+            &model,
+            &workers,
+            Some(&full),
+            1000,
+        );
+        inputs.policy_kind = PolicyKind::RoundRobin;
+        assert!(select_prefill_worker(&inputs).is_ok());
+        inputs.load_snapshot = Some(&free);
+        assert_eq!(select_prefill_worker(&inputs).unwrap().id.0, "p1");
+    }
+
+    #[test]
+    fn decode_capacity_fallback_does_not_skip_the_next_round_robin_request() {
+        let policy = crate::policies::decode::DecodeRoundRobinPolicy::default();
+        let first = worker("d0");
+        let second = worker("d1");
+        let workers = vec![first.clone(), second.clone()];
+        let full = snapshot(&[(&first, 100, 100), (&second, 100, 100)]);
+        let free = snapshot(&[(&first, 0, 10000), (&second, 0, 10000)]);
+        let buckets = BucketSelector::new(None);
+        let model = ModelId("model".into());
+        let mut inputs = decode_inputs(&buckets, &model, &workers, Some(&full), 1000);
+        inputs.decode_policy = &policy;
+        inputs.decode_policy_kind = DecodePolicyKind::RoundRobin;
+        assert!(select_decode_peer(&inputs).is_some());
+        inputs.load_snapshot = Some(&free);
+        assert_eq!(select_decode_peer(&inputs).unwrap().id.0, "d1");
+    }
+
     fn decode_inputs<'a>(
         bucket_selector: &'a BucketSelector,
         model_id: &'a ModelId,
@@ -1007,6 +1137,7 @@ mod tests {
         request_input_tokens: u64,
     ) -> DecodeSelectionInputs<'a> {
         DecodeSelectionInputs {
+            decode_policy: &crate::policies::decode::DecodePowerOfTwoPolicy,
             decode_policy_kind: DecodePolicyKind::PowerOfTwo,
             allow_capacity_fallback: true,
             bucket_selector,

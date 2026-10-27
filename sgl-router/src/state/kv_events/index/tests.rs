@@ -723,49 +723,41 @@ async fn pump_drops_events_from_detached_workers() {
     assert_eq!(tree.match_prefix(None, &[99]).matched_blocks, 1);
 }
 
-/// `add_worker` must reject a worker whose `EventConfig.block_size`
-/// disagrees with the previously-established oracle value. The
-/// router cannot hash prompts simultaneously at two block sizes;
-/// silently accepting the mismatched worker would destroy
-/// cache-aware routing quality for every request.
+/// Independent workers may publish different native page sizes; single-configuration
+/// consumers must see the fleet as heterogeneous until the other worker leaves.
 #[tokio::test]
-async fn add_worker_rejects_block_size_mismatch() {
+async fn add_worker_accepts_distinct_worker_block_sizes() {
     let index = KvEventIndex::new();
-    // First worker establishes block_size=64 via the oracle.
-    index.block_size_oracle().try_set(64).unwrap();
-
-    let bad_cfg = EventConfig {
-        host: "127.0.0.1".into(),
-        port_base: 30100,
-        topic: String::new(),
-        load_port_base: None,
-        load_topic: None,
-        replay_port_base: None,
-        block_size: 128,
-        dp_size: 1,
-        is_bigram: false,
-    };
-    index
-        .add_worker("http://127.0.0.1:30100", Some(bad_cfg))
-        .await;
-    assert_eq!(
-        index.known_worker_count(),
-        0,
-        "mismatched worker must not be registered"
-    );
+    for (url, size) in [("http://small", 64), ("http://large", 512)] {
+        index
+            .add_worker(
+                url,
+                Some(EventConfig {
+                    host: "127.0.0.1".into(),
+                    port_base: 30100,
+                    topic: String::new(),
+                    load_port_base: None,
+                    load_topic: None,
+                    replay_port_base: None,
+                    block_size: size,
+                    dp_size: 1,
+                    is_bigram: false,
+                }),
+            )
+            .await;
+    }
+    assert_eq!(index.known_worker_count(), 2);
+    assert_eq!(index.block_size_oracle().get(), None);
+    index.remove_worker("http://large").await;
+    assert_eq!(index.block_size_oracle().get(), Some(64));
     index.shutdown().await;
 }
 
 #[tokio::test]
 async fn add_worker_seeds_oracle_with_first_block_size() {
-    // Without any prior priming, the first worker through `add_worker`
-    // should publish its `EventConfig.block_size` into the oracle so
-    // subsequent matching workers reconcile and mismatched ones fail.
     let index = KvEventIndex::new();
     assert_eq!(index.block_size_oracle().get(), None);
 
-    // A dp_size=0 cfg short-circuits before the subscriber spawn but
-    // still runs through the block-size validation.
     let cfg = EventConfig {
         host: "127.0.0.1".into(),
         port_base: 30200,
@@ -774,7 +766,7 @@ async fn add_worker_seeds_oracle_with_first_block_size() {
         load_topic: None,
         replay_port_base: None,
         block_size: 64,
-        dp_size: 0,
+        dp_size: 1,
         is_bigram: false,
     };
     index.add_worker("http://127.0.0.1:30200", Some(cfg)).await;
@@ -789,7 +781,6 @@ async fn add_worker_seeds_bigram_flag_from_event_config() {
     // select() picks the bigram hasher for EAGLE workers.
     let index = KvEventIndex::new();
     assert!(!index.block_size_oracle().is_bigram());
-    // dp_size=0 short-circuits the subscriber spawn but still runs the seed.
     let cfg = EventConfig {
         host: "127.0.0.1".into(),
         port_base: 30300,
@@ -798,7 +789,7 @@ async fn add_worker_seeds_bigram_flag_from_event_config() {
         load_topic: None,
         replay_port_base: None,
         block_size: 64,
-        dp_size: 0,
+        dp_size: 1,
         is_bigram: true,
     };
     index.add_worker("http://127.0.0.1:30300", Some(cfg)).await;

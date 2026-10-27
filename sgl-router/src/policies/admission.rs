@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared capacity admission and pressure guards for prefill and decode.
+//! Prefill capacity admission, pressure guards, and decode policy resolution.
 //!
 //! Native Cache-Aware uses monitor-backed admission only when every expected
 //! DP rank has a fresh, complete #34608 ZMQ sample. Otherwise it falls back to
@@ -495,7 +495,7 @@ pub fn resolve_prefill_admitted(
 pub fn resolve_decode(
     domain: &CandidateDomain,
     proposal: &SelectionProposal,
-    request_kv_tokens: u64,
+    _request_kv_tokens: u64,
     snapshot: &EngineReportedLoadSnapshot,
 ) -> Option<FinalDecision> {
     if domain.stage != RoutingStage::Decode || !contains_domain_worker(domain, &proposal.primary) {
@@ -506,27 +506,14 @@ pub fn resolve_decode(
         .as_ref()
         .filter(|worker| contains_domain_worker(domain, worker))
         .cloned();
-    let primary_admitted = is_decode_admitted(&proposal.primary, request_kv_tokens, snapshot);
-    let backup_admitted = backup
-        .as_ref()
-        .is_some_and(|worker| is_decode_admitted(worker, request_kv_tokens, snapshot));
-    let (selected, reason) = match (primary_admitted, backup.as_ref(), backup_admitted) {
-        (true, Some(backup), true) => {
-            if compare_decode_engines(&proposal.primary, backup, Some(snapshot)).is_gt() {
-                (Arc::clone(backup), DecisionReason::BackupPressureGuard)
-            } else {
-                (Arc::clone(&proposal.primary), DecisionReason::Primary)
-            }
-        }
-        (true, _, _) => (Arc::clone(&proposal.primary), DecisionReason::Primary),
-        (false, Some(backup), true) => (Arc::clone(backup), DecisionReason::BackupPrimaryAdmission),
-        _ => decode_domain_fallback(domain, request_kv_tokens, snapshot)?,
-    };
+    // The configured decode policy owns worker choice. Projected KV usage
+    // cannot predict the engine's queue, eviction, or allocation outcome.
+    // Preserve its primary and let the engine schedule the request.
     Some(FinalDecision {
-        selected,
+        selected: Arc::clone(&proposal.primary),
         primary: Arc::clone(&proposal.primary),
         backup,
-        reason,
+        reason: DecisionReason::Primary,
         candidate_range_id: domain.id.clone(),
         load_snapshot_version: snapshot.version,
     })
@@ -575,17 +562,6 @@ fn is_prefill_admitted(
                     <= limit
             })
         })
-}
-
-fn is_decode_admitted(
-    worker: &Arc<Worker>,
-    request_kv_tokens: u64,
-    snapshot: &EngineReportedLoadSnapshot,
-) -> bool {
-    has_kv_capacity(
-        snapshot.fresh_native_cache_load_for_url(&worker.url),
-        request_kv_tokens,
-    )
 }
 
 fn is_cache_candidate_admitted(
@@ -751,23 +727,6 @@ fn legal_prefill_candidates(
         .filter(|worker| contains_worker(range, worker))
         .cloned()
         .collect()
-}
-
-fn decode_domain_fallback(
-    domain: &CandidateDomain,
-    request_kv_tokens: u64,
-    snapshot: &EngineReportedLoadSnapshot,
-) -> Option<(Arc<Worker>, DecisionReason)> {
-    let admitted = domain
-        .workers
-        .iter()
-        .filter(|worker| is_decode_admitted(worker, request_kv_tokens, snapshot))
-        .cloned()
-        .collect::<Vec<_>>();
-    let loads = CandidateLoads::new(Some(snapshot), admitted.iter());
-    loads
-        .select_min_by_load_key(admitted, CandidateLoads::compare_decode_load_keys)
-        .map(|worker| (worker, DecisionReason::RangeFallback))
 }
 
 fn pressure_guard_prefers_backup(

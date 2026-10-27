@@ -3,8 +3,11 @@
 
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
+use crate::server::routes::chat::admit_and_prepare;
 use crate::tokenizer::adapter;
 use axum::extract::State;
+use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use dynamo_tokenizers::Tokenizer;
 use serde::{Deserialize, Serialize};
@@ -54,53 +57,63 @@ pub(crate) fn tokenizer_for(ctx: &AppContext, model: &str) -> Result<Arc<Tokeniz
 
 pub async fn tokenize(
     State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
     Json(req): Json<TokenizeRequest>,
-) -> Result<Json<TokenizeResponse>, ApiError> {
-    let tok = tokenizer_for(&ctx, &req.model)?;
-    // Structured log on failure so an operator can correlate
-    // "every encode for model X errors" against the route, model id, and
-    // prompt size. The generic anyhow-chain log in ApiError::Internal still
-    // fires from IntoResponse — duplication is intentional: the route-level
-    // line carries `model` / `prompt_len`, the IntoResponse line carries
-    // the full anyhow chain.
-    let ids = adapter::encode(&tok, &req.prompt).map_err(|e| {
-        tracing::error!(
-            route = "/v1/tokenize",
-            model = %req.model,
-            prompt_len = req.prompt.len(),
-            error = ?e,
-            "tokenize.encode failed",
-        );
-        ApiError::Internal(e)
-    })?;
-    Ok(Json(TokenizeResponse {
-        model: req.model,
-        count: ids.len(),
-        tokens: ids,
-    }))
+) -> Result<Response, ApiError> {
+    let (admitted, response) = admit_and_prepare(&ctx, "/v1/tokenize", &headers, move |ctx| {
+        let tok = tokenizer_for(ctx, &req.model)?;
+        // Structured log on failure so an operator can correlate
+        // "every encode for model X errors" against the route, model id, and
+        // prompt size. The generic anyhow-chain log in ApiError::Internal still
+        // fires from IntoResponse — duplication is intentional: the route-level
+        // line carries `model` / `prompt_len`, the IntoResponse line carries
+        // the full anyhow chain.
+        let ids = adapter::encode(&tok, &req.prompt).map_err(|e| {
+            tracing::error!(
+                route = "/v1/tokenize",
+                model = %req.model,
+                prompt_len = req.prompt.len(),
+                error = ?e,
+                "tokenize.encode failed",
+            );
+            ApiError::Internal(e)
+        })?;
+        Ok(TokenizeResponse {
+            model: req.model,
+            count: ids.len(),
+            tokens: ids,
+        })
+    })
+    .await?;
+    Ok(admitted.response(Json(response).into_response()))
 }
 
 pub async fn detokenize(
     State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
     Json(req): Json<DetokenizeRequest>,
-) -> Result<Json<DetokenizeResponse>, ApiError> {
-    let tok = tokenizer_for(&ctx, &req.model)?;
-    let text =
-        adapter::decode_complete(&tok, &req.tokens, req.skip_special_tokens).map_err(|e| {
-            tracing::error!(
-                route = "/v1/detokenize",
-                model = %req.model,
-                n_tokens = req.tokens.len(),
-                skip_special = req.skip_special_tokens,
-                error = ?e,
-                "detokenize.decode_complete failed",
-            );
-            ApiError::Internal(e)
-        })?;
-    Ok(Json(DetokenizeResponse {
-        model: req.model,
-        text,
-    }))
+) -> Result<Response, ApiError> {
+    let (admitted, response) = admit_and_prepare(&ctx, "/v1/detokenize", &headers, move |ctx| {
+        let tok = tokenizer_for(ctx, &req.model)?;
+        let text =
+            adapter::decode_complete(&tok, &req.tokens, req.skip_special_tokens).map_err(|e| {
+                tracing::error!(
+                    route = "/v1/detokenize",
+                    model = %req.model,
+                    n_tokens = req.tokens.len(),
+                    skip_special = req.skip_special_tokens,
+                    error = ?e,
+                    "detokenize.decode_complete failed",
+                );
+                ApiError::Internal(e)
+            })?;
+        Ok(DetokenizeResponse {
+            model: req.model,
+            text,
+        })
+    })
+    .await?;
+    Ok(admitted.response(Json(response).into_response()))
 }
 
 #[cfg(test)]
@@ -144,6 +157,7 @@ mod tests {
             },
             discovery: crate::config::DiscoveryBackend::StaticUrls(
                 crate::config::StaticUrlsDiscoveryConfig {
+                    roles: Default::default(),
                     urls: vec!["http://placeholder:0".into()],
                 },
             ),

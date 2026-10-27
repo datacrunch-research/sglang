@@ -233,18 +233,15 @@ impl RouterInflightLoadRegistry {
         );
     }
 
-    /// Default-config registry: monotonic system clock + 10-minute stale
-    /// timeout. Convenience constructor for production callers; tests use
+    /// Default-config registry with a monotonic clock and the default request
+    /// budget. Callers with configuration should pass its timeout to [`Self::new`]. Tests use
     /// [`Self::new`] with a `MockClock`. Mirrors
     /// `default_stale_request_timeout_secs` in `config::types`.
     ///
-    /// 10 minutes is comfortable above 99p generation tail latency
-    /// (including long-queue throughput-focused workloads) while
-    /// bounding leak-induced load inflation.
     pub fn with_defaults() -> Arc<Self> {
         Self::new(
             Arc::new(SystemTimeClock) as Arc<dyn Clock>,
-            Duration::from_secs(10 * 60),
+            Duration::from_secs(crate::config::default_stale_request_timeout_secs()),
         )
     }
 

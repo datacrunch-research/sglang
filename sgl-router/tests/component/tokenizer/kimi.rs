@@ -9,6 +9,31 @@ use sha2::{Digest, Sha256};
 mod fixture;
 
 #[test]
+fn model_directory_loads_the_same_tokenizer_and_chat_metadata_as_the_file() {
+    let fixture = fixture::tokenizer();
+    let file = fixture.path().join("tiktoken.model");
+    let file = file.to_str().unwrap();
+    let directory = fixture.path().to_str().unwrap();
+    let request = json!({"messages":[{"role":"user","content":"Say hello."}]});
+    let tokenizer = adapter::load(file).unwrap();
+    let formatter = ChatFormatter::load("served-alias", file).unwrap().unwrap();
+    let expected = formatter.encode(&tokenizer, &request).unwrap();
+    let tokenizer = adapter::load(directory).expect("gateway --model-path names a directory");
+    let formatter = ChatFormatter::load("served-alias", directory)
+        .unwrap()
+        .expect("model config must come from the supplied directory");
+    assert_eq!(formatter.encode(&tokenizer, &request).unwrap(), expected);
+
+    let hf = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        "tests/fixtures/tiny_tokenizer.json",
+        hf.path().join("tokenizer.json"),
+    )
+    .unwrap();
+    assert!(adapter::load(hf.path().to_str().unwrap()).is_ok());
+}
+
+#[test]
 fn kimi_tokens_match_sglang() {
     let fixture = fixture::tokenizer();
     let path = fixture.path().join("tiktoken.model");
