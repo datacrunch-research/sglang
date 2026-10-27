@@ -599,6 +599,7 @@ async fn select_workers(
         prefill,
         decode,
         track_dispatch_timestamps: policy.needs_dispatch_timestamps(),
+        bucket_slot: None,
     })
 }
 
@@ -974,6 +975,7 @@ pub(crate) async fn generation_probe(
         prefill,
         decode,
         track_dispatch_timestamps: false,
+        bucket_slot: None,
     };
     let Ok(dispatched) =
         forward_request(ctx, &mut request, selected, headers, started, &duration).await

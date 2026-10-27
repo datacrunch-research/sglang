@@ -13,6 +13,7 @@ use crate::proxy::grpc::{Additions, EngineRpc, GrpcResponse};
 use crate::proxy::sse::{self, ErrorEventScanner, PumpItem, StreamEnd, StreamEndReason};
 use crate::proxy::Proxy;
 use crate::server::app_context::AppContext;
+use crate::server::bucket_admission::BucketSlot;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
     classify_stream_end, outcome_from_status, MetricsRegistry, RequestLogContext, RequestOutcome,
@@ -48,6 +49,8 @@ pub(super) struct SelectedWorkers {
     pub(super) prefill: Arc<Worker>,
     pub(super) decode: Option<Arc<Worker>>,
     pub(super) track_dispatch_timestamps: bool,
+    /// The request's place in its bucket's queue, held until prefill is done.
+    pub(super) bucket_slot: Option<BucketSlot>,
 }
 
 /// PD sends to both workers and returns the decode response.
@@ -178,7 +181,14 @@ async fn dispatch<T: Transport>(
         prefill,
         decode,
         track_dispatch_timestamps,
+        bucket_slot,
     } = workers;
+    // Under PD the detached prefill holds the slot until it finishes; a plain
+    // engine's prefill is over once its response arrives.
+    let (prefill_slot, plain_slot) = match decode {
+        Some(_) => (bucket_slot, None),
+        None => (None, bucket_slot),
+    };
     if let Some(scope) = &request.scope {
         let mut proof = vec![Arc::clone(&prefill)];
         proof.extend(decode.iter().cloned());
@@ -297,6 +307,7 @@ async fn dispatch<T: Transport>(
                 bootstrap.room,
                 stream_abort.clone(),
                 decode_slot.clone(),
+                prefill_slot,
             );
             // Counted from arrival, so decode selection sees requests waiting here.
             let decode_load = decode.load_guard();
@@ -393,6 +404,7 @@ async fn dispatch<T: Transport>(
             (Err(ApiError::StaleRequestExpired { model }), None)
         }
     };
+    drop(plain_slot);
     if matches!(dispatch_outcome::<T>(&result), RequestOutcome::Success) {
         unanswered.0 = None;
     }
@@ -848,10 +860,13 @@ fn spawn_prefill_request<T: Transport>(
     bootstrap_room: u64,
     stream_abort: CancellationToken,
     slot: Option<DecodeSlot>,
+    bucket_slot: Option<BucketSlot>,
 ) -> tokio::task::JoinHandle<PrefillFailure<T::Response>> {
     let proxy = Arc::clone(&ctx.proxy);
     let (registry, model) = (Arc::clone(&metrics.registry), metrics.model.clone());
     tokio::spawn(async move {
+        // Every exit of this task ends the request's prefill work in its bucket.
+        let _bucket_slot = bucket_slot;
         let prefill_started = Instant::now();
         let cancelled = load_guards
             .3

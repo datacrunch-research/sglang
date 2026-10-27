@@ -5,6 +5,7 @@ pub mod admin;
 pub mod admission;
 pub mod app;
 pub mod app_context;
+pub mod bucket_admission;
 pub mod error;
 pub mod grpc;
 pub mod header_utils;

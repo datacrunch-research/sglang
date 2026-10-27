@@ -15,6 +15,7 @@ use crate::config::{
     PolicyKind, SessionAffinityMode,
 };
 use crate::discovery::WorkerId;
+use crate::server::bucket_admission::{BucketQueue, QueueSpec};
 use crate::state::kv_events::RadixTreePrefixProvider;
 use crate::state::session_estimator::{SessionEstimator, DEFAULT_SESSION_IDLE};
 use crate::state::{
@@ -55,6 +56,9 @@ pub struct BucketSpec {
     pub max_context_tokens: Option<u64>,
     pub ttft_ms: Option<u64>,
     pub tokens_per_second: Option<f64>,
+    /// Bounded wait queue: the request waits here for an engine of this
+    /// bucket instead of moving to the next fitting bucket.
+    pub queue: Option<QueueSpec>,
     pub plain: Option<GroupSpec>,
     pub prefill: Option<GroupSpec>,
     pub decode: Option<GroupSpec>,
@@ -261,6 +265,12 @@ pub fn build_resolver(
             min: spec.min_uncached_tokens,
             max: spec.max_uncached_tokens,
         };
+        if let Some(queue) = &spec.queue {
+            queue
+                .validate()
+                .map_err(|error| anyhow::anyhow!("bucket {id:?}: {error}"))?;
+            bucket.queue = Some(Arc::new(BucketQueue::new(id.clone(), queue.clone())));
+        }
         bucket.max_context_tokens = spec.max_context_tokens;
         bucket.ttft_ms = spec.ttft_ms;
         bucket.tokens_per_second = spec.tokens_per_second;
@@ -453,6 +463,7 @@ mod tests {
             plain.estimator.is_none(),
             "length-only buckets keep no sessions"
         );
+        assert!(plain.buckets[0].queue.is_none());
         for invalid in [
             serde_json::json!({"buckets": [{"id": "x", "min_uncached_tokens": 9, "max_uncached_tokens": 8, "plain": {}}]}),
             serde_json::json!({"buckets": [{"id": "x", "max_uncached_tokens": 0, "plain": {}}]}),
@@ -460,6 +471,28 @@ mod tests {
         ] {
             assert!(build_resolver(&model(invalid), &state, None).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn a_bucket_queue_is_built_from_its_spec_and_validated() {
+        let state = KvEventIndex::new();
+        let build = |queue: serde_json::Value| {
+            let mut model = test_model(serde_json::json!({"buckets": [
+                {"id": "S", "max_uncached_tokens": 32000, "queue": queue, "plain": {}}
+            ]}));
+            model.policy = PolicyKind::PowerOfTwo;
+            build_resolver(&model, &state, None).map(|(resolver, _)| resolver)
+        };
+        let resolver = build(serde_json::json!(
+            {"mean_wait_s": 4.0, "rate_tokens_per_s": 20000, "rate_requests_per_s": 3.0}
+        ))
+        .unwrap();
+        let queue = resolver.buckets[0].queue.as_ref().unwrap();
+        assert_eq!((queue.id.as_str(), queue.spec.deadline_factor), ("S", 2.3));
+        assert!(build(serde_json::json!(
+            {"mean_wait_s": -1, "rate_tokens_per_s": 1, "rate_requests_per_s": 1}
+        ))
+        .is_err());
     }
 
     #[test]

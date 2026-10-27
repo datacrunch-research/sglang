@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use crate::discovery::{ModelId, WorkerId};
 use crate::policies_reorg::{Pick, PickError, PickRequest, Policy, Stage};
+use crate::server::bucket_admission::BucketQueue;
 use crate::state::kv_events::CacheNamespace;
 use crate::state::session_estimator::SessionEstimator;
 use crate::workers::{paired_prefills, Worker, WorkerRegistry};
@@ -171,6 +172,9 @@ pub struct Bucket {
     pub ttft_ms: Option<u64>,
     pub tokens_per_second: Option<f64>,
     pub groups: BucketGroups,
+    /// Bounded prefill work with a wait deadline; without it a bucket that
+    /// cannot place a request passes it to the next fitting bucket.
+    pub queue: Option<Arc<BucketQueue>>,
 }
 
 impl Bucket {
@@ -184,6 +188,7 @@ impl Bucket {
             ttft_ms: None,
             tokens_per_second: None,
             groups,
+            queue: None,
         }
     }
 
@@ -230,6 +235,19 @@ impl Bucket {
                 &decode.members(workers, model, Stage::Decode),
             )
             .is_empty(),
+        }
+    }
+
+    /// Engines that can serve this bucket now: plain members, or prefill
+    /// members with a decode in their version group. Its queue depth scales with them.
+    pub fn ready_members(&self, workers: &WorkerRegistry, model: &ModelId) -> usize {
+        match &self.groups {
+            BucketGroups::Plain(group) => group.members(workers, model, Stage::Plain).len(),
+            BucketGroups::Pd { prefill, decode } => paired_prefills(
+                prefill.members(workers, model, Stage::Prefill),
+                &decode.members(workers, model, Stage::Decode),
+            )
+            .len(),
         }
     }
 
