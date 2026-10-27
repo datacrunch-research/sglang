@@ -2418,6 +2418,56 @@ class TestHiCacheArgs(CustomTestCase):
                     ):
                         handle_hicache(args)
 
+    def test_dcp_decode_storage_requires_wait_complete_without_offload(self):
+        """A DCP decode server must not promise prefill an L3 span it may not load."""
+        base = dict(
+            disaggregation_mode="decode",
+            hicache_storage_backend="file",
+            dcp_size=8,
+            tp_size=8,
+        )
+        hicache = dict(enable_hierarchical_cache=True)
+        rejected = (
+            ("wait_complete", dict(hicache, hicache_storage_prefetch_policy="timeout")),
+            (
+                "wait_complete",
+                dict(hicache, hicache_storage_prefetch_policy="best_effort"),
+            ),
+            (
+                "decode offload",
+                dict(
+                    disaggregation_decode_enable_offload_kvcache=True,
+                    hicache_storage_prefetch_policy="wait_complete",
+                ),
+            ),
+        )
+        accepted = (
+            dict(hicache, hicache_storage_prefetch_policy="wait_complete"),
+            dict(
+                hicache,
+                hicache_storage_prefetch_policy="best_effort",
+                disaggregation_mode="prefill",
+            ),
+            dict(
+                hicache,
+                hicache_storage_prefetch_policy="timeout",
+                dcp_size=1,
+                tp_size=1,
+            ),
+        )
+        with patch(
+            "sglang.srt.arg_groups.hicache_hook.use_mla_backend", return_value=True
+        ):
+            for message, overrides in rejected:
+                with (
+                    self.subTest(rejected=overrides),
+                    self.assertRaisesRegex(NotImplementedError, message),
+                ):
+                    handle_hicache(self._make_args(**{**base, **overrides}))
+            for overrides in accepted:
+                with self.subTest(accepted=overrides):
+                    handle_hicache(self._make_args(**{**base, **overrides}))
+
     def test_buffer_only_resolves_write_back_to_write_through(self):
         """buffer_only has no retained host tier for write_back to defer
         writes into, so the mode resolves that policy to write_through

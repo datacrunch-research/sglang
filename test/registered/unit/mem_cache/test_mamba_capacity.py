@@ -2,14 +2,19 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeReqToTokenPool,
+    HiCacheRestoreResult,
     HybridMambaDecodeReqToTokenPool,
 )
+from sglang.srt.disaggregation.decode_hicache_mixin import DecodePrefixMatch
 from sglang.srt.mem_cache.allocation import alloc_req_slots, ensure_mamba_capacity
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -239,6 +244,7 @@ class TestMambaCapacity(unittest.TestCase):
             enable_priority_scheduling=False,
             enable_hisparse=False,
             enable_lora=False,
+            enable_decode_hicache=False,
         )
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
@@ -276,6 +282,118 @@ class TestMambaCapacity(unittest.TestCase):
         self.assertEqual(queue.retracted_queue, [req])
         self.assertTrue(req.is_retracted)
         queue._pre_alloc.assert_not_called()
+
+    def test_pd_restore_promise_keeps_a_canonical_state_slot(self):
+        """Decode must not promise prefill a host/L3 prefix whose hybrid restore has
+        no free state slot besides the live one: the restore fails after prefill
+        has skipped those tokens."""
+        for case, free, release, pending, expected in (
+            ("fits", 2, 0, False, 6),
+            ("full", 1, 0, False, 2),
+            ("reclaim", 1, 1, False, 6),
+            ("pending_restore", 2, 0, True, 2),
+        ):
+            with self.subTest(case=case):
+                pool, held = make_pool(free)
+                pool.mamba_initial_tracking_slots = 0
+                pool.req_to_token = torch.arange(10, 18).reshape(1, 8)
+                cache = make_cache(pool, held, release)
+                cache.hicache_storage_pass_prefix_keys = False
+                cache.get_last_hash_value = lambda _: "h2"
+                cache.prefetch_from_storage = MagicMock()
+                cache.has_ongoing_prefetch = lambda _: True
+                req = SimpleNamespace(
+                    rid=case,
+                    cache_request_handle=CacheRequestHandle(case, 0),
+                    origin_input_ids=list(range(8)),
+                    output_ids=[],
+                    finished_reason=None,
+                    extra_key=None,
+                    cache_salt=None,
+                    kv=SimpleNamespace(
+                        req_pool_idx=0,
+                        cache_protected_len=0,
+                        holds_mamba=False,
+                        mamba_ping_pong_track_buffer=None,
+                    ),
+                )
+                decode_req = SimpleNamespace(
+                    req=req, waiting_for_input=True, is_rebootstrap=False
+                )
+                # L1 2 + L2 2 + L3 2 tokens: L2 and L3 need a local restore.
+                prefix_match = DecodePrefixMatch(
+                    prefix_indices=torch.tensor([10, 11]),
+                    l2_host_hit_length=2,
+                    l3_storage_hit_length=2,
+                    last_device_node=11,
+                    last_host_node=22,
+                )
+                queued_restore = SimpleNamespace(
+                    prefix_match=DecodePrefixMatch(torch.tensor([]), 2, 0, 0),
+                    hicache_restore_status=HiCacheRestoreResult.PENDING,
+                    hicache_restore_lock=None,
+                )
+                queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+                queue.pp_size = 1
+                queue.queue = [decode_req]
+                queue.pending_reqs = []
+                queue.req_to_token_pool = pool
+                queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
+                    available_size=lambda: 1
+                )
+                queue.tree_cache = cache
+                queue.transfer_queue = SimpleNamespace(
+                    queue=[queued_restore] if pending else []
+                )
+                queue.scheduler = SimpleNamespace(
+                    running_batch=SimpleNamespace(reqs=[]),
+                    enable_priority_scheduling=False,
+                    enable_hisparse=False,
+                    enable_lora=False,
+                    enable_decode_hicache=True,
+                )
+                queue.token_to_kv_pool_allocator = SimpleNamespace(
+                    page_size=1, translate_kv_indices_for_transfer=lambda x: x
+                )
+                queue.kv_manager = SimpleNamespace(
+                    kv_args=SimpleNamespace(state_types=[])
+                )
+                queue._resolve_pending_reqs = MagicMock()
+                queue._update_handshake_waiters = MagicMock()
+                queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+                queue._uses_swa_reservation = MagicMock(return_value=False)
+                queue._allocatable_token_budgets = MagicMock(return_value=4096)
+                queue._rebootstrap_prefill_len = lambda r: len(r.origin_input_ids)
+                queue._match_prefix_and_lock = MagicMock(return_value=prefix_match)
+                queue._pre_alloc_fill_len = lambda r: len(r.origin_input_ids)
+                queue._required_alloc_tokens = MagicMock(return_value=8)
+                queue._required_admission_tokens = MagicMock(return_value=8)
+                queue._prealloc_reservation_fits = MagicMock(return_value=True)
+                promised = []
+                sent = []
+
+                def pre_alloc(_req, _indices, _l1, total):
+                    promised.append(total)
+                    return torch.arange(10 + total, 18)
+
+                def send(_decode_req, indices, _page_size, _state, **metadata):
+                    sent.append((indices.tolist(), metadata["decode_prefix_len"]))
+
+                queue._pre_alloc = pre_alloc
+                queue._send_kv_metadata = send
+                with patch(
+                    "sglang.srt.disaggregation.decode.get_disagg",
+                    return_value=SimpleNamespace(
+                        disaggregation_decode_host_receive_threshold=1,
+                        disaggregation_decode_enable_radix_cache=True,
+                    ),
+                ):
+                    self.assertEqual(queue.pop_preallocated(), ([decode_req], []))
+                self.assertEqual(promised, [expected])
+                self.assertEqual(sent, [(list(range(10 + expected, 18)), expected)])
+                self.assertEqual(req.kv.cache_protected_len, expected)
+                if expected == 2:
+                    cache.prefetch_from_storage.assert_not_called()
 
 
 if __name__ == "__main__":

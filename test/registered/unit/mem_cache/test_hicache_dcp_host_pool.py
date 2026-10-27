@@ -21,6 +21,8 @@ from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -477,6 +479,87 @@ class TestLayerShardedHostTransfers(CustomTestCase):
                 buffer[destination], torch.full((64, 1, 12), value, dtype=torch.float16)
             )
             self.assertEqual(torch.count_nonzero(buffer[64:]).item(), 0)
+
+
+class TestDcpDecodeStorageAttach(CustomTestCase):
+    """A DCP decode server promises prefill its probed L3 span before the read
+    completes, so runtime attach must not leave an early-stopping prefetch policy."""
+
+    @staticmethod
+    def _attachment(*, attached, current):
+        controller = SimpleNamespace(
+            storage_backend_type="file",
+            write_policy="write_back",
+            mem_pool_host=SimpleNamespace(entries=[]),
+            attach_storage_backend=mock.Mock(),
+        )
+        cache = SimpleNamespace(
+            cache_controller=controller,
+            enable_storage=attached,
+            prefetch_stop_policy=current,
+            write_through_threshold=2,
+            is_write_back=True,
+            host_memory_mode="cache",
+            components={},
+            tree_core=SimpleNamespace(is_write_through_compatible=lambda: True),
+            _enable_metrics_flag=False,
+            extra_metric_labels=None,
+        )
+        return StorageAttachment(cache), cache, controller
+
+    def test_decode_attach_uses_effective_prefetch_policy(self):
+        for attached in (False, True):
+            for role, dcp_size, current, requested, accepted in (
+                ("decode", 2, "wait_complete", "best_effort", False),
+                ("decode", 2, "wait_complete", "timeout", False),
+                ("decode", 2, "timeout", None, False),
+                ("decode", 2, "timeout", "wait_complete", True),
+                ("decode", 2, "wait_complete", None, True),
+                ("prefill", 2, "best_effort", "timeout", True),
+                ("decode", 1, "best_effort", "timeout", True),
+            ):
+                attachment, cache, controller = self._attachment(
+                    attached=attached, current=current
+                )
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    disaggregation_mode=role,
+                    dcp_size=dcp_size,
+                    tp_size=dcp_size,
+                    hicache_storage_prefetch_policy=current,
+                )
+                with (
+                    self.subTest(
+                        attached=attached,
+                        role=role,
+                        dcp_size=dcp_size,
+                        current=current,
+                        requested=requested,
+                    ),
+                    mock.patch(
+                        "sglang.srt.runtime_context.get_parallel",
+                        return_value=SimpleNamespace(attn_dcp_size=dcp_size),
+                    ),
+                    mock.patch(
+                        "sglang.srt.runtime_context.get_server_args",
+                        return_value=server_args,
+                    ),
+                    mock.patch.object(attachment, "apply_runtime_config"),
+                ):
+                    ok, reason = attachment.attach(
+                        "file", hicache_storage_prefetch_policy=requested
+                    )
+                    self.assertEqual(ok, accepted, reason)
+                    if accepted:
+                        self.assertEqual(
+                            cache.prefetch_stop_policy, requested or current
+                        )
+                        continue
+                    self.assertIn("wait_complete", reason)
+                    # A refused request changes nothing.
+                    self.assertEqual(cache.prefetch_stop_policy, current)
+                    self.assertEqual(cache.enable_storage, attached)
+                    controller.attach_storage_backend.assert_not_called()
 
 
 if __name__ == "__main__":

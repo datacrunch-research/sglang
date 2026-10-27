@@ -264,6 +264,9 @@ class InitLoadBackParams:
     host_hit_length: int
     mem_quota: Optional[int] = None
     req: Optional[Req] = None
+    # P/D decode receives the request's live state from prefill; restore the
+    # canonical cache state without copying an older checkpoint into its slot.
+    restore_request_state: bool = True
 
 
 class MatchResult(NamedTuple):
