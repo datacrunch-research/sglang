@@ -262,6 +262,18 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route(
             crate::state::kv_events::bootstrap::SNAPSHOT_PATH,
             get(crate::server::routes::cache::kv_snapshot),
+        )
+        .route(
+            crate::server::routes::cell::PREFIX_MATCH_PATH,
+            post(crate::server::routes::cell::prefix_match),
+        )
+        .route(
+            crate::server::routes::cell::CELL_LOAD_PATH,
+            get(crate::server::routes::cell::cell_load),
+        )
+        .route(
+            crate::server::routes::cell::CELL_INFO_PATH,
+            get(crate::server::routes::cell::cell_info),
         );
     // A route that panics on purpose, so the panic-handling layers below are
     // exercised as `build_router` actually composes them. Without it the layers

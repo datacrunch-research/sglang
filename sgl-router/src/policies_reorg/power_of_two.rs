@@ -34,6 +34,10 @@ impl PowerOfTwoPolicy {
 }
 
 impl Policy for PowerOfTwoPolicy {
+    fn admission(&self) -> Option<&dyn EngineAdmission> {
+        Some(self.admission.as_ref())
+    }
+
     fn pick<'a>(
         &'a self,
         engines: &'a [Arc<Worker>],
