@@ -189,15 +189,25 @@ class CuteDslMLAVarSplitDecode:
             )
         )
 
-    def _kernel(self, q_dtype: torch.dtype, out_dtype: torch.dtype):
-        key = (q_dtype, out_dtype)
+    def _kernel(
+        self,
+        q_dtype: torch.dtype,
+        out_dtype: torch.dtype,
+        is_workspace_size_zero: bool = False,
+    ):
+        key = (q_dtype, out_dtype, is_workspace_size_zero)
         k = self._kernels.get(key)
         if k is None:
-            k = self._compile(q_dtype, out_dtype)
+            k = self._compile(q_dtype, out_dtype, is_workspace_size_zero)
             self._kernels[key] = k
         return k
 
-    def _compile(self, q_dtype: torch.dtype, out_dtype: torch.dtype):
+    def _compile(
+        self,
+        q_dtype: torch.dtype,
+        out_dtype: torch.dtype,
+        is_workspace_size_zero: bool = False,
+    ):
         patched = _skip_empty_split_stores_enabled() and q_dtype == torch.float8_e4m3fn
         orig = self._impl.BlackwellMultiHeadLatentAttentionForwardFP8
         compile_fn = self._impl._get_compiled_mla_kernel
@@ -225,7 +235,7 @@ class CuteDslMLAVarSplitDecode:
                 reducer_d_tiles=1,
                 reducer_max_splits=self._max_splits,
                 skip_correction_threshold=0.0,
-                is_workspace_size_zero=False,
+                is_workspace_size_zero=is_workspace_size_zero,
                 enable_pdl=self.enable_pdl,
                 enable_dcp=True,
                 cp_world=self.cp_world,
@@ -254,6 +264,10 @@ class CuteDslMLAVarSplitDecode:
         if kv_cache.dim() == 4:
             kv_cache = kv_cache.squeeze(1)
         ws_bytes = self.workspace_bytes(bsz, smax)
+        # A single split has no partial-result workspace. Match the provider's
+        # None specialization rather than passing a zero-length tensor to a
+        # kernel compiled to read and write intermediate results.
+        is_workspace_size_zero = ws_bytes == 0
         if workspace.numel() < ws_bytes:
             raise ValueError(
                 f"var-split workspace too small: {workspace.numel()} < {ws_bytes}"
@@ -266,7 +280,7 @@ class CuteDslMLAVarSplitDecode:
         lse = torch.empty(
             (bsz, 1, self.num_heads), dtype=torch.float32, device=query.device
         )
-        self._kernel(query.dtype, out_dtype)(
+        self._kernel(query.dtype, out_dtype, is_workspace_size_zero)(
             query[..., :L],
             query[..., L:],
             kv_cache[:, :, :L],
@@ -274,13 +288,15 @@ class CuteDslMLAVarSplitDecode:
             block_tables,
             out,
             lse,
-            workspace[:ws_bytes],
+            None if is_workspace_size_zero else workspace[:ws_bytes],
             Int32(smax),
             seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32),
             None,
-            causal_seqs
-            if causal_seqs.dtype == torch.int32
-            else causal_seqs.to(torch.int32),
+            (
+                causal_seqs
+                if causal_seqs.dtype == torch.int32
+                else causal_seqs.to(torch.int32)
+            ),
             Int32(cp_rank),
             block_split_kvs,
             Float32(softmax_scale),
