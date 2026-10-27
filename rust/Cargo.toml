@@ -61,3 +61,7 @@ codegen-units = 1
 [profile.dev]
 opt-level = 0
 debug = 1
+
+[patch.crates-io]
+# Keep the tokenizer shared by direct and renderer dependencies on one pinned revision.
+dynamo-tokenizers = { git = "https://github.com/Venkat2811/frontend-crates.git", rev = "34e5627943637971f1a118973e54022ad12f819f" }
