@@ -9,6 +9,7 @@ pub mod bucket_admission;
 pub mod error;
 pub mod grpc;
 pub mod header_utils;
+pub mod histogram;
 pub mod inflight;
 pub mod logging;
 pub mod metrics;

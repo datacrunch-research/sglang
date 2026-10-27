@@ -278,6 +278,14 @@ pub fn build_resolver(
             bucket.queue = Some(Arc::new(BucketQueue::new(id.clone(), queue.clone())));
         }
         bucket.spill_to = spec.spill_to.iter().map(SpillTarget::new).collect();
+        if let Some(decode) = &spec.decode {
+            let defaults = &model.reorg_admission;
+            bucket.decode_permits_per_engine = decode
+                .admission
+                .as_ref()
+                .map_or_else(|| defaults.clone(), |limits| limits.or(defaults))
+                .max_inflight_requests;
+        }
         bucket.max_context_tokens = spec.max_context_tokens;
         bucket.ttft_ms = spec.ttft_ms;
         bucket.tokens_per_second = spec.tokens_per_second;

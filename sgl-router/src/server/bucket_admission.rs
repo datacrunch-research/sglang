@@ -25,8 +25,14 @@ use serde::Deserialize;
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
+use std::fmt::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::discovery::WorkerMode;
 use crate::server::app_context::{AppContext, ChatRouting};
-use crate::workers::WorkerRegistry;
+use crate::server::histogram::Histogram;
+use crate::server::metrics::escape_label;
+use crate::workers::{MembershipEvent, WorkerRegistry};
 
 /// How often a waiting request re-checks engine admission: engine load
 /// reports change without notifying the queue. Arbitrary; well under a band.
@@ -148,10 +154,37 @@ struct QueueState {
     requests: u64,
 }
 
+/// Seconds from arrival to an engine pick.
+static WAIT_BOUNDS: [f64; 14] = [
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 6.0, 10.0, 15.0, 30.0,
+];
+static RETRY_AFTER_BOUNDS: [f64; 8] = [1.0, 2.0, 3.0, 5.0, 10.0, 15.0, 20.0, 30.0];
+
+#[derive(Debug)]
+pub struct QueueStats {
+    pub admitted: AtomicU64,
+    /// Indexed by [`RejectReason`] in declaration order.
+    pub rejected: [AtomicU64; 3],
+    pub wait_seconds: Histogram,
+    pub retry_after_seconds: Histogram,
+}
+
+impl Default for QueueStats {
+    fn default() -> Self {
+        Self {
+            admitted: AtomicU64::new(0),
+            rejected: Default::default(),
+            wait_seconds: Histogram::new(&WAIT_BOUNDS),
+            retry_after_seconds: Histogram::new(&RETRY_AFTER_BOUNDS),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct BucketQueue {
     pub id: String,
     pub spec: QueueSpec,
+    pub stats: QueueStats,
     state: Mutex<QueueState>,
     changed: Notify,
 }
@@ -161,6 +194,7 @@ impl BucketQueue {
         Self {
             id: id.into(),
             spec,
+            stats: QueueStats::default(),
             state: Mutex::new(QueueState::default()),
             changed: Notify::new(),
         }
@@ -223,12 +257,14 @@ impl BucketQueue {
         if runner_free || within_depth {
             state.tokens = state.tokens.saturating_add(tokens);
             state.requests += 1;
+            self.stats.admitted.fetch_add(1, Ordering::Relaxed);
             return Ok(BucketSlot {
                 queue: Arc::clone(self),
                 tokens,
             });
         }
         let retry_after_s = self.drain_seconds(&state, depth, tokens);
+        self.count_rejection(RejectReason::Full, retry_after_s);
         Err(BucketRejection {
             bucket: self.id.clone(),
             reason: RejectReason::Full,
@@ -272,6 +308,7 @@ impl BucketQueue {
             RejectReason::DecodePermits => self.spec.decode_retry_after_s,
             _ => self.spec.deadline_retry_after_s,
         };
+        self.count_rejection(reason, retry_after_s);
         BucketRejection {
             bucket: self.id.clone(),
             reason,
@@ -281,6 +318,16 @@ impl BucketQueue {
             uncached_tokens: tokens,
             waited,
         }
+    }
+
+    fn count_rejection(&self, reason: RejectReason, retry_after_s: u64) {
+        self.stats.rejected[reason as usize].fetch_add(1, Ordering::Relaxed);
+        self.stats.retry_after_seconds.observe(retry_after_s as f64);
+    }
+
+    /// Record an admitted request's wait from arrival to its engine pick.
+    pub fn record_wait(&self, waited: Duration) {
+        self.stats.wait_seconds.observe(waited.as_secs_f64());
     }
 
     /// Wait until work leaves the bucket, members join, or one engine poll
@@ -356,6 +403,194 @@ pub fn spawn_membership_watch(ctx: Arc<AppContext>) -> Option<tokio::task::JoinH
             }
         })
     })
+}
+
+const REASONS: [RejectReason; 3] = [
+    RejectReason::Full,
+    RejectReason::Deadline,
+    RejectReason::DecodePermits,
+];
+
+/// The bucket, decode-permit, session-estimate and membership series, pulled
+/// on scrape. Empty under legacy routing.
+pub fn render_metrics(ctx: &AppContext) -> String {
+    let ChatRouting::Reorg(resolvers) = &ctx.chat_routing else {
+        return String::new();
+    };
+    let mut out = String::new();
+    let queues: Vec<_> = resolvers
+        .values()
+        .flat_map(|resolver| resolver.buckets.iter())
+        .filter_map(|bucket| bucket.queue.as_ref())
+        .collect();
+    let mut family =
+        |name: &str, kind: &str, help: &str, rows: &mut dyn Iterator<Item = String>| {
+            let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} {kind}");
+            for row in rows {
+                out.push_str(&row);
+            }
+        };
+    type Gauge = fn(&BucketQueue) -> u64;
+    let gauges: [(&str, &str, Gauge); 5] = [
+        ("sgl_router_bucket_queue_tokens", "Uncached prompt tokens admitted to the bucket and not yet through prefill.", |q| q.outstanding().0),
+        ("sgl_router_bucket_queue_requests", "Requests admitted to the bucket and not yet through prefill.", |q| q.outstanding().1),
+        ("sgl_router_bucket_depth_tokens", "Most uncached tokens the bucket holds before answering 429: members x rate x mean wait.", |q| q.depth().tokens),
+        ("sgl_router_bucket_depth_requests", "Most requests the bucket holds before answering 429 (each member may also run one).", |q| q.depth().requests),
+        ("sgl_router_bucket_members", "Ready engines the bucket's depth scales with.", BucketQueue::members),
+    ];
+    for (name, help, value) in gauges {
+        family(
+            name,
+            "gauge",
+            help,
+            &mut queues.iter().map(|q| {
+                format!(
+                    "{name}{{bucket=\"{}\"}} {}\n",
+                    escape_label(&q.id),
+                    value(q)
+                )
+            }),
+        );
+    }
+    family(
+        "sgl_router_bucket_admitted_total",
+        "counter",
+        "Requests admitted to the bucket's queue.",
+        &mut queues.iter().map(|q| {
+            format!(
+                "sgl_router_bucket_admitted_total{{bucket=\"{}\"}} {}\n",
+                escape_label(&q.id),
+                q.stats.admitted.load(Ordering::Relaxed)
+            )
+        }),
+    );
+    family(
+        "sgl_router_bucket_rejected_total",
+        "counter",
+        "Requests the bucket answered 429, by reason.",
+        &mut queues.iter().flat_map(|q| {
+            REASONS.iter().map(move |reason| {
+                format!(
+                    "sgl_router_bucket_rejected_total{{bucket=\"{}\",reason=\"{}\"}} {}\n",
+                    escape_label(&q.id),
+                    reason.label(),
+                    q.stats.rejected[*reason as usize].load(Ordering::Relaxed)
+                )
+            })
+        }),
+    );
+    let spills: Vec<_> = resolvers
+        .values()
+        .flat_map(|resolver| resolver.buckets.iter())
+        .flat_map(|bucket| bucket.spill_to.iter().map(move |target| (bucket, target)))
+        .collect();
+    family(
+        "sgl_router_bucket_spill_total",
+        "counter",
+        "Requests a bucket placed on an idle engine of a longer bucket.",
+        &mut spills.iter().map(|(bucket, target)| {
+            format!(
+                "sgl_router_bucket_spill_total{{from=\"{}\",to=\"{}\"}} {}\n",
+                escape_label(&bucket.id),
+                escape_label(&target.bucket),
+                target.spilled.load(Ordering::Relaxed)
+            )
+        }),
+    );
+    let (permits, running) = decode_permits(ctx);
+    family(
+        "sgl_router_decode_permits",
+        "gauge",
+        "Sum over ready decode engines of their bucket group's max_inflight_requests; -1 when a group sets none.",
+        &mut std::iter::once(format!("sgl_router_decode_permits {permits}\n")),
+    );
+    family(
+        "sgl_router_decode_running",
+        "gauge",
+        "Requests this router has in flight on each decode engine.",
+        &mut running.into_iter().map(|(worker, count)| {
+            format!(
+                "sgl_router_decode_running{{worker=\"{}\"}} {count}\n",
+                escape_label(&worker)
+            )
+        }),
+    );
+    family(
+        "sgl_router_membership_events_total",
+        "counter",
+        "Discovery events applied to the worker registry, by kind.",
+        &mut MembershipEvent::ALL.iter().map(|event| {
+            format!(
+                "sgl_router_membership_events_total{{kind=\"{}\"}} {}\n",
+                event.label(),
+                ctx.registry.membership.count(*event)
+            )
+        }),
+    );
+    for (name, help, histogram) in [
+        (
+            "sgl_router_bucket_queue_wait_seconds",
+            "Seconds from arrival to an engine pick, for requests a bucket admitted.",
+            (|q: &BucketQueue| &q.stats.wait_seconds) as fn(&BucketQueue) -> &Histogram,
+        ),
+        (
+            "sgl_router_retry_after_seconds",
+            "Retry-After seconds sent with the bucket's 429s.",
+            |q: &BucketQueue| &q.stats.retry_after_seconds,
+        ),
+    ] {
+        let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} histogram");
+        for q in &queues {
+            histogram(q).render(
+                &mut out,
+                name,
+                &format!("bucket=\"{}\"", escape_label(&q.id)),
+            );
+        }
+    }
+    for resolver in resolvers.values() {
+        if let Some(estimator) = &resolver.estimator {
+            let name = "sgl_router_session_uncached_estimate_error";
+            let _ = writeln!(
+                out,
+                "# HELP {name} Router uncached estimate minus the engine's reported uncached tokens (prompt minus cached), per completed turn.\n# TYPE {name} histogram"
+            );
+            estimator.estimate_error.render(&mut out, name, "");
+        }
+    }
+    out
+}
+
+/// Decode permits over ready decode engines of PD buckets, each engine
+/// counted once with the first bucket's cap, and the router's in-flight count
+/// per decode engine.
+fn decode_permits(ctx: &AppContext) -> (i64, Vec<(String, usize)>) {
+    let ChatRouting::Reorg(resolvers) = &ctx.chat_routing else {
+        return (0, Vec::new());
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut permits = 0i64;
+    for (model, resolver) in resolvers {
+        for bucket in &resolver.buckets {
+            for engine in bucket.ready_decode_members(&ctx.registry, model) {
+                if seen.insert(engine.id.clone()) {
+                    permits = match (permits, bucket.decode_permits_per_engine) {
+                        (-1, _) | (_, None) => -1,
+                        (sum, Some(cap)) => sum.saturating_add(cap as i64),
+                    };
+                }
+            }
+        }
+    }
+    let mut running: Vec<_> = ctx
+        .registry
+        .all()
+        .into_iter()
+        .filter(|worker| worker.mode() == WorkerMode::Decode)
+        .map(|worker| (worker.id.0.clone(), worker.router_inflight_load()))
+        .collect();
+    running.sort();
+    (permits, running)
 }
 
 /// Admitted work in a bucket; released when dropped, which the router does

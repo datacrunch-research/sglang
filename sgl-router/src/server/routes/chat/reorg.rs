@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use super::forward::SelectedWorkers;
+use super::forward::{BucketRouting, SelectedWorkers};
 use super::preparation::{session_id_header, PreparedRequest};
 use super::{
     nonempty_header, parse_optional_positive_f64_header, parse_optional_positive_u64_header,
@@ -96,7 +96,10 @@ pub(super) async fn select_workers(
             .and_then(|config| nonempty_header(headers, &config.header_name)),
         excluded,
     };
-    let selected = |picks: BucketPick, bucket_slot: Option<BucketSlot>| {
+    let selected = |picks: BucketPick,
+                    bucket_slot: Option<BucketSlot>,
+                    bucket: &str,
+                    queue_wait: Option<std::time::Duration>| {
         if let (Some(scope), Some((estimator, Some(key), estimate))) = (&request.scope, &session) {
             scope.life.track_session_turn(PendingTurn {
                 estimator: Arc::clone(estimator),
@@ -116,13 +119,18 @@ pub(super) async fn select_workers(
             decode: picks.decode.map(|pick| pick.engine),
             track_dispatch_timestamps: false,
             bucket_slot,
+            routing: Some(BucketRouting {
+                bucket: bucket.to_owned(),
+                uncached_tokens,
+                queue_wait,
+            }),
         }
     };
     // A queued home bucket keeps the request: it waits there for an engine.
     let home = buckets[0];
     if let Some(queue) = &home.queue {
         let tokens = uncached_tokens.unwrap_or(input_tokens);
-        let (picks, slot) = pick_queued(
+        let (picks, slot, waited) = pick_queued(
             ctx,
             resolver,
             home,
@@ -132,13 +140,13 @@ pub(super) async fn select_workers(
             &request.model,
         )
         .await?;
-        return Ok(selected(picks, Some(slot)));
+        return Ok(selected(picks, Some(slot), &home.id, Some(waited)));
     }
     let mut rejections: Option<Vec<_>> = None;
     let mut missing_stage = None;
     for bucket in buckets {
         match bucket.pick_engines(&ctx.registry, &bucket_request).await {
-            Ok(picks) => return Ok(selected(picks, None)),
+            Ok(picks) => return Ok(selected(picks, None, &bucket.id, None)),
             Err((stage, error)) => {
                 tracing::debug!(bucket = %bucket.id, ?stage, %error, "bucket selection failed");
                 match error {
@@ -155,7 +163,7 @@ pub(super) async fn select_workers(
         }
     }
     if let Some((picks, _)) = spill(ctx, resolver, home, &bucket_request).await {
-        return Ok(selected(picks, None));
+        return Ok(selected(picks, None, &home.id, None));
     }
     // Preserve admission exhaustion even if a later bucket has no candidates.
     let error = match rejections {
@@ -176,7 +184,7 @@ async fn pick_queued(
     request: &BucketRequest<'_>,
     tokens: u64,
     model: &ModelId,
-) -> Result<(BucketPick, BucketSlot), ApiError> {
+) -> Result<(BucketPick, BucketSlot, std::time::Duration), ApiError> {
     queue.set_members(home.ready_members(&ctx.registry, model) as u64);
     let arrived = Instant::now();
     let slot = queue
@@ -185,7 +193,10 @@ async fn pick_queued(
     let deadline = arrived + queue.deadline();
     loop {
         match home.pick_engines(&ctx.registry, request).await {
-            Ok(picks) => return Ok((picks, slot)),
+            Ok(picks) => {
+                queue.record_wait(arrived.elapsed());
+                return Ok((picks, slot, arrived.elapsed()));
+            }
             Err((
                 stage,
                 PickError::NoCandidates
@@ -194,7 +205,8 @@ async fn pick_queued(
             )) => {
                 // Before waiting, an idle engine of a longer bucket may take it.
                 if let Some((picks, _)) = spill(ctx, resolver, home, request).await {
-                    return Ok((picks, slot));
+                    queue.record_wait(arrived.elapsed());
+                    return Ok((picks, slot, arrived.elapsed()));
                 }
                 if Instant::now() >= deadline {
                     let reason = match stage {

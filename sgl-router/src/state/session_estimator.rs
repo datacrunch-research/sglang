@@ -33,6 +33,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::server::histogram::Histogram;
+
 /// Keeps the map bounded when every request carries a fresh key.
 const MAX_SESSIONS: usize = 1 << 20;
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
@@ -85,11 +87,19 @@ struct Record {
     at: Instant,
 }
 
+/// Signed token error bounds for the estimate-error histogram.
+static ERROR_BOUNDS: [f64; 13] = [
+    -262_144.0, -65_536.0, -16_384.0, -4_096.0, -1_024.0, -256.0, 0.0, 256.0, 1_024.0, 4_096.0,
+    16_384.0, 65_536.0, 262_144.0,
+];
+
 #[derive(Debug)]
 pub struct SessionEstimator {
     sessions: DashMap<String, Record>,
     idle: Duration,
     last_sweep: Mutex<Instant>,
+    /// Estimate minus the engine's reported uncached tokens, per completed turn.
+    pub estimate_error: Histogram,
 }
 
 impl SessionEstimator {
@@ -98,6 +108,7 @@ impl SessionEstimator {
             sessions: DashMap::new(),
             idle,
             last_sweep: Mutex::new(Instant::now()),
+            estimate_error: Histogram::new(&ERROR_BOUNDS),
         }
     }
 
@@ -149,6 +160,11 @@ impl SessionEstimator {
         engine_prompt_tokens: Option<u64>,
         engine_cached_tokens: Option<u64>,
     ) {
+        if let (Some(prompt), Some(cached)) = (engine_prompt_tokens, engine_cached_tokens) {
+            let actual = prompt.saturating_sub(cached);
+            self.estimate_error
+                .observe(estimate.uncached_tokens as f64 - actual as f64);
+        }
         let previous = self.sessions.get(key).map(|record| record.scale);
         let scale = match engine_prompt_tokens {
             Some(engine) if engine > 0 && prompt_tokens > 0 => {
@@ -426,6 +442,25 @@ mod tests {
         // One absurd report is clamped.
         estimator.observe("h:a", 88_000, delta(5_000), Some(10_000_000), None);
         assert_eq!(estimator.estimate(Some("h:a"), 88_001).uncached_tokens, 4);
+    }
+
+    #[test]
+    fn each_reported_turn_records_its_estimate_error() {
+        let estimator = estimator();
+        estimator.observe("h:a", 100_000, cold(100_000), Some(100_000), Some(0));
+        estimator.observe("h:a", 103_000, delta(3_000), Some(103_000), Some(99_000));
+        estimator.observe("h:a", 104_000, delta(1_000), None, None);
+        assert_eq!(
+            estimator.estimate_error.count(),
+            2,
+            "unreported turns are skipped"
+        );
+        let mut out = String::new();
+        estimator.estimate_error.render(&mut out, "e", "");
+        // Errors 0 and -1,000 tokens.
+        assert!(out.contains("e_bucket{le=\"-1024\"} 0\n"), "{out}");
+        assert!(out.contains("e_bucket{le=\"0\"} 2\n"), "{out}");
+        assert!(out.contains("e_sum -1000\n"), "{out}");
     }
 
     #[test]

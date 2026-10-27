@@ -14,7 +14,7 @@ use crate::proxy::sse::{self, ErrorEventScanner, PumpItem, StreamEnd, StreamEndR
 use crate::proxy::Proxy;
 use crate::server::app_context::AppContext;
 use crate::server::bucket_admission::BucketSlot;
-use crate::server::error::ApiError;
+use crate::server::error::{ApiError, X_SGL_BUCKET, X_SGL_QUEUE_WAIT_MS, X_SGL_UNCACHED_ESTIMATE};
 use crate::server::metrics::{
     classify_stream_end, outcome_from_status, MetricsRegistry, RequestLogContext, RequestOutcome,
     StaleRequestOutcome, WorkerModeLabel,
@@ -51,6 +51,45 @@ pub(super) struct SelectedWorkers {
     pub(super) track_dispatch_timestamps: bool,
     /// The request's place in its bucket's queue, held until prefill is done.
     pub(super) bucket_slot: Option<BucketSlot>,
+    /// What a reorg bucket decided, returned to an HTTP client as headers.
+    pub(super) routing: Option<BucketRouting>,
+}
+
+pub(super) struct BucketRouting {
+    /// The request's own bucket, also when an idle longer bucket served it.
+    pub(super) bucket: String,
+    pub(super) uncached_tokens: Option<u64>,
+    /// Time from arrival to the engine pick, for a queued bucket.
+    pub(super) queue_wait: Option<std::time::Duration>,
+}
+
+const X_SGL_PREFILL_WORKER: HeaderName = HeaderName::from_static("x-sgl-prefill-worker");
+const X_SGL_DECODE_WORKER: HeaderName = HeaderName::from_static("x-sgl-decode-worker");
+
+/// `x-sgl-*` headers telling the client how a reorg bucket routed its request:
+/// bucket, uncached estimate, queue wait, and the engines picked.
+fn routing_headers(workers: &SelectedWorkers) -> Vec<(HeaderName, HeaderValue)> {
+    let Some(routing) = &workers.routing else {
+        return Vec::new();
+    };
+    let mut headers = Vec::new();
+    let mut push = |name: HeaderName, value: &str| {
+        if let Ok(value) = HeaderValue::from_str(value) {
+            headers.push((name, value));
+        }
+    };
+    push(X_SGL_BUCKET, &routing.bucket);
+    if let Some(tokens) = routing.uncached_tokens {
+        push(X_SGL_UNCACHED_ESTIMATE, &tokens.to_string());
+    }
+    if let Some(wait) = routing.queue_wait {
+        push(X_SGL_QUEUE_WAIT_MS, &wait.as_millis().to_string());
+    }
+    push(X_SGL_PREFILL_WORKER, &workers.prefill.id.0);
+    if let Some(decode) = &workers.decode {
+        push(X_SGL_DECODE_WORKER, &decode.id.0);
+    }
+    headers
 }
 
 /// PD sends to both workers and returns the decode response.
@@ -70,6 +109,7 @@ pub(super) async fn forward_request(
     request_started_at: Instant,
     duration: &Arc<RequestDurationGuard>,
 ) -> Result<HttpDispatched, ApiError> {
+    let routing = routing_headers(&workers);
     let dispatched = dispatch(
         Http,
         ctx,
@@ -89,6 +129,9 @@ pub(super) async fn forward_request(
         }
         Err(error) => error.into_response(),
     };
+    for (name, value) in routing {
+        response.headers_mut().insert(name, value);
+    }
     response.extensions_mut().insert(dispatched.log_context);
     Ok(HttpDispatched {
         response,
@@ -182,6 +225,7 @@ async fn dispatch<T: Transport>(
         decode,
         track_dispatch_timestamps,
         bucket_slot,
+        routing: _,
     } = workers;
     // Under PD the detached prefill holds the slot until it finishes; a plain
     // engine's prefill is over once its response arrives.

@@ -180,6 +180,8 @@ pub struct Bucket {
     /// Longer buckets whose idle engines take this bucket's requests when
     /// none of its own admits one; never the other way.
     pub spill_to: Vec<SpillTarget>,
+    /// The decode group's per-engine in-flight cap, for the permits gauge.
+    pub decode_permits_per_engine: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -244,6 +246,7 @@ impl Bucket {
             groups,
             queue: None,
             spill_to: Vec::new(),
+            decode_permits_per_engine: None,
         }
     }
 
@@ -303,6 +306,18 @@ impl Bucket {
                 &decode.members(workers, model, Stage::Decode),
             )
             .len(),
+        }
+    }
+
+    /// Ready decode engines of a P/D bucket; none for a plain one.
+    pub fn ready_decode_members(
+        &self,
+        workers: &WorkerRegistry,
+        model: &ModelId,
+    ) -> Vec<Arc<Worker>> {
+        match &self.groups {
+            BucketGroups::Plain(_) => Vec::new(),
+            BucketGroups::Pd { decode, .. } => decode.members(workers, model, Stage::Decode),
         }
     }
 
