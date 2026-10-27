@@ -40,6 +40,7 @@ pub(crate) struct Lifecycle {
     observation: Mutex<Observation>,
     prefill_observation: Mutex<Option<u64>>,
     generation_workers: Mutex<Vec<Arc<crate::workers::Worker>>>,
+    session_turn: OnceLock<crate::state::session_estimator::PendingTurn>,
 }
 impl Default for Lifecycle {
     fn default() -> Self {
@@ -55,6 +56,7 @@ impl Default for Lifecycle {
             observation: Mutex::new(Observation::default()),
             prefill_observation: Mutex::new(None),
             generation_workers: Mutex::new(Vec::new()),
+            session_turn: OnceLock::new(),
         }
     }
 }
@@ -127,6 +129,11 @@ impl Lifecycle {
         let _ = self
             .terminal
             .compare_exchange(0, 2, Ordering::Relaxed, Ordering::Relaxed);
+    }
+    /// Feed the engine's counts for this turn back to the uncached estimate
+    /// once the request has finished; the first routed attempt's turn counts.
+    pub fn track_session_turn(&self, turn: crate::state::session_estimator::PendingTurn) {
+        let _ = self.session_turn.set(turn);
     }
     pub fn bind_generation_workers(&self, workers: Vec<Arc<crate::workers::Worker>>) {
         *self.generation_workers.lock().unwrap() = workers;
@@ -211,6 +218,12 @@ impl Drop for Lifecycle {
         };
         ctx.metrics
             .record_cache_observation(&ctx.model, route.predicted, actual);
+        // Only a completed turn is in the engine's cache for the next one to extend.
+        if let Some(turn) = self.session_turn.get() {
+            if self.terminal.load(Ordering::Relaxed) == 1 && !error {
+                turn.complete(prompt_tokens, actual);
+            }
+        }
         let event = match self.terminal.load(Ordering::Relaxed) {
             1 if !error => "finish",
             3 => "error",

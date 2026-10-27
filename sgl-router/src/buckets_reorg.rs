@@ -26,6 +26,7 @@ use std::sync::Arc;
 use crate::discovery::{ModelId, WorkerId};
 use crate::policies_reorg::{Pick, PickError, PickRequest, Policy, Stage};
 use crate::state::kv_events::CacheNamespace;
+use crate::state::session_estimator::SessionEstimator;
 use crate::workers::{paired_prefills, Worker, WorkerRegistry};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -161,6 +162,9 @@ pub struct Bucket {
     pub rank: u32,
     /// Inclusive input-token range used to choose the bucket.
     pub limits: TokenLimits,
+    /// Inclusive range of estimated uncached prompt tokens; the whole prompt
+    /// counts when no estimate is supplied.
+    pub uncached: TokenLimits,
     /// Full sequence capacity, checked against the expected peak when known.
     pub max_context_tokens: Option<u64>,
     /// Optional service estimates used only for bucket ordering.
@@ -175,6 +179,7 @@ impl Bucket {
             id: id.into(),
             rank: 0,
             limits: TokenLimits::default(),
+            uncached: TokenLimits::default(),
             max_context_tokens: None,
             ttft_ms: None,
             tokens_per_second: None,
@@ -313,11 +318,26 @@ impl Bucket {
             .map_err(|error| (stage, error))
     }
 
-    fn fits(&self, input_tokens: u64, expected_peak_tokens: Option<u64>) -> bool {
+    fn fits(
+        &self,
+        input_tokens: u64,
+        uncached_tokens: Option<u64>,
+        expected_peak_tokens: Option<u64>,
+    ) -> bool {
         self.limits.fits(input_tokens)
+            && self.uncached.fits(uncached_tokens.unwrap_or(input_tokens))
             && self
                 .max_context_tokens
                 .is_none_or(|max| expected_peak_tokens.unwrap_or(input_tokens) <= max)
+    }
+
+    /// Whether the bucket is chosen on the uncached estimate.
+    pub fn bounds_uncached_tokens(&self) -> bool {
+        self.uncached.min.is_some() || self.uncached.max.is_some()
+    }
+
+    fn uncached_capacity(&self) -> u64 {
+        self.uncached.max.unwrap_or(u64::MAX)
     }
 
     fn input_capacity(&self) -> u64 {
@@ -353,6 +373,8 @@ pub struct BucketResolver {
     pub buckets: Vec<Bucket>,
     pub ttft_slo: SloPreference,
     pub tps_slo: SloPreference,
+    /// Set when a bucket bounds uncached tokens; estimates them per session.
+    pub estimator: Option<Arc<SessionEstimator>>,
 }
 
 impl BucketResolver {
@@ -382,6 +404,26 @@ impl BucketResolver {
         ttft_ms: Option<u64>,
         tokens_per_second: Option<f64>,
     ) -> Result<Vec<&Bucket>, PickError> {
+        self.resolve_uncached(
+            input_tokens,
+            None,
+            expected_peak_tokens,
+            ttft_ms,
+            tokens_per_second,
+        )
+    }
+
+    /// [`Self::resolve`] with the request's estimated uncached tokens, which
+    /// buckets bounding them are matched on. Buckets with a smaller uncached
+    /// bound order first, so the shortest fitting lane is the home bucket.
+    pub fn resolve_uncached(
+        &self,
+        input_tokens: u64,
+        uncached_tokens: Option<u64>,
+        expected_peak_tokens: Option<u64>,
+        ttft_ms: Option<u64>,
+        tokens_per_second: Option<f64>,
+    ) -> Result<Vec<&Bucket>, PickError> {
         if expected_peak_tokens.is_some_and(|tokens| tokens < input_tokens) {
             return Err(PickError::InvalidSignal(
                 "expected peak tokens are below input length".into(),
@@ -402,7 +444,7 @@ impl BucketResolver {
         let mut buckets: Vec<_> = self
             .buckets
             .iter()
-            .filter(|bucket| bucket.fits(input_tokens, expected_peak_tokens))
+            .filter(|bucket| bucket.fits(input_tokens, uncached_tokens, expected_peak_tokens))
             .collect();
         buckets.sort_by_key(|bucket| {
             let ttft_matches = ttft_ms.map(|target| {
@@ -416,7 +458,13 @@ impl BucketResolver {
                 })
             });
             let penalty = self.ttft_slo.penalty(ttft_matches) + self.tps_slo.penalty(tps_matches);
-            (penalty, bucket.input_capacity(), bucket.rank, &bucket.id)
+            (
+                penalty,
+                bucket.uncached_capacity(),
+                bucket.input_capacity(),
+                bucket.rank,
+                &bucket.id,
+            )
         });
         Ok(buckets)
     }
@@ -461,6 +509,54 @@ mod tests {
             mutate(&mut bucket);
             assert!(bucket.needs_request_tokens(), "{field}");
         }
+    }
+
+    fn uncached_bucket(id: &str, min: Option<u64>, max: Option<u64>) -> Bucket {
+        let mut bucket = load_only_bucket(id);
+        bucket.uncached = TokenLimits { min, max };
+        bucket
+    }
+
+    /// The bucket is chosen on the uncached estimate, not the prompt: a long
+    /// resume with a short new tail goes to the short lane.
+    #[test]
+    fn uncached_bounds_choose_the_bucket_from_the_estimate() {
+        let resolver = BucketResolver::new(vec![
+            uncached_bucket("long", Some(256_001), None),
+            uncached_bucket("short", None, Some(32_000)),
+            uncached_bucket("mid", Some(32_001), Some(256_000)),
+        ])
+        .unwrap();
+        let ids = |input, uncached| {
+            resolver
+                .resolve_uncached(input, uncached, None, None, None)
+                .unwrap()
+                .iter()
+                .map(|bucket| bucket.id.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(900_000, Some(3_000)), ["short"]);
+        assert_eq!(ids(900_000, Some(100_000)), ["mid"]);
+        assert_eq!(ids(900_000, Some(400_000)), ["long"]);
+        // Without an estimate the whole prompt counts.
+        assert_eq!(ids(900_000, None), ["long"]);
+        assert_eq!(ids(20_000, None), ["short"]);
+    }
+
+    /// Overlapping uncached ranges order by the smaller uncached bound first.
+    #[test]
+    fn the_smallest_uncached_bound_is_tried_first() {
+        let resolver = BucketResolver::new(vec![
+            uncached_bucket("wide", None, Some(1_048_576)),
+            uncached_bucket("narrow", None, Some(32_000)),
+        ])
+        .unwrap();
+        let found = resolver
+            .resolve_uncached(500_000, Some(1_000), None, None, None)
+            .unwrap();
+        assert_eq!(found[0].id, "narrow");
+        assert!(found[0].bounds_uncached_tokens());
+        assert!(!load_only_bucket("plain").bounds_uncached_tokens());
     }
 
     /// One bounded bucket makes every request to the model tokenize: the bucket is

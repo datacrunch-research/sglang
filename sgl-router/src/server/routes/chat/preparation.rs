@@ -13,6 +13,7 @@ use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{InputIdsForwarding, MetricsRegistry};
 use crate::state::kv_events::CacheNamespace;
+use crate::state::session_estimator::derived_session_key as derive_session_key;
 use crate::tokenizer::ForwardingScope;
 use axum::http::HeaderMap;
 use bytes::Bytes;
@@ -115,6 +116,9 @@ pub(super) struct PreparedRequest {
     sampling_defaults: Vec<(SamplingField, Number)>,
     /// Turns the engine's `/generate` response back into the OpenAI one.
     pub(super) responder: Option<Responder>,
+    /// Session key from the chat's first messages, for the uncached estimate
+    /// of a request without a session header.
+    pub(super) derived_session_key: Option<String>,
 }
 
 impl PreparedRequest {
@@ -194,6 +198,10 @@ impl PreparedRequest {
         };
         ctx.metrics
             .record_openai_route(&model.0, lowered.as_ref().err().copied());
+        let derived_session_key = (path == CHAT_PATH
+            && wants_derived_session_key(ctx, &model, headers))
+        .then(|| derive_session_key(&body))
+        .flatten();
         if let Ok((mut generate, responder)) = lowered {
             // Null fields are `GenerateReqInput`'s defaults; dropping them keeps the
             // router's own `routed_dp_rank` and bootstrap fields from duplicating keys.
@@ -208,6 +216,7 @@ impl PreparedRequest {
                 scope: None,
                 wait_for_prefill: false,
                 responder: Some(responder),
+                derived_session_key,
                 ..Self::generate_value(ctx, model, generate, None)?
             });
         }
@@ -258,6 +267,7 @@ impl PreparedRequest {
             scope: None,
             wait_for_prefill: false,
             responder: None,
+            derived_session_key,
         })
     }
 
@@ -318,6 +328,7 @@ impl PreparedRequest {
             scope: None,
             wait_for_prefill: false,
             responder: None,
+            derived_session_key: None,
             cache_namespace: cache_namespace(COMPLETIONS_PATH, &value),
             parsed_body: Some(value),
             sampling_defaults,
@@ -416,6 +427,7 @@ impl PreparedRequest {
             scope: None,
             wait_for_prefill: false,
             responder: None,
+            derived_session_key: None,
         })
     }
 
@@ -536,6 +548,7 @@ impl PreparedRequest {
             scope: None,
             wait_for_prefill: false,
             responder: None,
+            derived_session_key: None,
             parsed_body: None,
             cache_namespace: CacheNamespace::default(),
             sampling_defaults,
@@ -574,6 +587,7 @@ impl PreparedRequest {
             scope: None,
             wait_for_prefill: false,
             responder: None,
+            derived_session_key: None,
         }
     }
 
@@ -641,6 +655,29 @@ fn forwarding_scope(ctx: &AppContext, model: &ModelId) -> ForwardingScope {
 
 /// The `/generate` body and response builder SGLang's OpenAI layer would use,
 /// or why the request goes to the engine's own route.
+/// Whether a chat without the session header needs a derived key: only when
+/// the model's buckets are chosen on the uncached estimate.
+fn wants_derived_session_key(ctx: &AppContext, model: &ModelId, headers: &HeaderMap) -> bool {
+    let crate::server::app_context::ChatRouting::Reorg(resolvers) = &ctx.chat_routing else {
+        return false;
+    };
+    resolvers
+        .get(model)
+        .is_some_and(|resolver| resolver.estimator.is_some())
+        && header_str(headers, session_id_header(ctx)).is_none_or(str::is_empty)
+}
+
+/// The header the session-aware policy and the uncached estimate key on.
+pub(super) fn session_id_header(ctx: &AppContext) -> &str {
+    ctx.config
+        .model
+        .affinity
+        .as_ref()
+        .map_or(crate::config::DEFAULT_SESSION_ID_HEADER, |affinity| {
+            affinity.session_id_header.as_str()
+        })
+}
+
 fn lower_openai(
     ctx: &AppContext,
     path: &str,

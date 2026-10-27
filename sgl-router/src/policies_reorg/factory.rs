@@ -16,6 +16,7 @@ use crate::config::{
 };
 use crate::discovery::WorkerId;
 use crate::state::kv_events::RadixTreePrefixProvider;
+use crate::state::session_estimator::{SessionEstimator, DEFAULT_SESSION_IDLE};
 use crate::state::{
     kv_events::KvEventIndex, load_monitor::router_inflight_load::JanitorHandle, AffinityStore,
 };
@@ -36,6 +37,8 @@ pub struct BucketsConfig {
     pub buckets: Vec<BucketSpec>,
     pub ttft_slo: SloPreference,
     pub tps_slo: SloPreference,
+    /// Seconds a session's last turn stays usable for the uncached estimate.
+    pub session_idle_secs: Option<u64>,
 }
 
 /// Set either `plain` or both `prefill` and `decode`.
@@ -46,6 +49,9 @@ pub struct BucketSpec {
     pub rank: u32,
     pub min_input_tokens: Option<u64>,
     pub max_input_tokens: Option<u64>,
+    /// Bounds on the request's estimated uncached prompt tokens.
+    pub min_uncached_tokens: Option<u64>,
+    pub max_uncached_tokens: Option<u64>,
     pub max_context_tokens: Option<u64>,
     pub ttft_ms: Option<u64>,
     pub tokens_per_second: Option<f64>,
@@ -228,6 +234,13 @@ pub fn build_resolver(
             "bucket {id:?} needs min input tokens <= max input and context tokens, \
              and positive capacity and SLO estimates"
         );
+        ensure!(
+            spec.min_uncached_tokens
+                .zip(spec.max_uncached_tokens)
+                .is_none_or(|(min, max)| min <= max)
+                && spec.max_uncached_tokens != Some(0),
+            "bucket {id:?} needs min uncached tokens <= a positive max uncached tokens"
+        );
         let bucket_groups = match (&spec.plain, &spec.prefill, &spec.decode) {
             (Some(plain), None, None) => {
                 BucketGroups::Plain(groups.build(id, Stage::Plain, plain)?)
@@ -244,6 +257,10 @@ pub fn build_resolver(
             min: spec.min_input_tokens,
             max: spec.max_input_tokens,
         };
+        bucket.uncached = TokenLimits {
+            min: spec.min_uncached_tokens,
+            max: spec.max_uncached_tokens,
+        };
         bucket.max_context_tokens = spec.max_context_tokens;
         bucket.ttft_ms = spec.ttft_ms;
         bucket.tokens_per_second = spec.tokens_per_second;
@@ -252,6 +269,16 @@ pub fn build_resolver(
     let mut resolver = BucketResolver::new(buckets)?;
     resolver.ttft_slo = config.ttft_slo;
     resolver.tps_slo = config.tps_slo;
+    ensure!(
+        config.session_idle_secs != Some(0),
+        "--bucket-config session_idle_secs must be positive"
+    );
+    if resolver.buckets.iter().any(Bucket::bounds_uncached_tokens) {
+        let idle = config
+            .session_idle_secs
+            .map_or(DEFAULT_SESSION_IDLE, Duration::from_secs);
+        resolver.estimator = Some(Arc::new(SessionEstimator::new(idle)));
+    }
     Ok((resolver, groups.cleanup))
 }
 
@@ -372,6 +399,68 @@ impl Groups<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_model(buckets: serde_json::Value) -> ModelConfig {
+        ModelConfig {
+            id: "m".into(),
+            tokenizer_path: None,
+            disable_input_ids_forwarding: false,
+            tokenizer: Default::default(),
+            policy: PolicyKind::PowerOfTwo,
+            decode_policy: DecodePolicyKind::PowerOfTwo,
+            dp_aware: false,
+            dp_rank_policy: Default::default(),
+            bucket_config: None,
+            reorg_buckets: Some(serde_json::from_value(buckets).unwrap()),
+            reorg_admission: Default::default(),
+            circuit_breaker: None,
+            cache_aware: None,
+            sticky: None,
+            affinity: None,
+            fused: None,
+            eligibility: None,
+            sampling_overrides: Default::default(),
+            default_chat_template_kwargs: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn uncached_bounds_build_an_estimator_and_are_validated() {
+        let model = test_model;
+        let state = KvEventIndex::new();
+        let (resolver, _) = build_resolver(
+            &model(serde_json::json!({"buckets": [
+                {"id": "S", "max_uncached_tokens": 32000, "plain": {}},
+                {"id": "L", "min_uncached_tokens": 32001, "plain": {}}
+            ]})),
+            &state,
+            None,
+        )
+        .unwrap();
+        assert!(resolver.estimator.is_some());
+        let found = resolver
+            .resolve_uncached(900_000, Some(2_000), None, None, None)
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "S");
+        let (plain, _) = build_resolver(
+            &model(serde_json::json!({"buckets": [{"id": "all", "plain": {}}]})),
+            &state,
+            None,
+        )
+        .unwrap();
+        assert!(
+            plain.estimator.is_none(),
+            "length-only buckets keep no sessions"
+        );
+        for invalid in [
+            serde_json::json!({"buckets": [{"id": "x", "min_uncached_tokens": 9, "max_uncached_tokens": 8, "plain": {}}]}),
+            serde_json::json!({"buckets": [{"id": "x", "max_uncached_tokens": 0, "plain": {}}]}),
+            serde_json::json!({"session_idle_secs": 0, "buckets": [{"id": "x", "max_uncached_tokens": 8, "plain": {}}]}),
+        ] {
+            assert!(build_resolver(&model(invalid), &state, None).is_err());
+        }
+    }
 
     #[test]
     fn group_metric_change_drops_the_cli_gap() {

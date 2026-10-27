@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::forward::SelectedWorkers;
-use super::preparation::PreparedRequest;
+use super::preparation::{session_id_header, PreparedRequest};
 use super::{
     nonempty_header, parse_optional_positive_f64_header, parse_optional_positive_u64_header,
     record_prefill_route, X_SGL_TPS_SLO, X_SGL_TTFT_SLO_MS,
@@ -12,7 +12,9 @@ use crate::discovery::{ModelId, WorkerId};
 use crate::policies_reorg::{PickError, Stage};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
+use crate::state::session_estimator::{session_key, PendingTurn};
 use axum::http::HeaderMap;
+use std::sync::Arc;
 
 /// Bucket-first selection used when `AppContext::chat_routing` is reorg.
 pub(super) async fn select_workers(
@@ -43,9 +45,20 @@ pub(super) async fn select_workers(
     } else {
         None
     };
+    // Buckets bounding uncached tokens read the session's estimate.
+    let session = resolver.estimator.as_ref().map(|estimator| {
+        let header = nonempty_header(headers, session_id_header(ctx));
+        let key = session_key(header, request.derived_session_key.as_deref());
+        let estimate = estimator.estimate(key.as_deref(), input_tokens);
+        (estimator, key, estimate)
+    });
+    let uncached_tokens = session
+        .as_ref()
+        .map(|(_, _, estimate)| estimate.uncached_tokens);
     let buckets = resolver
-        .resolve(
+        .resolve_uncached(
             input_tokens,
+            uncached_tokens,
             expected_peak_tokens,
             ttft_ms,
             tokens_per_second,
@@ -86,6 +99,16 @@ pub(super) async fn select_workers(
     for bucket in buckets {
         match bucket.pick_engines(&ctx.registry, &bucket_request).await {
             Ok(picks) => {
+                if let (Some(scope), Some((estimator, Some(key), estimate))) =
+                    (&request.scope, &session)
+                {
+                    scope.life.track_session_turn(PendingTurn {
+                        estimator: Arc::clone(estimator),
+                        key: key.clone(),
+                        prompt_tokens: input_tokens,
+                        estimate: *estimate,
+                    });
+                }
                 record_prefill_route(
                     ctx,
                     prefix.local_signal().as_deref(),
