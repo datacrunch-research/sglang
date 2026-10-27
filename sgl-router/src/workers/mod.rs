@@ -9,7 +9,7 @@ pub mod worker;
 
 pub use decode_gate::{DecodeGate, DecodeSlot};
 pub use introspect::{ServerInfo, WorkerIntrospector};
-pub use registry::WorkerRegistry;
+pub use registry::{MembershipEvent, MembershipEvents, WorkerRegistry};
 pub use worker::WireProtocol;
 pub use worker::{paired_prefills, Worker};
 pub use worker::{DpRankGuard, EngineProfile, LoadGuard, GRPC_MAX_MESSAGE_BYTES};

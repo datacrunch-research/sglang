@@ -169,6 +169,8 @@ async fn main() -> Result<()> {
         )));
     }
     let app_context = Arc::new(app_context);
+    let bucket_watch =
+        sgl_router::server::bucket_admission::spawn_membership_watch(Arc::clone(&app_context));
     app_context.mark_ready();
     let health_handle = app_context.active_health.as_ref().map(|_| {
         tokio::spawn(sgl_router::health::active::ActiveHealth::run(Arc::clone(
@@ -228,6 +230,9 @@ async fn main() -> Result<()> {
         handle.abort();
     }
     if let Some(handle) = health_handle {
+        handle.abort();
+    }
+    if let Some(handle) = bucket_watch {
         handle.abort();
     }
 

@@ -25,6 +25,9 @@ use serde::Deserialize;
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
+use crate::server::app_context::{AppContext, ChatRouting};
+use crate::workers::WorkerRegistry;
+
 /// How often a waiting request re-checks engine admission: engine load
 /// reports change without notifying the queue. Arbitrary; well under a band.
 const ENGINE_POLL: Duration = Duration::from_millis(20);
@@ -301,6 +304,60 @@ impl BucketQueue {
     }
 }
 
+/// Set every queued bucket's member count from the registry; true if any changed.
+pub fn refresh_members(routing: &ChatRouting, registry: &WorkerRegistry) -> bool {
+    let ChatRouting::Reorg(resolvers) = routing else {
+        return false;
+    };
+    let mut changed = false;
+    for (model, resolver) in resolvers {
+        for bucket in &resolver.buckets {
+            if let Some(queue) = &bucket.queue {
+                let members = bucket.ready_members(registry, model) as u64;
+                if queue.set_members(members) {
+                    tracing::info!(
+                        bucket = %bucket.id,
+                        members,
+                        depth_tokens = queue.depth().tokens,
+                        depth_requests = queue.depth().requests,
+                        "bucket depth recomputed"
+                    );
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// Readiness flips without a discovery event (health checks, breakers), so
+/// the watch also re-reads membership on this period.
+const MEMBERSHIP_RECHECK: Duration = Duration::from_secs(1);
+
+/// Recompute bucket depths whenever discovery adds, removes, relabels or
+/// re-roles a worker, and every [`MEMBERSHIP_RECHECK`]. `None` when no bucket
+/// has a queue.
+pub fn spawn_membership_watch(ctx: Arc<AppContext>) -> Option<tokio::task::JoinHandle<()>> {
+    let ChatRouting::Reorg(resolvers) = &ctx.chat_routing else {
+        return None;
+    };
+    let queued = resolvers
+        .values()
+        .any(|resolver| resolver.buckets.iter().any(|bucket| bucket.queue.is_some()));
+    queued.then(|| {
+        tokio::spawn(async move {
+            loop {
+                let changed = ctx.registry.membership.changed();
+                refresh_members(&ctx.chat_routing, &ctx.registry);
+                tokio::select! {
+                    () = changed => {}
+                    () = tokio::time::sleep(MEMBERSHIP_RECHECK) => {}
+                }
+            }
+        })
+    })
+}
+
 /// Admitted work in a bucket; released when dropped, which the router does
 /// once the request's prefill has finished (or the request ended earlier).
 #[derive(Debug)]
@@ -456,6 +513,68 @@ mod tests {
         tokio::task::yield_now().await;
         drop(held);
         assert!(waiter.await.unwrap() < ENGINE_POLL);
+    }
+
+    #[test]
+    fn refreshing_members_follows_the_registry_per_bucket() {
+        use crate::buckets_reorg::{Bucket, BucketGroups, BucketResolver, EngineGroup};
+        use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+        use crate::policies_reorg::power_of_two::PowerOfTwoPolicy;
+        use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
+
+        let registry = WorkerRegistry::default();
+        let add = |id: &str| {
+            registry
+                .add(WorkerSpec {
+                    id: WorkerId(id.into()),
+                    url: format!("http://{id}:1"),
+                    mode: WorkerMode::Plain,
+                    model_ids: vec![ModelId("m".into())],
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        add("a");
+        add("b");
+        let group = |ids: &[&str]| {
+            let mut group = EngineGroup::new(Arc::new(PowerOfTwoPolicy::new(
+                EngineReportedLoadTable::new(),
+            )));
+            group.worker_ids = Some(ids.iter().map(|id| WorkerId((*id).into())).collect());
+            group
+        };
+        let mut short = Bucket::new("S", BucketGroups::Plain(group(&["a", "b"])));
+        short.queue = Some(Arc::new(BucketQueue::new("S", spec(1.0, 100.0, 1.0))));
+        let mut long = Bucket::new("L", BucketGroups::Plain(group(&["c"])));
+        long.queue = Some(Arc::new(BucketQueue::new("L", spec(1.0, 100.0, 1.0))));
+        let routing = ChatRouting::Reorg(
+            [(
+                ModelId("m".into()),
+                BucketResolver::new(vec![short, long]).unwrap(),
+            )]
+            .into(),
+        );
+        let queue = |index: usize| {
+            let ChatRouting::Reorg(resolvers) = &routing else {
+                unreachable!()
+            };
+            Arc::clone(
+                resolvers[&ModelId("m".into())].buckets[index]
+                    .queue
+                    .as_ref()
+                    .unwrap(),
+            )
+        };
+        assert!(refresh_members(&routing, &registry));
+        assert_eq!((queue(0).members(), queue(1).members()), (2, 0));
+        assert_eq!(queue(0).depth().tokens, 200);
+        assert!(!refresh_members(&routing, &registry), "nothing moved");
+        registry.remove(&WorkerId("b".into()));
+        add("c");
+        assert!(refresh_members(&routing, &registry));
+        assert_eq!((queue(0).members(), queue(1).members()), (1, 1));
+        assert_eq!(queue(0).depth().tokens, 100);
+        assert!(!refresh_members(&ChatRouting::Legacy, &registry));
     }
 
     #[test]

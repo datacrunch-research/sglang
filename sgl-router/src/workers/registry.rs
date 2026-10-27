@@ -32,8 +32,61 @@ pub enum AddWorkerError {
     },
 }
 
+/// A discovery event the worker manager applied, as counted for metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MembershipEvent {
+    Added,
+    Removed,
+    ServicesChanged,
+    ModeChanged,
+}
+
+impl MembershipEvent {
+    pub const ALL: [Self; 4] = [
+        Self::Added,
+        Self::Removed,
+        Self::ServicesChanged,
+        Self::ModeChanged,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Removed => "removed",
+            Self::ServicesChanged => "services_changed",
+            Self::ModeChanged => "mode_changed",
+        }
+    }
+}
+
+/// Applied membership events: counts per kind, and a wake-up for whatever
+/// sizes itself on membership (bucket queue depths).
+#[derive(Debug, Default)]
+pub struct MembershipEvents {
+    counts: [std::sync::atomic::AtomicU64; 4],
+    changed: tokio::sync::Notify,
+}
+
+impl MembershipEvents {
+    pub fn record(&self, event: MembershipEvent) {
+        self.counts[event as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.changed.notify_waiters();
+    }
+
+    pub fn count(&self, event: MembershipEvent) -> u64 {
+        self.counts[event as usize].load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Resolves at the next recorded event; create it before reading state.
+    pub fn changed(&self) -> tokio::sync::futures::Notified<'_> {
+        self.changed.notified()
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct WorkerRegistry {
+    /// Discovery events the manager applied to this registry.
+    pub membership: MembershipEvents,
     active_health_required: std::sync::atomic::AtomicBool,
     by_id: DashMap<WorkerId, Arc<Worker>>,
     by_model: DashMap<ModelId, HashSet<WorkerId>>,
