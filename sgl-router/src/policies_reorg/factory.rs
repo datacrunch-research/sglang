@@ -8,7 +8,8 @@ use anyhow::{bail, ensure, Result};
 use serde::Deserialize;
 
 use crate::buckets_reorg::{
-    Bucket, BucketGroups, BucketResolver, EngineGroup, SloPreference, TokenLimits,
+    Bucket, BucketGroups, BucketResolver, EngineGroup, IdleSpec, SloPreference, SpillTarget,
+    TokenLimits,
 };
 use crate::config::{
     AffinityConfig, AffinityMode, BalancedBy, DecodePolicyKind, FilterKind, ModelConfig,
@@ -40,6 +41,8 @@ pub struct BucketsConfig {
     pub tps_slo: SloPreference,
     /// Seconds a session's last turn stays usable for the uncached estimate.
     pub session_idle_secs: Option<u64>,
+    /// When an engine of a spill target counts as idle.
+    pub spill_idle: IdleSpec,
 }
 
 /// Set either `plain` or both `prefill` and `decode`.
@@ -59,6 +62,9 @@ pub struct BucketSpec {
     /// Bounded wait queue: the request waits here for an engine of this
     /// bucket instead of moving to the next fitting bucket.
     pub queue: Option<QueueSpec>,
+    /// Longer buckets, in order, whose idle engines may take this bucket's
+    /// requests when none of its own admits one.
+    pub spill_to: Vec<String>,
     pub plain: Option<GroupSpec>,
     pub prefill: Option<GroupSpec>,
     pub decode: Option<GroupSpec>,
@@ -271,14 +277,21 @@ pub fn build_resolver(
                 .map_err(|error| anyhow::anyhow!("bucket {id:?}: {error}"))?;
             bucket.queue = Some(Arc::new(BucketQueue::new(id.clone(), queue.clone())));
         }
+        bucket.spill_to = spec.spill_to.iter().map(SpillTarget::new).collect();
         bucket.max_context_tokens = spec.max_context_tokens;
         bucket.ttft_ms = spec.ttft_ms;
         bucket.tokens_per_second = spec.tokens_per_second;
         buckets.push(bucket);
     }
+    validate_spill(&buckets)?;
     let mut resolver = BucketResolver::new(buckets)?;
     resolver.ttft_slo = config.ttft_slo;
     resolver.tps_slo = config.tps_slo;
+    ensure!(
+        config.spill_idle.max_running_requests > 0,
+        "--bucket-config spill_idle.max_running_requests must be positive"
+    );
+    resolver.idle = config.spill_idle;
     ensure!(
         config.session_idle_secs != Some(0),
         "--bucket-config session_idle_secs must be positive"
@@ -290,6 +303,35 @@ pub fn build_resolver(
         resolver.estimator = Some(Arc::new(SessionEstimator::new(idle)));
     }
     Ok((resolver, groups.cleanup))
+}
+
+/// Spill runs one way, from shorter lanes to longer ones: a target must take
+/// longer requests than its source (uncached bound first, then input bound).
+fn validate_spill(buckets: &[Bucket]) -> Result<()> {
+    let reach = |bucket: &Bucket| {
+        (
+            bucket.uncached.max.unwrap_or(u64::MAX),
+            bucket.limits.max.unwrap_or(u64::MAX),
+        )
+    };
+    for bucket in buckets {
+        for target in &bucket.spill_to {
+            let Some(found) = buckets.iter().find(|b| b.id == target.bucket) else {
+                bail!(
+                    "bucket {:?} spills to unknown bucket {:?}",
+                    bucket.id,
+                    target.bucket
+                );
+            };
+            ensure!(
+                reach(found) > reach(bucket),
+                "bucket {:?} may spill only to a longer bucket, not {:?}",
+                bucket.id,
+                target.bucket
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Builds group policies; session stores and cache sources are shared by all groups.
@@ -493,6 +535,46 @@ mod tests {
             {"mean_wait_s": -1, "rate_tokens_per_s": 1, "rate_requests_per_s": 1}
         ))
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn spill_runs_only_from_shorter_to_longer_buckets() {
+        let state = KvEventIndex::new();
+        let build = |buckets: serde_json::Value| {
+            build_resolver(&test_model(buckets), &state, None).map(|(resolver, _)| resolver)
+        };
+        let resolver = build(serde_json::json!({
+            "spill_idle": {"max_running_requests": 2},
+            "buckets": [
+                {"id": "S", "max_uncached_tokens": 32000, "spill_to": ["M", "L"], "plain": {}},
+                {"id": "M", "min_uncached_tokens": 32001, "max_uncached_tokens": 256000, "spill_to": ["L"], "plain": {}},
+                {"id": "L", "min_uncached_tokens": 256001, "plain": {}}
+            ]
+        }))
+        .unwrap();
+        let targets: Vec<_> = (resolver.bucket("S").unwrap().spill_to.iter())
+            .map(|target| target.bucket.as_str())
+            .collect();
+        assert_eq!(targets, ["M", "L"]);
+        assert_eq!(resolver.idle.max_running_requests, 2);
+        assert_eq!(resolver.idle.max_waiting_uncached_tokens, 0);
+        for invalid in [
+            serde_json::json!({"buckets": [
+                {"id": "S", "max_uncached_tokens": 32000, "plain": {}},
+                {"id": "L", "min_uncached_tokens": 32001, "spill_to": ["S"], "plain": {}}
+            ]}),
+            serde_json::json!({"buckets": [
+                {"id": "S", "max_uncached_tokens": 32000, "spill_to": ["X"], "plain": {}}
+            ]}),
+            serde_json::json!({"buckets": [
+                {"id": "S", "max_uncached_tokens": 32000, "spill_to": ["S"], "plain": {}}
+            ]}),
+            serde_json::json!({"spill_idle": {"max_running_requests": 0}, "buckets": [
+                {"id": "S", "plain": {}}
+            ]}),
+        ] {
+            assert!(build(invalid).is_err());
+        }
     }
 
     #[test]

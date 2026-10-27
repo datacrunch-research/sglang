@@ -24,9 +24,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::discovery::{ModelId, WorkerId};
+use crate::policies_reorg::admission::EngineMetrics;
 use crate::policies_reorg::{Pick, PickError, PickRequest, Policy, Stage};
 use crate::server::bucket_admission::BucketQueue;
 use crate::state::kv_events::CacheNamespace;
+use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::state::session_estimator::SessionEstimator;
 use crate::workers::{paired_prefills, Worker, WorkerRegistry};
 
@@ -175,6 +177,58 @@ pub struct Bucket {
     /// Bounded prefill work with a wait deadline; without it a bucket that
     /// cannot place a request passes it to the next fitting bucket.
     pub queue: Option<Arc<BucketQueue>>,
+    /// Longer buckets whose idle engines take this bucket's requests when
+    /// none of its own admits one; never the other way.
+    pub spill_to: Vec<SpillTarget>,
+}
+
+#[derive(Debug)]
+pub struct SpillTarget {
+    pub bucket: String,
+    /// Requests this bucket placed on the target's engines.
+    pub spilled: std::sync::atomic::AtomicU64,
+}
+
+impl SpillTarget {
+    pub fn new(bucket: impl Into<String>) -> Self {
+        Self {
+            bucket: bucket.into(),
+            spilled: Default::default(),
+        }
+    }
+}
+
+/// When an engine counts as idle for a spill: its reported waiting uncached
+/// tokens and running requests, and this router's own in-flight count, are
+/// all low. Unreported load is never idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IdleSpec {
+    pub max_waiting_uncached_tokens: u64,
+    /// Strictly fewer running (and router in-flight) requests than this.
+    pub max_running_requests: u64,
+}
+
+impl Default for IdleSpec {
+    fn default() -> Self {
+        Self {
+            max_waiting_uncached_tokens: 0,
+            max_running_requests: 4,
+        }
+    }
+}
+
+impl IdleSpec {
+    pub fn is_idle(&self, engine: &Worker, load: &EngineReportedLoadSnapshot) -> bool {
+        let metrics = EngineMetrics::observe(engine, load);
+        metrics
+            .pending_prefill_tokens
+            .is_some_and(|waiting| waiting <= self.max_waiting_uncached_tokens)
+            && metrics
+                .running_requests
+                .is_some_and(|running| running < self.max_running_requests)
+            && metrics.inflight_requests < self.max_running_requests
+    }
 }
 
 impl Bucket {
@@ -189,6 +243,7 @@ impl Bucket {
             tokens_per_second: None,
             groups,
             queue: None,
+            spill_to: Vec::new(),
         }
     }
 
@@ -258,14 +313,27 @@ impl Bucket {
         workers: &WorkerRegistry,
         request: &BucketRequest<'_>,
     ) -> Result<BucketPick, (Stage, PickError)> {
+        self.pick_engines_where(workers, request, &|_| true).await
+    }
+
+    /// [`Self::pick_engines`] among the plain or prefill engines `keep` accepts;
+    /// decode candidates are not filtered.
+    pub async fn pick_engines_where(
+        &self,
+        workers: &WorkerRegistry,
+        request: &BucketRequest<'_>,
+        keep: &(dyn Fn(&Worker) -> bool + Sync),
+    ) -> Result<BucketPick, (Stage, PickError)> {
         let (prefill, decode) = match &self.groups {
             BucketGroups::Plain(group) => {
-                let engines = group.candidates(workers, request, Stage::Plain);
+                let mut engines = group.candidates(workers, request, Stage::Plain);
+                engines.retain(|engine| keep(engine));
                 let plain = self.pick_from_group(group, Stage::Plain, engines, request);
                 (plain.await?, None)
             }
             BucketGroups::Pd { prefill, decode } => {
-                let prefills = prefill.candidates(workers, request, Stage::Prefill);
+                let mut prefills = prefill.candidates(workers, request, Stage::Prefill);
+                prefills.retain(|engine| keep(engine));
                 let decoders = decode.candidates(workers, request, Stage::Decode);
                 let stage = if prefills.is_empty() {
                     Stage::Prefill
@@ -391,6 +459,8 @@ pub struct BucketResolver {
     pub buckets: Vec<Bucket>,
     pub ttft_slo: SloPreference,
     pub tps_slo: SloPreference,
+    /// What makes an engine of a spill target idle.
+    pub idle: IdleSpec,
     /// Set when a bucket bounds uncached tokens; estimates them per session.
     pub estimator: Option<Arc<SessionEstimator>>,
 }
@@ -405,6 +475,34 @@ impl BucketResolver {
             buckets,
             ..Self::default()
         })
+    }
+
+    pub fn bucket(&self, id: &str) -> Option<&Bucket> {
+        self.buckets.iter().find(|bucket| bucket.id == id)
+    }
+
+    /// Place a request `home` cannot on an idle engine of one of its spill
+    /// targets, in their listed order; the target bucket's id with the pick.
+    pub async fn spill(
+        &self,
+        home: &Bucket,
+        workers: &WorkerRegistry,
+        load: &EngineReportedLoadSnapshot,
+        request: &BucketRequest<'_>,
+    ) -> Option<(BucketPick, &Bucket)> {
+        let idle = |engine: &Worker| self.idle.is_idle(engine, load);
+        for target in &home.spill_to {
+            let Some(bucket) = self.bucket(&target.bucket) else {
+                continue;
+            };
+            if let Ok(pick) = bucket.pick_engines_where(workers, request, &idle).await {
+                target
+                    .spilled
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Some((pick, bucket));
+            }
+        }
+        None
     }
 
     /// Whether any bucket reads request tokens; startup rejects this under `--no-tokenizer`.
@@ -575,6 +673,97 @@ mod tests {
         assert_eq!(found[0].id, "narrow");
         assert!(found[0].bounds_uncached_tokens());
         assert!(!load_only_bucket("plain").bounds_uncached_tokens());
+    }
+
+    /// Spill lands only on a target engine that reports itself idle, and
+    /// counts the move on the source bucket.
+    #[tokio::test]
+    async fn spill_takes_only_idle_engines_of_the_listed_targets() {
+        use crate::discovery::WorkerSpec;
+        use crate::state::load_monitor::engine_reported_load::{LoadStat, NativeCacheRankLoad};
+
+        let workers = WorkerRegistry::default();
+        for id in ["s", "l"] {
+            workers
+                .add(WorkerSpec {
+                    id: WorkerId(id.into()),
+                    url: format!("http://{id}:1"),
+                    mode: Stage::Plain,
+                    model_ids: vec![ModelId("m".into())],
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let load = EngineReportedLoadTable::new();
+        let member = |id: &str| {
+            let mut group = EngineGroup::new(Arc::new(PowerOfTwoPolicy::new(Arc::clone(&load))));
+            group.worker_ids = Some([WorkerId(id.into())].into());
+            group
+        };
+        let mut short = Bucket::new("S", BucketGroups::Plain(member("s")));
+        short.uncached.max = Some(32_000);
+        short.spill_to = vec![SpillTarget::new("L")];
+        let mut long = Bucket::new("L", BucketGroups::Plain(member("l")));
+        long.uncached.min = Some(32_001);
+        let resolver = BucketResolver::new(vec![short, long]).unwrap();
+        let report = |running: u64, waiting: u64| {
+            load.set(
+                "http://l:1",
+                0,
+                LoadStat {
+                    num_running_reqs: running,
+                    num_waiting_reqs: 0,
+                    num_tokens: 0,
+                    max_total_num_tokens: 1_000,
+                    native_cache: Some(NativeCacheRankLoad {
+                        num_waiting_uncached_tokens: waiting,
+                        num_total_tokens: 0,
+                        max_running_requests: 64,
+                        total_prefill_uncached_tokens: 0,
+                        total_prefill_busy_us: 0,
+                    }),
+                },
+                std::time::Instant::now(),
+            )
+        };
+        let model = ModelId("m".into());
+        let request = BucketRequest {
+            model: &model,
+            input_tokens: 10,
+            total_input_tokens: 10,
+            expected_peak_tokens: None,
+            prefix: None,
+            token_ids: None,
+            cache_namespace: CacheNamespace::NONE,
+            session_key: None,
+            routing_key: None,
+            excluded: &[],
+        };
+        let home = resolver.bucket("S").unwrap();
+        let spill = |home| spill_target(&resolver, home, &workers, &load, &request);
+        assert_eq!(spill(home).await, None, "unreported load is not idle");
+        report(5, 0);
+        assert_eq!(spill(home).await, None, "too many running");
+        report(0, 4_096);
+        assert_eq!(spill(home).await, None, "uncached tokens waiting");
+        report(1, 0);
+        assert_eq!(spill(home).await, Some(("l".into(), "L".into())));
+        let spilled = &home.spill_to[0].spilled;
+        assert_eq!(spilled.load(std::sync::atomic::Ordering::Relaxed), 1);
+        // The long bucket lists no target, so nothing ever spills from it.
+        assert_eq!(spill(resolver.bucket("L").unwrap()).await, None);
+    }
+
+    async fn spill_target(
+        resolver: &BucketResolver,
+        home: &Bucket,
+        workers: &WorkerRegistry,
+        load: &EngineReportedLoadTable,
+        request: &BucketRequest<'_>,
+    ) -> Option<(String, String)> {
+        let snapshot = load.capture_snapshot(std::time::Instant::now());
+        let (pick, bucket) = resolver.spill(home, workers, &snapshot, request).await?;
+        Some((pick.prefill.engine.id.0.clone(), bucket.id.clone()))
     }
 
     /// One bounded bucket makes every request to the model tokenize: the bucket is

@@ -119,11 +119,19 @@ pub(super) async fn select_workers(
         }
     };
     // A queued home bucket keeps the request: it waits there for an engine.
-    if let Some(queue) = &buckets[0].queue {
-        let home = buckets[0];
+    let home = buckets[0];
+    if let Some(queue) = &home.queue {
         let tokens = uncached_tokens.unwrap_or(input_tokens);
-        let (picks, slot) =
-            pick_queued(ctx, home, queue, &bucket_request, tokens, &request.model).await?;
+        let (picks, slot) = pick_queued(
+            ctx,
+            resolver,
+            home,
+            queue,
+            &bucket_request,
+            tokens,
+            &request.model,
+        )
+        .await?;
         return Ok(selected(picks, Some(slot)));
     }
     let mut rejections: Option<Vec<_>> = None;
@@ -146,6 +154,9 @@ pub(super) async fn select_workers(
             }
         }
     }
+    if let Some((picks, _)) = spill(ctx, resolver, home, &bucket_request).await {
+        return Ok(selected(picks, None));
+    }
     // Preserve admission exhaustion even if a later bucket has no candidates.
     let error = match rejections {
         Some(reasons) => PickError::NoAdmissibleEngine(reasons),
@@ -159,6 +170,7 @@ pub(super) async fn select_workers(
 /// client leaves while it waits is dropped here and frees its place.
 async fn pick_queued(
     ctx: &AppContext,
+    resolver: &BucketResolver,
     home: &Bucket,
     queue: &Arc<BucketQueue>,
     request: &BucketRequest<'_>,
@@ -180,6 +192,10 @@ async fn pick_queued(
                 | PickError::NoAdmissibleEngine(_)
                 | PickError::AdmissionRejected(_),
             )) => {
+                // Before waiting, an idle engine of a longer bucket may take it.
+                if let Some((picks, _)) = spill(ctx, resolver, home, request).await {
+                    return Ok((picks, slot));
+                }
                 if Instant::now() >= deadline {
                     let reason = match stage {
                         Stage::Decode => RejectReason::DecodePermits,
@@ -193,6 +209,23 @@ async fn pick_queued(
             Err((stage, error)) => return Err(selection_error(error, model, Some(stage))),
         }
     }
+}
+
+async fn spill<'r>(
+    ctx: &AppContext,
+    resolver: &'r BucketResolver,
+    home: &Bucket,
+    request: &BucketRequest<'_>,
+) -> Option<(BucketPick, &'r Bucket)> {
+    if home.spill_to.is_empty() {
+        return None;
+    }
+    let load = ctx
+        .engine_reported_load
+        .capture_snapshot(std::time::Instant::now());
+    let (picks, target) = resolver.spill(home, &ctx.registry, &load, request).await?;
+    tracing::debug!(from = %home.id, to = %target.id, "spilled to an idle engine of a longer bucket");
+    Some((picks, target))
 }
 
 fn selection_error(error: PickError, model: &ModelId, stage: Option<Stage>) -> ApiError {
