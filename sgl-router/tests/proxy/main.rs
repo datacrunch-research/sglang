@@ -11,6 +11,7 @@
 mod common;
 
 mod admission;
+mod bucket_queues;
 mod bucket_routing;
 mod cache_aware_input_ids;
 mod chat_routing;

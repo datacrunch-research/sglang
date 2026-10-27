@@ -5,6 +5,7 @@ design, policies and bucket configuration are in [ARCHITECTURE.md](ARCHITECTURE.
 
 - [Discovery and KV signals](#discovery-and-kv-signals)
 - [Bucket file membership](#bucket-file-membership)
+- [Uncached-token buckets and queues](#uncached-token-buckets-and-queues)
 - [Routing and reliability](#routing-and-reliability)
 - [Chat rendering](#chat-rendering)
 - [Native `/generate`](#native-generate)
@@ -206,6 +207,76 @@ Empty membership lists and blank worker IDs are rejected at startup.
 
 Admission fields left unset or set to `null` inherit CLI defaults. To apply a
 limit only to selected groups, omit that CLI default and set it on those groups.
+
+## Uncached-token buckets and queues
+
+Reorg bucket fields for lanes split on the prompt tokens prefill must compute,
+with bounded queues. Example D in [ARCHITECTURE.md](ARCHITECTURE.md) shows a
+three-lane file.
+
+| field | where | meaning |
+|---|---|---|
+| `min_uncached_tokens`, `max_uncached_tokens` | bucket | inclusive range of the request's estimated uncached tokens; narrower buckets are tried first |
+| `queue` | bucket | `mean_wait_s`, `rate_tokens_per_s`, `rate_requests_per_s` (per ready engine), optional `deadline_factor` (2.3), `retry_after_max_s` (30), `deadline_retry_after_s` (2), `decode_retry_after_s` (5) |
+| `spill_to` | bucket | longer buckets, in order, whose idle engines may take this bucket's requests |
+| `spill_idle` | file | `max_waiting_uncached_tokens` (0) and `max_running_requests` (4): an engine is idle when its reported waiting uncached tokens are at most the first and its running requests, and this router's in-flight count to it, are below the second |
+| `session_idle_secs` | file | how long a session's last turn stays usable for the estimate (7200) |
+
+### Uncached estimate
+
+The estimate is made before dispatch, from the session's previous completed
+turn: a conversation that only appends has `prompt(now) - prompt(previous)`
+uncached tokens. The session key is `--session-id-header` (`x-session-id` by
+default); a chat without it is keyed by a hash of its first system and first
+user message. An unknown, expired or shrunk session counts its whole prompt. A
+turn routed on that delta whose reported `cached_tokens` came back under half of
+what was expected makes the next turn count its whole prompt too. The engine's
+`prompt_tokens` over the router's count converts the router's count (the
+tokenizer's, or the body-size estimate without one) into engine tokens. A turn
+is learned only once it completes, from the counts the engine reports
+(`usage.prompt_tokens_details.cached_tokens` with `--enable-cache-report`, or
+`meta_info.cached_tokens`; the prefill leg's under prefill/decode). Without an
+estimate the whole prompt counts, which lands in the longer bucket.
+
+### Queues, 429 and Retry-After
+
+A queued bucket bounds its outstanding prefill work (admitted, not yet through
+prefill) at `members x rate_tokens_per_s x mean_wait_s` tokens and
+`members x rate_requests_per_s x mean_wait_s` requests, where members are its
+ready engines (plain, or prefill engines with a paired decode). Each member may
+also run one request whatever its size.
+
+- Over the depth: `429` at once, error type `bucket_full`, `Retry-After` = the
+  excess over `members x rate` in seconds, between 1 and `retry_after_max_s`.
+- Admitted but no engine admits it: the request waits in its bucket, woken when
+  bucket work finishes or members join, and re-checks engine admission every
+  20 ms, up to `deadline_factor x mean_wait_s`; then `429` with
+  `bucket_deadline` (`Retry-After` `deadline_retry_after_s`) or
+  `decode_permits` when the decode side refused (`decode_retry_after_s`).
+- The body is `{"error": {"type", "code", "message", "bucket", "depth_tokens",
+  "queued_tokens", "retry_after_s"}}`; no bucket path answers 5xx.
+
+A request's place is released when its prefill finishes: under prefill/decode
+when the detached prefill request ends, for a plain engine when its response
+arrives, and at once if the client leaves while waiting. A queued home bucket
+never passes a request to another bucket except through `spill_to`.
+
+### Depth from membership
+
+The worker manager counts each discovery event it applies (`Added` once
+registered, `Removed`, `ServicesChanged`, `ModeChanged`) and wakes a watch that
+recounts each queued bucket's ready members; the watch also re-reads them every
+second, since health checks change readiness without an event. Lower depth
+applies to new arrivals only; admitted work keeps its place.
+
+### Routing headers and metrics
+
+A response routed by a reorg bucket carries `x-sgl-bucket` (the request's own
+bucket), `x-sgl-uncached-estimate`, `x-sgl-queue-wait-ms` (queued buckets),
+`x-sgl-prefill-worker` and `x-sgl-decode-worker` (worker ids). A bucket 429
+carries `Retry-After`, `x-sgl-bucket`, `x-sgl-uncached-estimate` and
+`x-sgl-queue-wait-ms`. The series are listed in
+[monitoring/README.md](monitoring/README.md#bucket-queues).
 
 ## Routing and reliability
 

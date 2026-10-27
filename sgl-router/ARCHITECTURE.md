@@ -234,3 +234,59 @@ sgl-router --model-id qwen3 --chat-routing reorg \
     are waiting.
   - `short` decode engines reject requests at 90% KV usage.
   - `long` engines set no limits.
+
+### Example D: P/D buckets on uncached tokens, with queues
+
+For agent traffic, where a long conversation appends a few thousand tokens per
+turn, buckets can split on the tokens prefill has to compute rather than on the
+prompt. With the same flags as example C and `--policy session_aware`:
+
+```json
+{
+  "buckets": [
+    {
+      "id": "S", "max_uncached_tokens": 32000, "spill_to": ["M", "L"],
+      "queue": {"mean_wait_s": 4, "rate_tokens_per_s": 20000, "rate_requests_per_s": 3},
+      "prefill": {"worker_services": ["inference/prefill-s"],
+                  "admission": {"max_pending_prefill_tokens": 80000}},
+      "decode": {"worker_services": ["inference/decode"],
+                 "admission": {"max_inflight_requests": 40}}
+    },
+    {
+      "id": "M", "min_uncached_tokens": 32001, "max_uncached_tokens": 256000, "spill_to": ["L"],
+      "queue": {"mean_wait_s": 6, "rate_tokens_per_s": 25000, "rate_requests_per_s": 0.5},
+      "prefill": {"worker_services": ["inference/prefill-m"],
+                  "admission": {"max_pending_prefill_tokens": 150000}},
+      "decode": {"worker_services": ["inference/decode"],
+                 "admission": {"max_inflight_requests": 40}}
+    },
+    {
+      "id": "L", "min_uncached_tokens": 256001,
+      "queue": {"mean_wait_s": 0, "rate_tokens_per_s": 10000, "rate_requests_per_s": 0.05},
+      "prefill": {"worker_services": ["inference/prefill-l"]},
+      "decode": {"worker_services": ["inference/decode"],
+                 "admission": {"max_inflight_requests": 40}}
+    }
+  ]
+}
+```
+
+- **Buckets:** each request's uncached tokens are estimated from its session's
+  previous turn (`x-session-id`, or a key derived from the first messages), so a
+  900K-token conversation appending 3K tokens goes to `S` and a cold 300K prompt
+  to `L`. The ranges do not overlap: each request has one home bucket.
+- **Queues:** a bucket admits a request while its outstanding prefill work stays
+  within `members x rate x mean_wait_s`, in tokens and in requests; each ready
+  engine may also run one request of any size, so `L` runs one request per
+  engine and queues none. Over that, 429 at once with `Retry-After` from the
+  bucket's drain rate. An admitted request that no engine admits yet (here
+  `max_pending_prefill_tokens` or the decode caps) waits in its bucket up to
+  2.3 x `mean_wait_s`, then gets 429.
+- **Spill:** when every `S` engine is at its cap, an idle `M` or `L` engine may
+  take the request; nothing moves from a longer bucket to a shorter one.
+- **Membership:** the depths follow the Services: an engine leaving
+  `prefill-s` lowers `S`'s depth at once, one relabelled into `prefill-m` moves
+  its share to `M`.
+
+[REFERENCE.md](REFERENCE.md#uncached-token-buckets-and-queues) has the estimate,
+queue, `Retry-After`, header and metric details.
