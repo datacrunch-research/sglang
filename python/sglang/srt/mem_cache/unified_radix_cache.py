@@ -3698,7 +3698,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 and (req.swa_host_hit_length > 0 or req.mamba_host_hit_length > 0)
             )
         ):
-            if self.load_back(best_match_node_id, mem_quota, req=req):
+            # req still drives prefix bookkeeping; only the state copy is skipped.
+            state_req = req if params.restore_request_state else None
+            if self.load_back(best_match_node_id, mem_quota, req=state_req):
                 new_indices = self.tree_core.collect_full_device_indices(
                     best_match_node_id, last_best_match_device_node_id
                 )
