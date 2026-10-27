@@ -103,6 +103,7 @@ def route_quant_fused(
     apply_scale: bool,
     local_expert_offset: int = 0,
     num_local_experts: int = 0,
+    num_valid: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Returns ``(weights [M, topk] fp32, ids [M, topk] int32, packed [M, topk]
     int32, x_q [M, 3584] fp8_e4m3, x_s [M, 28] int32 row-major packed UE8M0)``.
@@ -112,9 +113,18 @@ def route_quant_fused(
     With ``num_local_experts > 0`` the packed ids are rank-local: experts
     ``[local_expert_offset, local_expert_offset + num_local_experts)`` become
     ``0..num_local_experts-1`` and any other expert in slot ``k`` becomes
-    ``num_local_experts + k``. ``ids`` keeps the global ids."""
+    ``num_local_experts + k``. ``ids`` keeps the global ids.
+
+    ``num_valid`` (int32 [1] device scalar) masks rows at and past it: ``ids``
+    -1 and weight 0; their packed ids are the masked id remapped as above (a
+    non-local ``num_local_experts + k``), or -1 without rank-local ids."""
     M = scores.shape[0]
     device = scores.device
+    if num_valid is not None:
+        # The graph buffer is int32 [1]; an eager batch may carry a 0-d scalar.
+        num_valid = num_valid.reshape(1)
+        if num_valid.dtype != torch.int32:
+            num_valid = num_valid.to(torch.int32)
     out_w = torch.empty((M, topk), dtype=torch.float32, device=device)
     out_i = torch.empty((M, topk), dtype=torch.int32, device=device)
     out_packed = torch.empty((M, topk), dtype=torch.int32, device=device)
@@ -135,5 +145,7 @@ def route_quant_fused(
         bool(apply_scale),
         int(local_expert_offset),
         int(num_local_experts),
+        num_valid if num_valid is not None else out_s,
+        num_valid is not None,
     )
     return out_w, out_i, out_packed, out_q, out_s
