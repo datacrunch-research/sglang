@@ -463,6 +463,20 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
                 if not enabled:
                     self.assertIn("Auxiliary", layout["reason"])
 
+    def test_dcp_sharded_mla_is_unavailable_without_probing_a_page(self):
+        """Under DCP each rank stores its own MLA shard of a logical page, and the
+        one-page key probe does not fit a logical page: startup crashed."""
+        store = self._store(mla_suffix="dcp0_cp0", registered=(PoolName.MAMBA,))
+        store.mem_pool_host = self._host_pool()
+        store.dcp_size = 2
+        store.storage_config = SimpleNamespace(logical_page_size=128)
+        layout = store.describe_l3_object_layout(
+            sidecar_pool_specs=(), swa_trailing_pages=None, page_size=64
+        )
+        self.assertFalse(layout["enabled"])
+        self.assertIn("DCP", layout["reason"])
+        self.assertEqual(layout["hicache_object_layout"]["pools"], [])
+
     def test_deepseek_v4_uses_rank_replicated_storage_config(self):
         """Compressed MLA must remain eligible without checking model names."""
         controller = cache_controller.HiCacheController.__new__(
