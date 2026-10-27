@@ -1,10 +1,15 @@
 import unittest
 from array import array
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
+from sglang.srt.disaggregation.decode_hicache_mixin import (
+    DecodeHiCacheTransferMixin,
+    DecodePrefixMatch,
+)
 from sglang.srt.managers.schedule_batch import (
     Req,
 )
@@ -516,6 +521,66 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         self.assertEqual(req.prefix_len + loaded_len, len(tokens))
         self.assertIsNotNone(node_device_value(cache, leaf, ComponentType.MAMBA))
         self._finish_pending_loads(cache)
+        self._release_ongoing_load_back_locks(cache)
+
+    @requires_full_mamba_ps1
+    def test_pd_decode_restore_keeps_the_live_request_state(self):
+        """A P/D decode restore publishes the host checkpoint into a cache slot;
+        it must not overwrite the live recurrent state prefill sent the request."""
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+        tokens = self._match_tokens_for_chain(cache, chain)
+        checkpoint = node_device_value(cache, leaf, ComponentType.MAMBA).clone()
+        self._fill_mamba_state(req_to_token_pool, checkpoint, marker=11)
+        expected_checkpoint = self._snapshot_mamba_state(req_to_token_pool, checkpoint)
+        self._backup_node(cache, leaf)
+        cache.evict(EvictParams(num_tokens=node_key_length(cache, leaf)))
+        self.assertTrue(cache.tree_core.is_full_device_evicted(leaf))
+
+        req = self._make_req(req_to_token_pool)
+        self.assertTrue(req.kv.holds_mamba)
+        req.origin_input_ids = array("q", tokens)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
+        )
+        self._apply_match_to_req(req, match)
+        self.assertGreater(match.host_hit_length, 0)
+        # The state prefill sent for the whole prompt already sits in the slot.
+        live_slot = req.kv.mamba_pool_idx.reshape(1)
+        self._fill_mamba_state(req_to_token_pool, live_slot, marker=37)
+        expected_live = self._snapshot_mamba_state(req_to_token_pool, live_slot)
+
+        decode_req = SimpleNamespace(
+            req=req,
+            prefix_match=DecodePrefixMatch(
+                prefix_indices=cache.path_device_indices(match.last_device_node),
+                l2_host_hit_length=match.host_hit_length,
+                l3_storage_hit_length=0,
+                last_device_node=match.last_device_node,
+            ),
+        )
+        self.assertTrue(
+            DecodeHiCacheTransferMixin._try_hicache_queue_load_back(
+                SimpleNamespace(tree_cache=cache), decode_req
+            )
+        )
+        self._finish_pending_loads(cache)
+
+        restored = node_device_value(cache, leaf, ComponentType.MAMBA)
+        self.assertIsNotNone(restored)
+        self.assertNotEqual(restored.reshape(-1).tolist(), live_slot.tolist())
+        for slot, expected in (
+            (restored, expected_checkpoint),
+            (live_slot, expected_live),
+        ):
+            temporal, conv = self._snapshot_mamba_state(req_to_token_pool, slot)
+            torch.testing.assert_close(temporal, expected[0], rtol=0, atol=0)
+            for got, want in zip(conv, expected[1], strict=True):
+                torch.testing.assert_close(got, want, rtol=0, atol=0)
+        cache.unlock(decode_req.hicache_restore_lock)
         self._release_ongoing_load_back_locks(cache)
 
     @requires(

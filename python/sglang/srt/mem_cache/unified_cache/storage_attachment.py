@@ -92,6 +92,10 @@ class StorageAttachment:
                 "Flush the cache before changing the write policy.",
             )
 
+        invalid = self._validate_dcp_decode_policy(hicache_storage_prefetch_policy)
+        if invalid is not None:
+            return False, invalid
+
         if cache.enable_storage:
             current_backend = controller.storage_backend_type
             if current_backend != storage_backend:
@@ -374,6 +378,29 @@ class StorageAttachment:
                 f"Invalid hicache_write_policy: {hicache_write_policy!r}. "
                 f"Expected one of {list(_WRITE_POLICIES)}."
             )
+        return None
+
+    def _validate_dcp_decode_policy(
+        self, hicache_storage_prefetch_policy: Optional[str]
+    ) -> Optional[str]:
+        from sglang.srt.runtime_context import get_parallel, get_server_args
+
+        if get_parallel().attn_dcp_size <= 1:
+            return None
+        from sglang.srt.arg_groups.hicache_hook import (
+            validate_hicache_dcp_decode_storage,
+        )
+
+        # The effective policy: a request that names none keeps the current one.
+        try:
+            validate_hicache_dcp_decode_storage(
+                get_server_args(),
+                prefetch_policy=(
+                    hicache_storage_prefetch_policy or self._cache.prefetch_stop_policy
+                ),
+            )
+        except NotImplementedError as e:
+            return str(e)
         return None
 
     def _apply_policies(
