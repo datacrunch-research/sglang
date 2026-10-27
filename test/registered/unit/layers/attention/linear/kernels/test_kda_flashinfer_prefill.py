@@ -108,6 +108,55 @@ class TestFlashInferKDAPrefillDtBias(CustomTestCase):
         self.assertTrue(torch.equal(fake.dt_bias, dt_bias.reshape(-1)))
 
 
+class TestFlashInferKDAPrefillCuSeqlens(CustomTestCase):
+    def test_int32_cu_seqlens_become_one_int64_tensor_per_forward(self):
+        """Every KDA layer of a forward gets the same int32 query_start_loc, and
+        FlashInfer memoizes cu_seqlens' host copy by tensor identity: all layers
+        must see one int64 tensor (a per-layer conversion misses the memo and
+        syncs the host per layer), and the next forward's new query_start_loc
+        must not reuse the previous forward's offsets."""
+        kernel = FlashInferKDAPrefillKernel.__new__(FlashInferKDAPrefillKernel)
+        kernel._cu_seqlens_i64 = None  # set by __init__, which requires SM100+
+        seen = []
+
+        def recurrent_kda(q, k, v, g, beta, A_log, dt_bias, cu_seqlens, **kwargs):
+            seen.append(cu_seqlens)
+            return torch.zeros_like(v), None
+
+        kernel._recurrent_kda = recurrent_kda
+
+        def extend(query_start_loc):
+            inputs = _make_inputs(num_tokens=6, seq_lens=[2, 4])
+            inputs["query_start_loc"] = query_start_loc
+            kernel.extend(
+                inputs.pop("q"),
+                inputs.pop("k"),
+                inputs.pop("v"),
+                inputs.pop("g"),
+                inputs.pop("beta"),
+                A_log=torch.zeros(H),
+                dt_bias=torch.zeros(H * K),
+                lower_bound=-5.0,
+                **inputs,
+            )
+
+        first = torch.tensor([0, 2, 6], dtype=torch.int32)
+        for _ in range(3):  # three KDA layers of one forward
+            extend(first)
+        self.assertEqual(seen[0].dtype, torch.int64)
+        self.assertTrue(all(cu is seen[0] for cu in seen[1:3]))
+        self.assertEqual(seen[0].tolist(), [0, 2, 6])
+
+        second = torch.tensor([0, 4, 6], dtype=torch.int32)
+        extend(second)
+        self.assertIsNot(seen[3], seen[0])
+        self.assertEqual(seen[3].tolist(), [0, 4, 6])
+
+        int64_loc = torch.tensor([0, 1, 6], dtype=torch.int64)
+        extend(int64_loc)
+        self.assertIs(seen[4], int64_loc)
+
+
 class TestFlashInferKDAPrefillDispatch(CustomTestCase):
     def _make_dispatcher(self):
         flashinfer_kernel = _RecordingKernel()
