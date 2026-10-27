@@ -101,6 +101,7 @@ every flag.
 | `POST /v1/tokenize`, `/v1/detokenize` | Tokenize with the router's tokenizer |
 | `GET /v1/models` | The served model |
 | `POST /flush_cache` | Fan out a cache flush to every worker |
+| `POST /internal/prefix_match`, `GET /internal/cell_load`, `GET /internal/cell_info` | [Cell signals](REFERENCE.md#cell-signals-for-an-upstream-router) for an upstream router that spreads one model over several cells, each one of these routers and its engines |
 | `GET /healthz`, `/readyz` | Liveness and readiness |
 | `GET /metrics` | Prometheus metrics, see [monitoring/README.md](monitoring/README.md) |
 

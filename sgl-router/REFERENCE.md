@@ -174,6 +174,56 @@ can exclude itself from its own peer list. A rolling update should surge
 all of it, and the `sgl_router_kv_bootstrap_*` series in
 [monitoring/README.md](monitoring/README.md) make the whole path observable.
 
+### Cell signals for an upstream router
+
+A cell is one router and the engines it serves. A deployment that spreads one
+model over several cells can put a global router in front of them that picks
+the cell by prefix affinity and load, the way this router picks an engine.
+Three routes give it the signals, read from state the router already keeps;
+none touches an engine, and all are advisory: an upstream that gets no answer,
+or a late one, should route by load.
+
+`POST /internal/prefix_match` takes one tokenized prompt and answers for the
+cell. Request fields: `model` (must be this router's `--model-id`, else 404),
+`token_ids` (the prompt's leading tokens; a few thousand are enough, since an
+owner is decided by the start of the prompt), `input_tokens` (the whole
+prompt's length, defaults to `token_ids.len()`), `cache_salt` and `lora_name`
+(the KV namespace, as the chat request would carry them), and `deadline_ms`
+(the caller's remaining budget: a lookup that cannot finish inside it answers
+504 rather than late).
+
+Response fields: `matched_prefix_tokens`, the deepest contiguous prefix any
+plain or prefill engine of this cell holds, capped at the query length, with
+`matched_prefix_blocks` and `page_size` beside it; `pending`, true when that
+depth is a [pending prefix](#pending-prefixes) stake rather than a confirmed
+KV event; `load`, the summary below; and `admits`, whether some engine would
+admit a prompt of `input_tokens` under the admission its routing applies
+(under reorg routing, the buckets that fit the length and their prefill-side
+groups; a policy without admission, or legacy routing, admits). Depth comes
+from the Router-local radix tree or the external Indexer, whichever
+cache-aware routing uses; without either it is 0.
+
+`GET /internal/cell_load` returns the load summary alone, summed over the
+healthy plain and prefill engines from their own load reports:
+`waiting_uncached_tokens`, `estimated_prefill_queue_ms` (the smallest any
+engine reports, the queue a new request would see at the best engine),
+`waiting_requests`, `running_requests`, `min_worker_queue` (the smallest
+waiting count on any reporting engine), `snapshot_age_ms` (age of the newest
+report, `u32::MAX` when none is fresh), `engines`, `reporting_engines`, and
+`router_inflight_requests` (this router's own in-flight count, known even
+when no engine reports).
+
+`GET /internal/cell_info` tells the upstream what this cell serves so it can
+load the matching tokenizer and parsers without being configured by hand:
+`model` (this router's `--model-id`), `tokenizer_path` (this router's
+`--tokenizer-path`, a path on this router's filesystem or an HF repo id; the
+model id is an HF repo id to fall back to), `page_size`, `chat` (the engines'
+OpenAI-layer launch arguments from `/server_info`: `served_model_name`,
+`reasoning_parser`, `tool_call_parser`, `default_chat_template_kwargs`,
+`context_length`; `null` until an engine reports them), `consistent` (every
+reporting engine agrees on `chat`), `router_default_chat_template_kwargs`
+(this router's own render defaults), `engines` and `engines_reporting_chat`.
+
 ## Bucket file membership
 
 `worker_services` matches Kubernetes Services by `namespace/name`, using the

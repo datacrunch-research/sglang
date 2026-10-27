@@ -597,16 +597,25 @@ async fn lookup_prefix_matches(
     ctx: &AppContext,
     request: &PreparedRequest,
 ) -> Result<Option<PrefixLookupResult>, ApiError> {
-    let namespace = &request.cache_namespace;
-    let tokens = request.tokens.as_ref();
-    let remote = ctx
-        .prefix_index
-        .as_ref()
-        .zip(tokens)
-        .and_then(|(index, tokens)| {
-            let hashes = ctx.block_size_oracle.block_hashes(&tokens.ids, namespace)?;
-            Some((index, hashes))
-        });
+    let Some(tokens) = request.tokens.as_ref() else {
+        return Ok(None);
+    };
+    lookup_prefix_for_tokens(ctx, &tokens.ids, &request.cache_namespace, &request.model.0).await
+}
+
+/// The prefix signal for `tokens` under `namespace`: the remote Indexer when
+/// configured and the block size is known, else the in-process radix tree.
+/// `None` without a usable prefix source.
+pub(crate) async fn lookup_prefix_for_tokens(
+    ctx: &AppContext,
+    tokens: &[u32],
+    namespace: &crate::state::kv_events::CacheNamespace,
+    model: &str,
+) -> Result<Option<PrefixLookupResult>, ApiError> {
+    let remote = ctx.prefix_index.as_ref().and_then(|index| {
+        let hashes = ctx.block_size_oracle.block_hashes(tokens, namespace)?;
+        Some((index, hashes))
+    });
     let signal = match remote {
         // Remote indexer: match the prompt's block hashes against the KV index.
         Some((index, hashes)) => {
@@ -614,7 +623,7 @@ async fn lookup_prefix_matches(
             let outcome = if hashes.is_empty() {
                 sgl_kv_indexer::PrefixOutcome::Empty
             } else {
-                resolve_prefix_query(index.match_prefix(hashes).await, &request.model.0)?
+                resolve_prefix_query(index.match_prefix(hashes).await, model)?
             };
             Some(PrefixLookupResult {
                 outcome,
@@ -627,8 +636,7 @@ async fn lookup_prefix_matches(
         None => ctx
             .radix_tree_prefix_provider
             .as_ref()
-            .zip(tokens)
-            .and_then(|(provider, tokens)| provider.match_request_tokens(&tokens.ids, namespace)),
+            .and_then(|provider| provider.match_request_tokens(tokens, namespace)),
     };
     Ok(signal)
 }
