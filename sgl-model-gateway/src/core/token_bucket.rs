@@ -106,12 +106,14 @@ impl TokenBucket {
             );
 
             loop {
-                // Wait for notify signal from return_tokens()
-                self.notify.notified().await;
-
+                // Register before checking: notify_waiters() wakes only futures
+                // that already exist, so a permit returned between a failed check
+                // and the wait would otherwise wake nobody.
+                let notified = self.notify.notified();
                 if self.try_acquire(tokens).await.is_ok() {
                     return Ok(());
                 }
+                notified.await;
             }
         }
 
