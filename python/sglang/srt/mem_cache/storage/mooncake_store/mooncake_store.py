@@ -849,6 +849,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 reason="External L3 lookup requires rank-replicated/MLA pools",
             )
             return layout
+        # DCP keys embed the DCP rank (one MLA shard per rank and page), which one
+        # scheduler cannot enumerate either.
+        if self.dcp_size > 1:
+            layout.update(
+                enabled=False,
+                reason="External L3 lookup does not support DCP-sharded MLA pools",
+            )
+            return layout
 
         if self.mem_pool_host.kv_buffer is not None:
             suffixes, _, _ = self._batch_preprocess(
