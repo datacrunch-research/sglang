@@ -120,6 +120,7 @@ every flag.
 | `GET /server_info` | Answered by one healthy worker (a decode worker under P/D, which reports decode's state); `/get_server_info` is an alias |
 | `GET /model_info`, `/health_generate` | Answered by one healthy worker (a prefill worker under P/D; `/health_generate` also runs on one of its decode peers and returns the decode's answer when both pass); `/get_model_info` is an alias |
 | `GET /healthz`, `/readyz` | Liveness and readiness; `/health`, `/liveness`, and `/readiness` are aliases |
+| `POST /internal/prefix_match`, `GET /internal/cell_load`, `GET /internal/cell_info` | [Cell signals](REFERENCE.md#cell-signals-for-an-upstream-router) for an upstream router that spreads one model over several cells, each one of these routers and its engines |
 | `GET /metrics` | Prometheus metrics, see [monitoring/README.md](monitoring/README.md) |
 
 Endpoints for features the router does not provide yet (the stored-response

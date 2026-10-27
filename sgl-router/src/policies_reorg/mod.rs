@@ -115,6 +115,13 @@ pub trait Policy: Send + Sync + Debug {
         None
     }
 
+    /// The admission this policy checks its engines against, when it has one,
+    /// so a cell-level answer (`/internal/prefix_match`) can say whether any
+    /// engine would admit a request without picking one.
+    fn admission(&self) -> Option<&dyn admission::EngineAdmission> {
+        None
+    }
+
     /// Delegate within the same candidates; the fallback reads its own state.
     fn pick_fallback<'a>(
         &'a self,

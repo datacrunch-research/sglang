@@ -68,7 +68,12 @@ impl EngineGroup {
             .await
     }
 
-    fn members(&self, workers: &WorkerRegistry, model: &ModelId, stage: Stage) -> Vec<Arc<Worker>> {
+    pub(crate) fn members(
+        &self,
+        workers: &WorkerRegistry,
+        model: &ModelId,
+        stage: Stage,
+    ) -> Vec<Arc<Worker>> {
         workers
             .healthy_workers_for(model)
             .into_iter()

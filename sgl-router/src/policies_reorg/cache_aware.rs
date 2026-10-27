@@ -287,6 +287,10 @@ impl CacheAwarePolicy {
 }
 
 impl Policy for CacheAwarePolicy {
+    fn admission(&self) -> Option<&dyn EngineAdmission> {
+        Some(self.admission.as_ref())
+    }
+
     fn supports(&self, stage: Stage) -> bool {
         stage != Stage::Decode
     }

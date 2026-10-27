@@ -75,6 +75,10 @@ impl SessionAwarePolicy {
 }
 
 impl Policy for SessionAwarePolicy {
+    fn admission(&self) -> Option<&dyn EngineAdmission> {
+        Some(self.admission.as_ref())
+    }
+
     fn pick<'a>(
         &'a self,
         engines: &'a [Arc<Worker>],
