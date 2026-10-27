@@ -376,10 +376,7 @@ impl AppContextBuilder {
         self.rate_limiter = match config.max_concurrent_requests {
             n if n <= 0 => None,
             n => {
-                let rate_limit_tokens = config
-                    .rate_limit_tokens_per_second
-                    .filter(|&t| t > 0)
-                    .unwrap_or(n);
+                let rate_limit_tokens = config.rate_limit_tokens_per_second.unwrap_or(n);
                 Some(Arc::new(TokenBucket::new(
                     n as usize,
                     rate_limit_tokens as usize,
@@ -528,5 +525,43 @@ impl AppContextBuilder {
 impl Default for AppContextBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    async fn drained_limiter(rate_limit_tokens_per_second: Option<i32>) -> Arc<TokenBucket> {
+        let config = RouterConfig {
+            max_concurrent_requests: 8,
+            rate_limit_tokens_per_second,
+            ..Default::default()
+        };
+        let bucket = AppContextBuilder::new()
+            .maybe_rate_limiter(&config)
+            .rate_limiter
+            .expect("a positive max_concurrent_requests builds a limiter");
+        assert!(bucket.try_acquire(8.0).await.is_ok());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        bucket
+    }
+
+    #[tokio::test]
+    async fn test_zero_refill_rate_caps_requests_in_flight() {
+        // --rate-limit-tokens-per-second 0: a permit comes back only when a response
+        // returns it, never from the clock (300 ms at the cap's rate would add 2.4).
+        let bucket = drained_limiter(Some(0)).await;
+        assert!(bucket.try_acquire(1.0).await.is_err());
+        bucket.return_tokens(1.0).await;
+        assert!(bucket.try_acquire(1.0).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_unset_refill_rate_refills_the_cap_per_second() {
+        let bucket = drained_limiter(None).await;
+        assert!(bucket.try_acquire(1.0).await.is_ok());
     }
 }
