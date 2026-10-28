@@ -48,7 +48,9 @@ pub const CELL_INFO_PATH: &str = "/internal/cell_info";
 pub struct PrefixMatchRequest {
     /// The model the tokens belong to; must be the one this router serves.
     pub model: Option<String>,
-    pub token_ids: Vec<u32>,
+    /// 64-bit, as the engine caches them: a multimodal prompt's pad sentinels
+    /// (above 2^32) match the blocks the engine published.
+    pub token_ids: Vec<u64>,
     /// The whole prompt's length; defaults to `token_ids.len()`.
     pub input_tokens: Option<u64>,
     /// KV namespace components, as the chat request would carry them.
@@ -609,7 +611,7 @@ mod tests {
 
     /// A context with a local KV tree where `url_a` holds the first `blocks`
     /// blocks of `prompt`.
-    fn ctx_with_tree(prompt: &[u32], blocks: usize) -> Arc<AppContext> {
+    fn ctx_with_tree(prompt: &[u64], blocks: usize) -> Arc<AppContext> {
         let mut ctx = AppContext::stub();
         let oracle = BlockSizeOracle::new();
         oracle.try_set(BLOCK).expect("block size");
@@ -676,7 +678,7 @@ mod tests {
 
     #[tokio::test]
     async fn prefix_match_reports_the_cell_depth_in_tokens_and_blocks() {
-        let prompt: Vec<u32> = (1..=40).collect();
+        let prompt: Vec<u64> = (1..=40).collect();
         let ctx = ctx_with_tree(&prompt, 6);
         let model = ctx.config.model.id.clone();
         let (status, body) = post_json(
@@ -698,7 +700,7 @@ mod tests {
 
     #[tokio::test]
     async fn prefix_match_is_capped_at_the_query_and_ignores_unknown_engines() {
-        let prompt: Vec<u32> = (1..=40).collect();
+        let prompt: Vec<u64> = (1..=40).collect();
         let ctx = ctx_with_tree(&prompt, 10);
         // Only the first two blocks are sent: the answer cannot exceed them.
         let (status, body) = post_json(
@@ -719,7 +721,7 @@ mod tests {
 
     #[tokio::test]
     async fn prefix_match_rejects_another_model_and_a_different_namespace_misses() {
-        let prompt: Vec<u32> = (1..=40).collect();
+        let prompt: Vec<u64> = (1..=40).collect();
         let ctx = ctx_with_tree(&prompt, 6);
         let (status, _) = post_json(
             Arc::clone(&ctx),
@@ -765,7 +767,7 @@ mod tests {
 
     #[tokio::test]
     async fn cell_info_names_the_model_and_the_block_size() {
-        let prompt: Vec<u32> = (1..=40).collect();
+        let prompt: Vec<u64> = (1..=40).collect();
         let ctx = ctx_with_tree(&prompt, 6);
         let model = ctx.config.model.id.clone();
         let (status, body) = get_json(ctx, CELL_INFO_PATH).await;
@@ -785,7 +787,7 @@ mod tests {
 
     #[tokio::test]
     async fn cell_signals_convert_to_their_grpc_messages() {
-        let prompt: Vec<u32> = (1..=40).collect();
+        let prompt: Vec<u64> = (1..=40).collect();
         let ctx = ctx_with_tree(&prompt, 6);
         let info: proto::CellInfo = cell_info_answer(&ctx).into();
         assert_eq!(info.model, ctx.config.model.id);

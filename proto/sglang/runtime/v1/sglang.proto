@@ -185,8 +185,10 @@ message GenerateResponse {
 message PrefixMatchRequest {
   // The model the tokens belong to; must be the one this router serves.
   optional string model = 1;
-  // The prompt's leading token ids (a few thousand are enough).
-  repeated uint32 token_ids = 2;
+  // The prompt's leading token ids (a few thousand are enough), as the engine
+  // caches them: 64-bit, so a multimodal prompt's pad sentinels (above
+  // 2^32) travel as they are.
+  repeated uint64 token_ids = 2;
   // The whole prompt's length; defaults to token_ids.len().
   optional uint64 input_tokens = 3;
   // KV namespace components, as the chat request would carry them.

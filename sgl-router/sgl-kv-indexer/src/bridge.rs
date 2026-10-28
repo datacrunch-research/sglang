@@ -738,11 +738,12 @@ fn decode_event_map(
     Ok(())
 }
 
-fn decode_token(value: &Value) -> Result<u32, BridgeError> {
+/// A token id as the engine caches it: 64-bit, so a multimodal prompt's pad
+/// sentinels (above 2^32, below 2^63) decode like any other id.
+fn decode_token(value: &Value) -> Result<u64, BridgeError> {
     value
         .as_u64()
-        .and_then(|v| u32::try_from(v).ok())
-        .ok_or_else(|| BridgeError::Decode("token ID must be u32".into()))
+        .ok_or_else(|| BridgeError::Decode("token ID must be a nonnegative integer".into()))
 }
 
 fn decode_hashes(value: &Value) -> Result<Vec<i64>, BridgeError> {

@@ -78,7 +78,7 @@ impl RadixTreePrefixProvider {
 
     pub fn match_request_tokens(
         &self,
-        tokens: &[u32],
+        tokens: &[u64],
         namespace: &CacheNamespace,
     ) -> Option<PrefixLookupResult> {
         let hashes = self.block_hashes(tokens, namespace)?;
@@ -131,7 +131,8 @@ impl RadixTreePrefixProvider {
         // so a placement remembered past that point counts where it is strictly
         // deeper than the best confirmed match. A real deeper hit still decides.
         let pending_best = depth_by_url.values().copied().max();
-        let media = self.media_chain(tokens, namespace, &hashes);
+        // Media tags are tokenizer ids; a prompt with a wide (engine pad) id has none.
+        let media = narrow(tokens).and_then(|tokens| self.media_chain(&tokens, namespace, &hashes));
         let mut media_winners = Vec::new();
         if let Some(media) = &media {
             let mut deepened = false;
@@ -211,7 +212,7 @@ impl RadixTreePrefixProvider {
         namespace: &CacheNamespace,
         worker_url: &str,
     ) -> RankDepths {
-        let Some(hashes) = self.block_hashes(tokens, namespace) else {
+        let Some(hashes) = self.block_hashes(&widen(tokens), namespace) else {
             return RankDepths::default();
         };
         let mut depths: Vec<(u32, usize)> = self
@@ -318,7 +319,7 @@ impl RadixTreePrefixProvider {
         if !self.tree.is_media_prompt(tokens) {
             return;
         }
-        let Some(hashes) = self.block_hashes(tokens, namespace) else {
+        let Some(hashes) = self.block_hashes(&widen(tokens), namespace) else {
             return;
         };
         if let Some(media) = self.media_chain(tokens, namespace, &hashes) {
@@ -328,7 +329,7 @@ impl RadixTreePrefixProvider {
         }
     }
 
-    fn block_hashes(&self, tokens: &[u32], namespace: &CacheNamespace) -> Option<Vec<i64>> {
+    fn block_hashes(&self, tokens: &[u64], namespace: &CacheNamespace) -> Option<Vec<i64>> {
         let hashes = self.block_size_oracle.block_hashes(tokens, namespace)?;
         (!hashes.is_empty()).then_some(hashes)
     }
@@ -354,6 +355,16 @@ impl MediaChain {
 /// A media chat's conversation key (see [`RadixTreePrefixProvider::media_chain`]):
 /// router-only, so it follows no engine's hash layout, only the namespace that
 /// keeps chats with a cache salt or a LoRA apart, and is the same on every router.
+/// Tokenizer ids on the KV path, which is 64-bit as the engine caches ids.
+fn widen(tokens: &[u32]) -> Vec<u64> {
+    tokens.iter().map(|&id| u64::from(id)).collect()
+}
+
+/// `tokens` as tokenizer ids; `None` when one is wider (an engine pad sentinel).
+fn narrow(tokens: &[u64]) -> Option<Vec<u32>> {
+    tokens.iter().map(|&id| u32::try_from(id).ok()).collect()
+}
+
 fn media_key(namespace: &CacheNamespace, parent: Option<i64>, tokens: &[u32]) -> i64 {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -429,12 +440,12 @@ mod tests {
         RadixTreePrefixProvider::new(tree, oracle)
     }
 
-    fn tokens(blocks: usize) -> Vec<u32> {
-        (1..=(blocks * BLOCK as usize) as u32).collect()
+    fn tokens(blocks: usize) -> Vec<u64> {
+        (1..=(blocks * BLOCK as usize) as u64).collect()
     }
 
     /// Publish the first `blocks` blocks of `tokens` for `url` as KV events.
-    fn confirm(provider: &RadixTreePrefixProvider, url: &str, tokens: &[u32], blocks: usize) {
+    fn confirm(provider: &RadixTreePrefixProvider, url: &str, tokens: &[u64], blocks: usize) {
         let hashes = provider
             .block_hashes(tokens, &CacheNamespace::default())
             .expect("hashes");
@@ -454,7 +465,7 @@ mod tests {
             .store_event(&KvWorkerId::new(url.to_owned(), 0), &event);
     }
 
-    fn lookup(provider: &RadixTreePrefixProvider, tokens: &[u32]) -> PrefixLookupResult {
+    fn lookup(provider: &RadixTreePrefixProvider, tokens: &[u64]) -> PrefixLookupResult {
         provider
             .match_request_tokens(tokens, &CacheNamespace::default())
             .expect("lookup")

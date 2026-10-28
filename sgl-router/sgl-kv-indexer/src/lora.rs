@@ -25,8 +25,10 @@ pub struct LoraBlock {
 pub struct LoraStore {
     pub hashes: Vec<i64>,
     pub parent: Option<i64>,
-    /// Already-flattened token atoms: bigrams contribute two u32s per atom.
-    pub tokens: Vec<u32>,
+    /// Already-flattened token atoms: bigrams contribute two words per atom.
+    /// 64-bit, as the engine caches them (multimodal pad sentinels sit above
+    /// 2^32).
+    pub tokens: Vec<u64>,
     pub block_size: usize,
     pub bigram: bool,
     pub name: String,
@@ -177,8 +179,18 @@ impl LoraIndex {
             if let Some(p) = prior {
                 h.update(p);
             }
+            // The engine's `hash_page`: 4-byte words, or a 0xff tag and 8-byte
+            // words when any word of the page is above u32::MAX.
+            let wide = tokens.iter().any(|t| *t > u64::from(u32::MAX));
+            if wide {
+                h.update([0xff]);
+            }
             for token in tokens {
-                h.update(token.to_le_bytes());
+                if wide {
+                    h.update(token.to_le_bytes());
+                } else {
+                    h.update((*token as u32).to_le_bytes());
+                }
             }
             let d: [u8; 32] = h.finalize().into();
             let lookup = lookup_hash(&d, &event.name);
@@ -297,7 +309,7 @@ impl LoraIndex {
 mod tests {
     use super::*;
 
-    fn store(ids: &[i64], tokens: &[u32]) -> LoraStore {
+    fn store(ids: &[i64], tokens: &[u64]) -> LoraStore {
         LoraStore {
             hashes: ids.to_vec(),
             parent: None,

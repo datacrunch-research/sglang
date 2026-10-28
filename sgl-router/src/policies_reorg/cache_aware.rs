@@ -61,15 +61,17 @@ impl CacheSource {
         let Some(tokens) = tokens else {
             return Ok(None);
         };
+        // The KV path is 64-bit (multimodal pad sentinels); tokenizer ids widen.
+        let tokens: Vec<u64> = tokens.iter().map(|&id| u64::from(id)).collect();
         let (index, oracle) = match self {
             Self::Local(provider) => {
                 return Ok(provider
-                    .match_request_tokens(tokens, namespace)
+                    .match_request_tokens(&tokens, namespace)
                     .map(Arc::new))
             }
             Self::Remote { index, block_size } => (index, block_size),
         };
-        let Some(hashes) = oracle.block_hashes(tokens, namespace) else {
+        let Some(hashes) = oracle.block_hashes(&tokens, namespace) else {
             return Ok(None);
         };
         let query_blocks = hashes.len();

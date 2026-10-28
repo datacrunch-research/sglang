@@ -233,6 +233,12 @@ until engines report it), `hash` (`sha256`, the content identity of
 `enable_multimodal`), `router_default_chat_template_kwargs` (this router's own
 render defaults), `engines` and `engines_reporting_chat`.
 
+Token ids on this path are 64-bit, as the engine caches them: a multimodal
+prompt's pad sentinels (above 2^32) are accepted by `prefix_match`, parsed
+from KV events, and hashed with the engine's page rule (4-byte words, or a
+`0xff` tag and 8-byte words on a page with a wide id), so an upstream that
+plans the expanded prompt matches past an image.
+
 The same three signals are served on the router's gRPC port
 (`--grpc-port`) as `sglang.runtime.v1.SglangService` RPCs `PrefixMatch`,
 `GetCellLoad` and `GetCellInfo`, answered from the router's own state without

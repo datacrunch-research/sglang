@@ -65,7 +65,7 @@ pub struct BlockStored {
     /// Hash of the parent block, or `None` for the first block in a chain.
     pub parent_block_hash: Option<i64>,
     /// Tokens covered by this block. SGLang uses 32-bit token IDs.
-    pub token_ids: Vec<u32>,
+    pub token_ids: Vec<u64>,
     /// Block size (tokens per block).
     pub block_size: u32,
     /// LoRA adapter ID this block is associated with, if any.
@@ -136,7 +136,7 @@ pub fn decode_event_batch(bytes: &[u8]) -> Result<KvEventBatch, DecodeError> {
         Ok(b) => Ok(b),
         Err(e) => {
             // Rewrap the size-cap sentinel into the typed variant. The
-            // sentinel string is set by `BoundedI64Vec` / `BoundedU32Vec`
+            // sentinel string is set by `BoundedI64Vec` / `BoundedU64Vec`
             // below; everything else is a true msgpack decode failure.
             let s = e.to_string();
             if let Some(rest) = s.strip_prefix(PAYLOAD_TOO_LARGE_TAG) {
@@ -212,14 +212,14 @@ impl<'de> Deserialize<'de> for BoundedI64Vec {
     }
 }
 
-/// One element of a `token_ids` array. SGLang emits a flat `u32` per token for
+/// One element of a `token_ids` array. SGLang emits a flat integer per token for
 /// unigram pages, but a 2-element `[t_i, t_{i+1}]` array per token for *bigram*
 /// pages (`mem_cache/events.py`, `is_bigram` branch — DeepSeek-V4-class models).
 /// LoRA ingestion hashes these atoms independently of the worker's block IDs;
 /// preserve whether the flattened atoms came from bigram pairs.
 enum TokenCell {
-    One(u32),
-    Many(Vec<u32>),
+    One(u64),
+    Many(Vec<u64>),
 }
 
 impl<'de> Deserialize<'de> for TokenCell {
@@ -231,26 +231,28 @@ impl<'de> Deserialize<'de> for TokenCell {
         impl<'de> Visitor<'de> for V {
             type Value = TokenCell;
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("a token id (u32) or an array of token ids")
+                f.write_str("a token id (u64) or an array of token ids")
             }
             // serde's default visit_u8/u16/u32 forward to visit_u64, and
             // visit_i8/i16/i32 forward to visit_i64, so these two cover every
             // integer width msgpack might use for a scalar token id.
             fn visit_u64<E: de::Error>(self, v: u64) -> Result<TokenCell, E> {
-                Ok(TokenCell::One(v as u32))
+                Ok(TokenCell::One(v))
             }
+            // Multimodal pad sentinels sit above 2^32 but below 2^63, so a
+            // signed encoding is still a nonnegative token id.
             fn visit_i64<E: de::Error>(self, v: i64) -> Result<TokenCell, E> {
-                Ok(TokenCell::One(v as u32))
+                Ok(TokenCell::One(v as u64))
             }
             fn visit_seq<A>(self, mut seq: A) -> Result<TokenCell, A::Error>
             where
                 A: SeqAccess<'de>,
             {
-                let mut ts: Vec<u32> = match seq.size_hint() {
+                let mut ts: Vec<u64> = match seq.size_hint() {
                     Some(h) => Vec::with_capacity(h.min(8)),
                     None => Vec::new(),
                 };
-                while let Some(t) = seq.next_element::<u32>()? {
+                while let Some(t) = seq.next_element::<u64>()? {
                     if ts.len() >= MAX_TOKENS_PER_EVENT {
                         return Err(de::Error::custom(format!(
                             "{PAYLOAD_TOO_LARGE_TAG}:token_ids:{}:{MAX_TOKENS_PER_EVENT}",
@@ -266,24 +268,24 @@ impl<'de> Deserialize<'de> for TokenCell {
     }
 }
 
-/// `BoundedI64Vec`'s `u32` twin. Same shape, different cap. Accepts both flat
+/// `BoundedI64Vec`'s `u64` twin. Same shape, different cap. Accepts both flat
 /// (unigram) token ids and bigram `[t_i, t_{i+1}]` pairs via [`TokenCell`],
 /// flattening the latter.
 #[derive(Debug, Clone, PartialEq)]
-struct BoundedU32Vec(Vec<u32>, bool);
+struct BoundedU64Vec(Vec<u64>, bool);
 
-impl<'de> Deserialize<'de> for BoundedU32Vec {
+impl<'de> Deserialize<'de> for BoundedU64Vec {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         struct V;
         impl<'de> Visitor<'de> for V {
-            type Value = BoundedU32Vec;
+            type Value = BoundedU64Vec;
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("a msgpack array of u32 values")
+                f.write_str("a msgpack array of u64 values")
             }
-            fn visit_seq<A>(self, mut seq: A) -> Result<BoundedU32Vec, A::Error>
+            fn visit_seq<A>(self, mut seq: A) -> Result<BoundedU64Vec, A::Error>
             where
                 A: SeqAccess<'de>,
             {
@@ -294,7 +296,7 @@ impl<'de> Deserialize<'de> for BoundedU32Vec {
                         )));
                     }
                 }
-                let mut out: Vec<u32> = match seq.size_hint() {
+                let mut out: Vec<u64> = match seq.size_hint() {
                     Some(h) => Vec::with_capacity(h),
                     None => Vec::new(),
                 };
@@ -302,7 +304,7 @@ impl<'de> Deserialize<'de> for BoundedU32Vec {
                 // `[t_i, t_{i+1}]` pair (bigram); flatten both into `out`.
                 let mut is_bigram = false;
                 while let Some(cell) = seq.next_element::<TokenCell>()? {
-                    let push = |t: u32, out: &mut Vec<u32>| -> Result<(), A::Error> {
+                    let push = |t: u64, out: &mut Vec<u64>| -> Result<(), A::Error> {
                         if out.len() >= MAX_TOKENS_PER_EVENT {
                             return Err(de::Error::custom(format!(
                                 "{PAYLOAD_TOO_LARGE_TAG}:token_ids:{}:{MAX_TOKENS_PER_EVENT}",
@@ -322,7 +324,7 @@ impl<'de> Deserialize<'de> for BoundedU32Vec {
                         }
                     }
                 }
-                Ok(BoundedU32Vec(out, is_bigram))
+                Ok(BoundedU64Vec(out, is_bigram))
             }
         }
         deserializer.deserialize_seq(V)
@@ -442,7 +444,7 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
                 let mut tag: Option<String> = None;
                 let mut block_hashes: Option<BoundedI64Vec> = None;
                 let mut parent_block_hash: Option<i64> = None;
-                let mut token_ids: Option<BoundedU32Vec> = None;
+                let mut token_ids: Option<BoundedU64Vec> = None;
                 let mut block_size: Option<u32> = None;
                 let mut lora_id: Option<i64> = None;
                 let mut lora_name: Option<String> = None;
