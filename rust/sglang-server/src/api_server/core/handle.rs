@@ -22,7 +22,7 @@ use crate::message::request::{GenerateRequest, RenderedChat, Request, RequestKin
 use crate::message::response::{ResponseItem, ResponseSink};
 use crate::message::sampling::SamplingParams;
 use crate::message::types::TokenIds;
-use crate::multi_modality::worker::{MediaError, MmProcessor};
+use crate::multi_modality::worker::MmProcessor;
 use crate::tokenizer_manager::from_scheduler::ActivityCounter;
 use crate::tokenizer_manager::wiring::{AbortSource, RequestAdmission, TmEvent};
 use crate::utils::error::Error;
@@ -296,10 +296,7 @@ impl CoreHandle {
             self.inner.mm_processor.get(),
         )
         .await
-        .map_err(|error| match error {
-            MediaError::Client(message) => CoreError::InvalidArgument(message),
-            MediaError::Server(message) => CoreError::Internal(message),
-        })
+        .map_err(CoreError::from)
     }
 
     /// Return static model metadata without exposing the full launch config.
@@ -635,6 +632,7 @@ fn translate_runtime_error(error: Error) -> CoreError {
         Error::Validation(message) => {
             CoreError::InvalidArgument(format!("validation failed: {message}"))
         }
+        Error::Encode(error) => error.into(),
         Error::QueueFull => CoreError::Overloaded("to_scheduler channel full".into()),
         Error::Disconnected => CoreError::Cancelled("client disconnected".into()),
         error => CoreError::Internal(error.to_string()),
@@ -1124,6 +1122,7 @@ mod tests {
     use crate::message::multimodal::MmItem;
     use crate::message::request::MmData;
     use crate::message::response::{ChunkEvent, frame_health_ack};
+    use crate::multi_modality::worker::MediaError;
     use crate::runtime::Runnable;
     use crate::tokenizer_manager::from_scheduler::Dispatcher;
     use crate::tokenizer_manager::wiring::Senders;
@@ -1563,7 +1562,7 @@ mod tests {
                 &self,
                 _input_ids: TokenIds,
                 _mm: MmData,
-            ) -> Result<crate::multi_modality::worker::MmProcessOutput, String> {
+            ) -> Result<crate::multi_modality::worker::MmProcessOutput, MediaError> {
                 unreachable!("rejected during admission")
             }
 

@@ -421,7 +421,11 @@ fn mm_process_for_parity(
                 ..Default::default()
             };
             ctx.processor.check_media(&mm)?;
-            process(&ctx, input_ids, mm)
+            // The message a client would get: a media error's own text.
+            process(&ctx, input_ids, mm).map_err(|error| match error {
+                utils::error::Error::Encode(media) => media.to_string(),
+                error => error.to_string(),
+            })
         })
         .map_err(|e| value_error("mm parity", e))?;
     let buffers = buffers
