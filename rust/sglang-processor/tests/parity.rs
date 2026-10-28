@@ -77,8 +77,13 @@ fn check_case(
         .map(|defaults| defaults.clone().into_iter().collect())
         .unwrap_or_default();
     let rendered = formatter.render_request(case["request"].clone(), &defaults);
-    if !case["error"].is_null() {
+    if let Some(error) = case["error"].as_str() {
+        // "Model only supports text input" is the serving layer's gate on a
+        // text-only launch (`is_multimodal`), not the renderer's: a renderer
+        // that places images may render such a case.
+        let launch_gate = error.contains("only supports text input");
         return match rendered {
+            Ok(_) if launch_gate => Ok(()),
             Ok(_) => Err("SGLang rejects this request".into()),
             Err(_) => Ok(()),
         };

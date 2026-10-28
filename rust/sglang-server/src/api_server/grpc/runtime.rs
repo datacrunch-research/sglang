@@ -159,6 +159,11 @@ pub(super) fn to_api_request(request: rt::GenerateRequest) -> api::GenerateReque
             .map(|d| one_optional_i64(Some(d.bootstrap_room))),
         routed_dp_rank: request.routed_dp_rank.map(i64::from),
         image_data: media(request.image_data),
+        mm_hashes: (!request.mm_hashes.is_empty()).then_some(api::StringListOrList {
+            value: Some(api::string_list_or_list::Value::One(api::StringList {
+                items: request.mm_hashes,
+            })),
+        }),
         video_data: media(request.video_data),
         audio_data: media(request.audio_data),
         priority: request.priority.map(i64::from),
@@ -373,6 +378,7 @@ mod tests {
             rid: Some("r1".into()),
             routing_key: Some("k".into()),
             image_data: vec!["data:image/png;base64,AA".into()],
+            mm_hashes: vec!["sha256:00".into()],
             return_text: Some(false),
             ..Default::default()
         };
@@ -398,6 +404,10 @@ mod tests {
         assert!(matches!(
             api.image_data.unwrap().value,
             Some(api::media_input::Value::Many(items)) if items.items.len() == 1
+        ));
+        assert!(matches!(
+            api.mm_hashes.unwrap().value,
+            Some(api::string_list_or_list::Value::One(list)) if list.items == vec!["sha256:00"]
         ));
     }
 

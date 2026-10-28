@@ -8,8 +8,9 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sglang_api_types::api::v1::{
     GenerateMetaInfo, GenerateRequest, GenerateResponse, GenerateStreamError, ImagesConfig,
-    Int64List, LogprobEntry, NullableTopLogprobs, SamplingParams, SamplingParamsOrList, TokenIds,
-    TokenIdsOrList, WatermarkRequestConfig, sampling_params_or_list, string_or_list,
+    Int64List, LogprobEntry, MediaInput, MediaItem, MediaItems, NullableTopLogprobs,
+    OptionalMediaItem, SamplingParams, SamplingParamsOrList, TokenIds, TokenIdsOrList,
+    WatermarkRequestConfig, media_input, media_item, sampling_params_or_list, string_or_list,
     token_ids_or_list,
 };
 
@@ -46,6 +47,10 @@ pub struct ChatModel {
     /// OpenAI layer special-cases `"kimi_k3"`.
     #[serde(default)]
     pub chat_encoding_spec: Option<String>,
+    /// Whether the engine takes images (`is_multimodal`, from the launch):
+    /// `_apply_jinja_template` rejects image input otherwise.
+    #[serde(default)]
+    pub is_multimodal: bool,
 }
 
 impl ChatModel {
@@ -298,10 +303,22 @@ pub fn lower_chat(
         || raw
             .get("messages")
             .and_then(Value::as_array)
-            .is_some_and(|m| m.iter().any(has_tools_or_media))
+            .is_some_and(|m| m.iter().any(|message| has_tools_or_media(message, model)))
     {
         return Err(Unsupported("unsupported_chat_feature"));
     }
+    // Image sources in prompt order, as `process_content_for_template_format`
+    // collects them into `image_data`; the renderer places one placeholder per image.
+    let image_data = raw
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages
+                .iter()
+                .flat_map(image_sources)
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
     let labels = custom_labels(headers, settings)?;
     if settings.return_input_ids || settings.return_output_ids || headers.sglext_ids {
         return Err(Unsupported("sglext_output"));
@@ -400,7 +417,7 @@ pub fn lower_chat(
     };
 
     let mut lowered = generate_body(
-        &request, &kwargs, model, prompt_ids, thinking, headers, settings,
+        &request, &kwargs, model, prompt_ids, thinking, headers, settings, image_data,
     )?;
     lowered.custom_labels = labels;
     // `get_structure_constraint`: K3's tool parser constrains `auto` calls by
@@ -595,17 +612,42 @@ fn truthy(value: &Value) -> bool {
         && value.as_array().is_none_or(|items| !items.is_empty())
 }
 
-fn has_tools_or_media(message: &Value) -> bool {
-    let media = |part: &Value| {
-        matches!(
-            part["type"].as_str(),
-            Some("image_url" | "video_url" | "audio_url" | "input_audio")
-        )
+/// Whether a message carries what this layer does not lower: per-message
+/// tools, video or audio, or images for a model whose renderer does not place
+/// them (Kimi K3's does, one `<|media_pad|>` per image, as Python's).
+fn has_tools_or_media(message: &Value, model: &ChatModel) -> bool {
+    let images_render =
+        model.is_multimodal && model.chat_encoding_spec.as_deref() == Some("kimi_k3");
+    let media = |part: &Value| match part["type"].as_str() {
+        Some("video_url" | "audio_url" | "input_audio") => true,
+        Some("image_url" | "input_image") => !images_render,
+        _ => false,
     };
     message.get("tools").is_some_and(truthy)
         || message["content"]
             .as_array()
             .is_some_and(|parts| parts.iter().any(media))
+}
+
+/// The image sources of a message, in order: `image_url.url`, or the string
+/// form of `image_url` / `input_image`.
+fn image_sources(message: &Value) -> Vec<String> {
+    message["content"]
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter(|part| matches!(part["type"].as_str(), Some("image_url" | "input_image")))
+                .filter_map(|part| match &part["image_url"] {
+                    Value::String(url) => Some(url.clone()),
+                    Value::Object(image) => {
+                        image.get("url").and_then(Value::as_str).map(str::to_owned)
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn valid_effort(effort: &Value) -> bool {
@@ -739,10 +781,13 @@ fn valid_message(message: &Value) -> bool {
     }
 }
 
-/// A text, `tool_reference` or (in assistant messages) thinking content part.
+/// A text, image, `tool_reference` or (in assistant messages) thinking
+/// content part. `ChatCompletionMessageContentImagePart` needs `image_url.url`;
+/// whether the model renders images is decided before validation.
 fn text_part(part: &Value, assistant: bool) -> bool {
     match part["type"].as_str() {
         Some("text") => part["text"].is_string(),
+        Some("image_url") => part["image_url"]["url"].is_string(),
         Some("tool_reference") => part["name"].is_string(),
         // `ChatCompletionMessageContentThinkingPart`: exactly one of `thinking` and `text`.
         Some("thinking" | "reasoning") if assistant => {
@@ -778,6 +823,7 @@ fn optional(object: &Map<String, Value>, key: &str, valid: impl Fn(&Value) -> bo
         .is_none_or(|value| value.is_null() || valid(value))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn generate_body(
     request: &ChatRequest,
     kwargs: &Map<String, Value>,
@@ -786,6 +832,7 @@ fn generate_body(
     thinking: bool,
     headers: &OpenAiHeaders<'_>,
     settings: &OpenAiSettings,
+    image_data: Vec<String>,
 ) -> Result<GenerateRequest, Unsupported> {
     let model_defaults = settings.sampling_defaults.as_deref().unwrap_or("model") == "model";
     let param = |value: Option<f64>, name: &str, default: f64| -> Result<f64, Unsupported> {
@@ -891,6 +938,18 @@ fn generate_body(
             })),
         }),
         require_reasoning: Some(thinking),
+        image_data: (!image_data.is_empty()).then(|| MediaInput {
+            value: Some(media_input::Value::Many(MediaItems {
+                items: image_data
+                    .into_iter()
+                    .map(|url| OptionalMediaItem {
+                        item: Some(MediaItem {
+                            value: Some(media_item::Value::Source(url)),
+                        }),
+                    })
+                    .collect(),
+            })),
+        }),
         ..Default::default()
     })
 }
@@ -1330,6 +1389,81 @@ mod tests {
         assert_eq!(
             custom.thinking(Some("deepseek-v4"), &Map::new()),
             Some(false)
+        );
+    }
+
+    /// Kimi K3 lowers image parts (its renderer places one pad per image) and
+    /// carries their sources as `image_data`; other models still send images to
+    /// the engine's own OpenAI route, and video or audio always does.
+    #[test]
+    fn kimi_k3_images_lower_with_their_sources() {
+        let messages = json!([{"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {"url": "https://x/a.png"}},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA", "detail": "low"}}]}]);
+        let body = serde_json::to_vec(&json!({"model": "m", "messages": messages})).unwrap();
+        let k3 = ChatModel {
+            chat_encoding_spec: Some("kimi_k3".into()),
+            is_multimodal: true,
+            ..ChatModel::default()
+        };
+        let render = |_: &Value| Some(vec![1, 7, 7]);
+        let (generate, _) = lower_chat(
+            &body,
+            &OpenAiHeaders::default(),
+            &OpenAiSettings::default(),
+            &k3,
+            render,
+            None,
+        )
+        .expect("images lower for Kimi K3");
+        let Some(media_input::Value::Many(items)) = generate.image_data.unwrap().value else {
+            panic!("image_data lists the sources")
+        };
+        let sources: Vec<&str> = items
+            .items
+            .iter()
+            .filter_map(|i| match &i.item.as_ref()?.value {
+                Some(media_item::Value::Source(url)) => Some(url.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sources, vec!["https://x/a.png", "data:image/png;base64,AA"]);
+        // Not for a model whose renderer does not place images.
+        assert_eq!(
+            unsupported(messages.clone()),
+            Some("unsupported_chat_feature")
+        );
+        // A Kimi K3 launched without multimodal support rejects images as Python does.
+        let text_only = ChatModel {
+            is_multimodal: false,
+            ..k3.clone()
+        };
+        let body = serde_json::to_vec(&json!({"model": "m", "messages": messages})).unwrap();
+        assert!(
+            lower_chat(
+                &body,
+                &OpenAiHeaders::default(),
+                &OpenAiSettings::default(),
+                &text_only,
+                render,
+                None
+            )
+            .is_err()
+        );
+        let audio = json!([{"role": "user", "content": [
+            {"type": "input_audio", "input_audio": {"data": "AA", "format": "wav"}}]}]);
+        let body = serde_json::to_vec(&json!({"model": "m", "messages": audio})).unwrap();
+        assert!(
+            lower_chat(
+                &body,
+                &OpenAiHeaders::default(),
+                &OpenAiSettings::default(),
+                &k3,
+                render,
+                None
+            )
+            .is_err()
         );
     }
 

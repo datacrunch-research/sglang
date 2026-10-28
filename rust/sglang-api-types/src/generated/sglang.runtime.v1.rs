@@ -177,6 +177,12 @@ pub struct GenerateRequest {
     pub video_data: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, repeated, tag = "21")]
     pub audio_data: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Caller-supplied identities of the media items, in item order, as the
+    /// HTTP body's mm_hashes (`sha256:<64 hex>` of the raw bytes): the engine
+    /// keys its media and KV caches on them instead of hashing the processor
+    /// output, so a router that hashed the bytes can predict the KV sequence.
+    #[prost(string, repeated, tag = "22")]
+    pub mm_hashes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// Versioned KV-hint envelope forwarded from a trusted orchestrator.
 #[derive(Clone, PartialEq, ::prost::Message)]
