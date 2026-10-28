@@ -399,6 +399,12 @@ worker instance must qualify independently. Completed client generations,
 including usage-free streams and gRPC output, supply recent proof and avoid
 queuing another probe behind busy engines.
 
+A discovery event (a worker added, removed, moved between Services or changing
+role) probes the workers not yet proven at once, then up to the success
+threshold 250 ms apart, so a ready engine joins in about a probe round trip
+instead of at the next interval; these probes only count successes. Until some
+worker or pair has qualified, requests are still refused.
+
 `/health`, `/healthz` and `/liveness` report router liveness. `/readiness` and
 `/readyz` require completed startup, a usable worker or compatible role pair,
 and settled KV bootstrap; they reject traffic during shutdown drain. In an

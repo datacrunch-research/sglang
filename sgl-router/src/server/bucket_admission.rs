@@ -665,6 +665,7 @@ pub fn spawn_membership_watch(ctx: Arc<AppContext>) -> Option<tokio::task::JoinH
         tokio::spawn(async move {
             loop {
                 let changed = ctx.registry.membership.changed();
+                let ready = ctx.registry.membership.ready();
                 refresh_members(
                     &ctx.chat_routing,
                     &ctx.registry,
@@ -672,6 +673,7 @@ pub fn spawn_membership_watch(ctx: Arc<AppContext>) -> Option<tokio::task::JoinH
                 );
                 tokio::select! {
                     () = changed => {}
+                    () = ready => {}
                     () = tokio::time::sleep(MEMBERSHIP_RECHECK) => {}
                 }
             }

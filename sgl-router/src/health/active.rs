@@ -16,6 +16,10 @@ use std::{
     time::Duration,
 };
 
+/// Spacing of the join probes after a discovery event. Arbitrary; short next
+/// to any health interval.
+const JOIN_RETRY: Duration = Duration::from_millis(250);
+
 pub struct ActiveHealth {
     config: HealthCheckConfig,
     state: Mutex<HealthState>,
@@ -66,6 +70,10 @@ impl ActiveHealth {
         })
     }
 
+    /// Check every worker each interval; after a discovery event (Added,
+    /// ServicesChanged, ModeChanged, Removed), probe the workers not yet proven
+    /// at once, so a ready engine joins in about a probe round trip rather
+    /// than at the next interval.
     pub async fn run(ctx: Arc<AppContext>) {
         let health = Arc::clone(
             ctx.active_health
@@ -74,16 +82,130 @@ impl ActiveHealth {
         );
         let mut interval = tokio::time::interval(Duration::from_secs(health.config.interval_secs));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Kept across checks, so an event during one is not missed.
+        let mut changed = std::pin::pin!(ctx.registry.membership.changed());
         loop {
-            interval.tick().await;
-            health.check(&ctx).await;
+            tokio::select! {
+                _ = interval.tick() => health.check(&ctx).await,
+                () = &mut changed => {
+                    changed.set(ctx.registry.membership.changed());
+                    health.join(&ctx).await;
+                }
+            }
         }
+    }
+
+    /// Probe the unproven workers up to `success_threshold` times,
+    /// [`JOIN_RETRY`] apart, stopping once none is left. Only successes count
+    /// here; failures are left to the interval check.
+    async fn join(&self, ctx: &AppContext) {
+        for attempt in 0..self.config.success_threshold.max(1) {
+            if attempt > 0 {
+                tokio::time::sleep(JOIN_RETRY).await;
+            }
+            if !self.prove_unproven(ctx).await {
+                break;
+            }
+        }
+    }
+
+    /// One probe of the workers whose health is not proven; true while some remain.
+    async fn prove_unproven(&self, ctx: &AppContext) -> bool {
+        let workers = ctx
+            .registry
+            .workers_for(&ModelId(ctx.config.model.id.clone()));
+        let unproven: HashSet<u64> = {
+            let state = self.state.lock().unwrap();
+            (workers.iter())
+                .map(|worker| worker.health_instance())
+                .filter(|id| !state.streaks.get(id).is_some_and(|s| s.proven))
+                .collect()
+        };
+        if unproven.is_empty() {
+            return false;
+        }
+        let proven = self.probe(ctx, &workers, Some(&unproven)).await;
+        let mut flipped = false;
+        let mut remaining = false;
+        {
+            let mut state = self.state.lock().unwrap();
+            for worker in &workers {
+                let id = worker.health_instance();
+                if !unproven.contains(&id) {
+                    continue;
+                }
+                let streak = state.streaks.entry(id).or_default();
+                if proven.contains(&id) {
+                    streak.failures = 0;
+                    streak.successes = streak.successes.saturating_add(1);
+                    if streak.successes >= self.config.success_threshold {
+                        streak.proven = true;
+                        worker.set_active_healthy(true);
+                        flipped = true;
+                    }
+                }
+                remaining |= !streak.proven;
+            }
+        }
+        if flipped {
+            ctx.registry.membership.readiness_changed();
+        }
+        remaining
     }
 
     async fn check(&self, ctx: &AppContext) {
         let workers = ctx
             .registry
             .workers_for(&ModelId(ctx.config.model.id.clone()));
+        let proven = self.probe(ctx, &workers, None).await;
+        let current: HashSet<_> = ctx
+            .registry
+            .workers_for(&ModelId(ctx.config.model.id.clone()))
+            .iter()
+            .map(|worker| worker.health_instance())
+            .collect();
+        let mut flipped = false;
+        let mut state = self.state.lock().unwrap();
+        state.streaks.retain(|id, _| current.contains(id));
+        for worker in workers {
+            let id = worker.health_instance();
+            if !current.contains(&id) {
+                continue;
+            }
+            let streak = state.streaks.entry(id).or_default();
+            if proven.contains(&id) {
+                streak.failures = 0;
+                streak.successes = streak.successes.saturating_add(1);
+                if streak.successes >= self.config.success_threshold {
+                    flipped |= !streak.proven;
+                    streak.proven = true;
+                    worker.set_active_healthy(true);
+                }
+            } else {
+                streak.successes = 0;
+                streak.failures = streak.failures.saturating_add(1);
+                if streak.failures >= self.config.failure_threshold {
+                    flipped |= streak.proven;
+                    streak.proven = false;
+                    worker.set_active_healthy(false);
+                }
+            }
+        }
+        drop(state);
+        if flipped {
+            ctx.registry.membership.readiness_changed();
+        }
+    }
+
+    /// The workers proven this round: live on `/health`, and under generation
+    /// mode serving a one-token generation (per prefill/decode pair). With
+    /// `focus`, generation probes only pairs with a focused side.
+    async fn probe(
+        &self,
+        ctx: &AppContext,
+        workers: &[Arc<Worker>],
+        focus: Option<&HashSet<u64>>,
+    ) -> HashSet<u64> {
         let timeout = Duration::from_secs(self.config.timeout_secs);
         let freshness = Duration::from_secs(
             self.config
@@ -110,41 +232,11 @@ impl ActiveHealth {
             .filter_map(std::future::ready)
             .collect()
             .await;
-        let proven = if self.config.mode == HealthCheckMode::Http {
+        if self.config.mode == HealthCheckMode::Http {
             live
         } else {
-            self.generation_checks(ctx, &workers, &live, timeout, freshness)
+            self.generation_checks(ctx, workers, &live, timeout, freshness, focus)
                 .await
-        };
-        let current: HashSet<_> = ctx
-            .registry
-            .workers_for(&ModelId(ctx.config.model.id.clone()))
-            .iter()
-            .map(|worker| worker.health_instance())
-            .collect();
-        let mut state = self.state.lock().unwrap();
-        state.streaks.retain(|id, _| current.contains(id));
-        for worker in workers {
-            let id = worker.health_instance();
-            if !current.contains(&id) {
-                continue;
-            }
-            let streak = state.streaks.entry(id).or_default();
-            if proven.contains(&id) {
-                streak.failures = 0;
-                streak.successes = streak.successes.saturating_add(1);
-                if streak.successes >= self.config.success_threshold {
-                    streak.proven = true;
-                    worker.set_active_healthy(true);
-                }
-            } else {
-                streak.successes = 0;
-                streak.failures = streak.failures.saturating_add(1);
-                if streak.failures >= self.config.failure_threshold {
-                    streak.proven = false;
-                    worker.set_active_healthy(false);
-                }
-            }
         }
     }
 
@@ -155,19 +247,24 @@ impl ActiveHealth {
         live: &HashSet<u64>,
         timeout: Duration,
         freshness: Duration,
+        focus: Option<&HashSet<u64>>,
     ) -> HashSet<u64> {
+        let focused =
+            |worker: &Worker| focus.is_none_or(|ids| ids.contains(&worker.health_instance()));
         let mut pairs = Vec::new();
         for worker in workers {
             if !live.contains(&worker.health_instance()) || worker.awaiting_bootstrap_port() {
                 continue;
             }
             match worker.mode() {
-                WorkerMode::Plain => pairs.push((Arc::clone(worker), None)),
+                WorkerMode::Plain if focused(worker) => pairs.push((Arc::clone(worker), None)),
+                WorkerMode::Plain => {}
                 WorkerMode::Prefill => {
                     for decode in workers {
                         if decode.mode() == WorkerMode::Decode
                             && live.contains(&decode.health_instance())
                             && decode.version_group() == worker.version_group()
+                            && (focused(worker) || focused(decode))
                         {
                             pairs.push((Arc::clone(worker), Some(Arc::clone(decode))));
                         }
@@ -382,6 +479,66 @@ mod tests {
         f.health.check(&f.ctx).await;
         assert_eq!(f.probe.health_calls.load(Ordering::Relaxed), calls);
         assert!(f.health.ready(&f.ctx));
+    }
+
+    /// A worker discovered between intervals is probed at once and joins after
+    /// `success_threshold` probes `JOIN_RETRY` apart, not at the next interval.
+    #[tokio::test]
+    async fn an_added_worker_joins_within_the_join_window_not_the_interval() {
+        let app = axum::Router::new()
+            .route("/health", get(|| async { StatusCode::OK }))
+            .route(
+                "/generate",
+                post(|| async {
+                    Json(serde_json::json!({"text":"OK","meta_info":{"completion_tokens":1}}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut ctx = AppContext::stub();
+        ctx.policies =
+            Arc::new(crate::policies::factory::build_registry_with_defaults(&ctx.config).unwrap());
+        ctx.registry.require_active_health();
+        ctx.active_health = Some(Arc::new(ActiveHealth::new(HealthCheckConfig {
+            mode: HealthCheckMode::Generation,
+            interval_secs: 60,
+            timeout_secs: 1,
+            failure_threshold: 3,
+            success_threshold: 2,
+        })));
+        let ctx = Arc::new(ctx);
+        let health = tokio::spawn(ActiveHealth::run(Arc::clone(&ctx)));
+        // Let the first interval check pass with no workers.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let ready = ctx.registry.membership.ready();
+        ctx.registry
+            .add(WorkerSpec {
+                id: WorkerId("late".into()),
+                url,
+                model_ids: vec![ModelId(ctx.config.model.id.clone())],
+                ..Default::default()
+            })
+            .unwrap();
+        let worker = Arc::clone(&ctx.registry.all()[0]);
+        assert!(!worker.active_health_passes(), "unproven until probed");
+        let added = std::time::Instant::now();
+        ctx.registry
+            .membership
+            .record(crate::workers::MembershipEvent::Added);
+        tokio::time::timeout(Duration::from_secs(2), ready)
+            .await
+            .expect("proving the worker wakes readiness watchers");
+        assert!(worker.active_health_passes());
+        assert!(ctx.active_health.as_ref().unwrap().ready(&ctx));
+        assert!(
+            added.elapsed() >= JOIN_RETRY,
+            "two probes for a threshold of two"
+        );
+        health.abort();
+        server.abort();
     }
 
     #[test]

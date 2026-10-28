@@ -65,6 +65,7 @@ impl MembershipEvent {
 pub struct MembershipEvents {
     counts: [std::sync::atomic::AtomicU64; 4],
     changed: tokio::sync::Notify,
+    ready: tokio::sync::Notify,
 }
 
 impl MembershipEvents {
@@ -80,6 +81,16 @@ impl MembershipEvents {
     /// Resolves at the next recorded event; create it before reading state.
     pub fn changed(&self) -> tokio::sync::futures::Notified<'_> {
         self.changed.notified()
+    }
+
+    /// Wake readiness watchers: active health proved or failed a worker.
+    pub fn readiness_changed(&self) {
+        self.ready.notify_waiters();
+    }
+
+    /// Resolves at the next readiness change; create it before reading state.
+    pub fn ready(&self) -> tokio::sync::futures::Notified<'_> {
+        self.ready.notified()
     }
 }
 
