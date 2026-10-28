@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 pub const PREFIX_MATCH_PATH: &str = "/internal/prefix_match";
 pub const CELL_LOAD_PATH: &str = "/internal/cell_load";
 pub const CELL_INFO_PATH: &str = "/internal/cell_info";
+pub const CELL_FILES_PATH: &str = "/internal/cell_files/{name}";
 
 /// Body of `POST /internal/prefix_match`. The caller sends the prompt's
 /// leading tokens (a few thousand are enough: an owner is decided by the
@@ -320,6 +321,57 @@ impl CellChatSettings {
 
 pub async fn cell_info(State(ctx): State<Arc<AppContext>>) -> Json<CellInfo> {
     Json(cell_info_answer(&ctx))
+}
+
+/// The model files a Global Router may fetch from this cell: what it needs
+/// to tokenize and render as the engines do, from the directory holding the
+/// tokenizer (`--tokenizer-path`, a file or a directory). Nothing else under
+/// that directory is served: the weights are not on this list.
+pub const CELL_FILES: &[&str] = &[
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "tokenizer.model",
+    "special_tokens_map.json",
+    "config.json",
+    "generation_config.json",
+    "preprocessor_config.json",
+    "chat_template.jinja",
+    "chat_template.json",
+];
+
+/// `GET /internal/cell_files/{name}`: one of [`CELL_FILES`] beside the
+/// tokenizer, for a Global Router whose own host has no copy of the model
+/// (it learns the model from `cell_info` and loads the tokenizer from
+/// here). A name off the list, no tokenizer path, or a missing file is a 404.
+pub async fn cell_file(
+    State(ctx): State<Arc<AppContext>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    if !CELL_FILES.contains(&name.as_str()) {
+        return (StatusCode::NOT_FOUND, "not a cell file").into_response();
+    }
+    let Some(tokenizer_path) = ctx.config.model.tokenizer_path.as_deref() else {
+        return (StatusCode::NOT_FOUND, "no tokenizer path").into_response();
+    };
+    let dir = {
+        let path = std::path::Path::new(tokenizer_path);
+        if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.parent().map(|p| p.to_path_buf()).unwrap_or_default()
+        }
+    };
+    match tokio::fs::read(dir.join(&name)).await {
+        Ok(bytes) => {
+            let content_type = if name.ends_with(".json") {
+                "application/json"
+            } else {
+                "application/octet-stream"
+            };
+            ([(axum::http::header::CONTENT_TYPE, content_type)], bytes).into_response()
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "no such file beside the tokenizer").into_response(),
+    }
 }
 
 /// What this cell serves, shared by the HTTP route and the gRPC `GetCellInfo` RPC.
@@ -787,6 +839,46 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["matched_prefix_blocks"], 0);
+    }
+
+    /// A Global Router with no copy of the model fetches the files beside the
+    /// tokenizer from the cell: the listed names only, nothing else under
+    /// that directory, and nothing without a tokenizer path.
+    #[tokio::test]
+    async fn cell_files_serves_the_model_files_beside_the_tokenizer() {
+        let dir =
+            std::env::temp_dir().join(format!("sgl-router-cell-files-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tokenizer.json"), r#"{"version": "1.0"}"#).unwrap();
+        std::fs::write(dir.join("config.json"), r#"{"model_type": "test"}"#).unwrap();
+        std::fs::write(dir.join("model.safetensors"), b"weights").unwrap();
+        let mut ctx = AppContext::stub();
+        ctx.config.model.tokenizer_path =
+            Some(dir.join("tokenizer.json").to_string_lossy().into_owned());
+        let ctx = Arc::new(ctx);
+        let (status, body) = get_json(ctx.clone(), "/internal/cell_files/tokenizer.json").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["version"], "1.0");
+        let (status, body) = get_json(ctx.clone(), "/internal/cell_files/config.json").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["model_type"], "test");
+        // Listed but absent, and present but not listed: both 404.
+        let (status, _) =
+            get_json(ctx.clone(), "/internal/cell_files/generation_config.json").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = get_json(ctx.clone(), "/internal/cell_files/model.safetensors").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // A directory as the tokenizer path serves the same files.
+        let mut ctx = AppContext::stub();
+        ctx.config.model.tokenizer_path = Some(dir.to_string_lossy().into_owned());
+        let (status, _) = get_json(Arc::new(ctx), "/internal/cell_files/tokenizer.json").await;
+        assert_eq!(status, StatusCode::OK);
+        // No tokenizer path: nothing to serve.
+        let mut ctx = AppContext::stub();
+        ctx.config.model.tokenizer_path = None;
+        let (status, _) = get_json(Arc::new(ctx), "/internal/cell_files/tokenizer.json").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

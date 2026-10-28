@@ -274,6 +274,10 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route(
             crate::server::routes::cell::CELL_INFO_PATH,
             get(crate::server::routes::cell::cell_info),
+        )
+        .route(
+            crate::server::routes::cell::CELL_FILES_PATH,
+            get(crate::server::routes::cell::cell_file),
         );
     // A route that panics on purpose, so the panic-handling layers below are
     // exercised as `build_router` actually composes them. Without it the layers
