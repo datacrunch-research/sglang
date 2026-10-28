@@ -11,7 +11,10 @@
 //! 1. Initialize a SHA256 hasher.
 //! 2. If a prior page exists, feed the prior page's **full 32-byte SHA256
 //!    digest** (raw bytes, not the truncated i64) into the hasher.
-//! 3. Feed each token in the page as 4 little-endian unsigned bytes.
+//! 3. Feed each token in the page as 4 little-endian unsigned bytes, unless
+//!    any token of the page is above `u32::MAX` (a multimodal pad sentinel):
+//!    then a `0xff` tag goes first and every token takes 8 little-endian
+//!    bytes (`sglang-radix-tree`'s `hash_page`, "wide pages").
 //! 4. Take the 32-byte digest as the new "prior" for the next page.
 //! 5. Truncate the digest to a signed i64 by reading the first 16 hex chars
 //!    (top 64 bits) and reinterpreting as signed.
@@ -61,7 +64,7 @@ impl CacheNamespace {
 
     /// Canonical prompt lookup keys. Base keys match the legacy publisher;
     /// LoRA keys use the public adapter name, independently of worker block IDs.
-    pub fn block_hashes(&self, token_ids: &[u32], block_size: usize, bigram: bool) -> Vec<i64> {
+    pub fn block_hashes(&self, token_ids: &[u64], block_size: usize, bigram: bool) -> Vec<i64> {
         if self.ambiguous {
             return Vec::new();
         }
@@ -105,11 +108,11 @@ fn sha256_parts(parts: &[&[u8]]) -> [u8; 32] {
 /// Panics if `block_size == 0`. Callers are expected to validate this once
 /// up-front against the worker-published `block_size`; an invalid value is
 /// a programmer/config bug, not a runtime input we should swallow.
-pub fn compute_block_hashes(token_ids: &[u32], block_size: usize) -> Vec<i64> {
+pub fn compute_block_hashes(token_ids: &[u64], block_size: usize) -> Vec<i64> {
     chain(token_ids, block_size, None)
 }
 
-fn chain(token_ids: &[u32], block_size: usize, mut prior: Option<[u8; 32]>) -> Vec<i64> {
+fn chain(token_ids: &[u64], block_size: usize, mut prior: Option<[u8; 32]>) -> Vec<i64> {
     assert!(block_size > 0, "block_size must be positive");
     if token_ids.is_empty() {
         return Vec::new();
@@ -134,15 +137,33 @@ fn chain(token_ids: &[u32], block_size: usize, mut prior: Option<[u8; 32]>) -> V
 /// Hash a single page, optionally chained to a parent block's full 32-byte
 /// SHA256 digest. Returns the new 32-byte digest.
 #[inline]
-fn chain_block(parent_digest: Option<&[u8; 32]>, block_tokens: &[u32]) -> [u8; 32] {
+fn chain_block(parent_digest: Option<&[u8; 32]>, block_tokens: &[u64]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     if let Some(parent) = parent_digest {
         hasher.update(parent);
     }
-    for t in block_tokens {
-        hasher.update(t.to_le_bytes());
-    }
+    feed_words(&mut hasher, block_tokens.iter().copied());
     hasher.finalize().into()
+}
+
+/// Feeds a page's token words as the engine's `hash_page` does: 4 LE bytes
+/// each, or, when any word is above `u32::MAX`, a `0xff` tag then 8 LE bytes
+/// each. The words are collected once so the width is known before the first
+/// is fed.
+#[inline]
+fn feed_words(hasher: &mut Sha256, words: impl Iterator<Item = u64>) {
+    let words: Vec<u64> = words.collect();
+    let wide = words.iter().any(|w| *w > u64::from(u32::MAX));
+    if wide {
+        hasher.update([0xff]);
+    }
+    for w in words {
+        if wide {
+            hasher.update(w.to_le_bytes());
+        } else {
+            hasher.update((w as u32).to_le_bytes());
+        }
+    }
 }
 
 /// Convert a full 32-byte SHA256 digest to the signed i64 truncation that
@@ -180,11 +201,11 @@ pub fn sha256_to_i64(digest: &[u8; 32]) -> i64 {
 /// EAGLE speculative algorithm via `/server_info`; otherwise the router's query
 /// hashes won't match the worker's stored bigram block hashes and cache-aware
 /// routing silently degrades to min-load.
-pub fn compute_block_hashes_bigram(token_ids: &[u32], block_size: usize) -> Vec<i64> {
+pub fn compute_block_hashes_bigram(token_ids: &[u64], block_size: usize) -> Vec<i64> {
     chain_bigram(token_ids, block_size, None)
 }
 
-fn chain_bigram(token_ids: &[u32], block_size: usize, mut prior: Option<[u8; 32]>) -> Vec<i64> {
+fn chain_bigram(token_ids: &[u64], block_size: usize, mut prior: Option<[u8; 32]>) -> Vec<i64> {
     assert!(block_size > 0, "block_size must be positive");
     // N raw tokens -> N-1 overlapping bigrams; fewer than 2 tokens -> no blocks.
     let logical_len = token_ids.len().saturating_sub(1);
@@ -214,7 +235,7 @@ fn chain_bigram(token_ids: &[u32], block_size: usize, mut prior: Option<[u8; 32]
 #[inline]
 fn chain_block_bigram(
     parent_digest: Option<&[u8; 32]>,
-    tokens: &[u32],
+    tokens: &[u64],
     start: usize,
     end: usize,
 ) -> [u8; 32] {
@@ -222,16 +243,41 @@ fn chain_block_bigram(
     if let Some(parent) = parent_digest {
         hasher.update(parent);
     }
-    for j in start..end {
-        hasher.update(tokens[j].to_le_bytes());
-        hasher.update(tokens[j + 1].to_le_bytes());
-    }
+    feed_words(
+        &mut hasher,
+        (start..end).flat_map(|j| [tokens[j], tokens[j + 1]]),
+    );
     hasher.finalize().into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reference values from the engine's `hash_page` rule, computed with
+    /// Python hashlib: narrow pages feed 4-byte words; a page with a word
+    /// above u64::MAX feeds a 0xff tag and 8-byte words, and only that page.
+    #[test]
+    fn wide_pages_hash_as_the_engine_does() {
+        assert_eq!(
+            compute_block_hashes(&[10, 20, 30, 40], 4),
+            vec![WIDE_GOLDENS[0]]
+        );
+        assert_eq!(
+            compute_block_hashes(&[10, 1_000_000 + (1 << 40), 30, 40], 4),
+            vec![WIDE_GOLDENS[1]]
+        );
+        assert_eq!(
+            compute_block_hashes(&[10, 20, 30, 40, 5, 1_000_000 + (1 << 61)], 4),
+            vec![WIDE_GOLDENS[0], WIDE_GOLDENS[2]]
+        );
+    }
+    // Python: sha256 of 4-byte LE words; of 0xff + 8-byte LE words; the second
+    // page of a chain whose first page is narrow and second wide.
+    const GOLDEN_NARROW: i64 = 2363863779256192285;
+    const GOLDEN_WIDE_FIRST: i64 = 578571603637136045;
+    const GOLDEN_WIDE_SECOND: i64 = -6258879877586278078;
+    const WIDE_GOLDENS: [i64; 3] = [GOLDEN_NARROW, GOLDEN_WIDE_FIRST, GOLDEN_WIDE_SECOND];
 
     // ---- Bigram cross-language goldens ----
     // Values produced by SGLang's REAL `RadixKey(..., is_bigram=True).hash_page`
@@ -303,7 +349,7 @@ mod tests {
         // Sanity: for >2 tokens the bigram hash must NOT equal the unigram hash
         // (different byte stream) — this is exactly why a unigram-hashing
         // router gets zero overlap against a bigram worker.
-        let toks = [10u32, 20, 30, 40];
+        let toks = [10u64, 20, 30, 40];
         assert_ne!(
             compute_block_hashes_bigram(&toks, 4),
             compute_block_hashes(&toks, 4)
@@ -320,13 +366,23 @@ mod tests {
     /// chained against an optional parent digest. This mirrors `chain_block`
     /// but is duplicated here so a regression in the production helper
     /// cannot also hide itself in the test oracle.
-    fn oracle_block_digest(parent: Option<&[u8; 32]>, tokens: &[u32]) -> [u8; 32] {
+    fn oracle_block_digest(parent: Option<&[u8; 32]>, tokens: &[u64]) -> [u8; 32] {
         let mut h = Sha256::new();
         if let Some(p) = parent {
             h.update(p);
         }
+        // The engine's rule: 4-byte words, or a 0xff tag and 8-byte words
+        // when any word of the page is above u32::MAX.
+        let wide = tokens.iter().any(|t| *t > u64::from(u32::MAX));
+        if wide {
+            h.update([0xff]);
+        }
         for t in tokens {
-            h.update(t.to_le_bytes());
+            if wide {
+                h.update(t.to_le_bytes());
+            } else {
+                h.update((*t as u32).to_le_bytes());
+            }
         }
         h.finalize().into()
     }
@@ -375,7 +431,7 @@ mod tests {
     fn multi_block_chain() {
         // 8 tokens, block_size 2 → 4 blocks, each chained against the
         // previous block's full 32-byte digest.
-        let tokens: [u32; 8] = [10, 20, 30, 40, 50, 60, 70, 80];
+        let tokens: [u64; 8] = [10, 20, 30, 40, 50, 60, 70, 80];
         let d0 = oracle_block_digest(None, &tokens[0..2]);
         let d1 = oracle_block_digest(Some(&d0), &tokens[2..4]);
         let d2 = oracle_block_digest(Some(&d1), &tokens[4..6]);

@@ -58,9 +58,11 @@ impl PrefixCachePolicy {
         let Some(tokens) = ctx.request_tokens().filter(|t| !t.is_empty()) else {
             return flat();
         };
+        // The KV path is 64-bit (multimodal pad sentinels); tokenizer ids widen.
+        let tokens: Vec<u64> = tokens.iter().map(|&id| u64::from(id)).collect();
         let Some(hashes) = self
             .block_size_oracle
-            .block_hashes(tokens, ctx.cache_namespace())
+            .block_hashes(&tokens, ctx.cache_namespace())
             .filter(|hashes| !hashes.is_empty())
         else {
             return flat();
@@ -130,7 +132,12 @@ mod tests {
         }))
     }
 
-    fn tokens() -> Vec<u32> {
+    fn tokens() -> Vec<u64> {
+        (0..(BLOCK as u64 * 4)).collect()
+    }
+
+    /// The same prompt as the tokenizer hands it to the selection context.
+    fn request_ids() -> Vec<u32> {
         (0..(BLOCK as u32 * 4)).collect()
     }
 
@@ -168,7 +175,7 @@ mod tests {
         let ws = vec![worker("deep"), worker("tail"), worker("cold")];
 
         let model = ModelId("tiny".into());
-        let ids = tokens();
+        let ids = request_ids();
         let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
 
         let scores = shares(&policy(tree), &ws, &ctx);
@@ -185,7 +192,7 @@ mod tests {
         let ws = vec![worker("dp")];
 
         let model = ModelId("tiny".into());
-        let ids = tokens();
+        let ids = request_ids();
         let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
         assert_eq!(
             shares(&policy(tree), &ws, &ctx),
@@ -202,7 +209,7 @@ mod tests {
         let model = ModelId("tiny".into());
         let policy = policy(tree);
 
-        let ids = tokens();
+        let ids = request_ids();
         let with = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
         assert_eq!(
             shares(&policy, &ws, &with),
@@ -225,7 +232,7 @@ mod tests {
         let ws = vec![worker("deep"), worker("cold")];
 
         let model = ModelId("tiny".into());
-        let ids = tokens();
+        let ids = request_ids();
         let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
         let cold = PrefixCachePolicy::new(tree, BlockSizeOracle::new(), 1.0);
         assert_eq!(shares(&cold, &ws, &ctx), vec![0.0, 0.0]);
@@ -242,7 +249,8 @@ mod tests {
         insert(&tree, "deep", 0, 0, 4);
         let ws = vec![worker("deep")];
         let model = ModelId("tiny".into());
-        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
+        let request = request_ids();
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&request));
 
         let oracle = BlockSizeOracle::new();
         oracle.try_set(BLOCK as u32).unwrap();

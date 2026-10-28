@@ -711,9 +711,15 @@ fn prompt_dp_rank(
         .flatten()
         .find_map(|name| nonempty_header(headers, name));
     let prefix_depths = match (key, &ctx.dp_rank_prefix_provider, &request.tokens) {
-        (None, Some(provider), Some(tokens)) => {
-            provider.rank_depths(&tokens.ids, &request.cache_namespace, &worker.url)
-        }
+        (None, Some(provider), Some(tokens)) => provider.rank_depths(
+            &tokens
+                .ids
+                .iter()
+                .map(|&id| u64::from(id))
+                .collect::<Vec<u64>>(),
+            &request.cache_namespace,
+            &worker.url,
+        ),
         _ => Vec::new(),
     };
     select_dp_rank(worker, key, &prefix_depths, model.dp_rank_policy)

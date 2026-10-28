@@ -600,15 +600,18 @@ async fn lookup_prefix_matches(
     let Some(tokens) = request.tokens.as_ref() else {
         return Ok(None);
     };
-    lookup_prefix_for_tokens(ctx, &tokens.ids, &request.cache_namespace, &request.model.0).await
+    let ids: Vec<u64> = tokens.ids.iter().map(|&id| u64::from(id)).collect();
+    lookup_prefix_for_tokens(ctx, &ids, &request.cache_namespace, &request.model.0).await
 }
 
 /// The prefix signal for `tokens` under `namespace`: the remote Indexer when
 /// configured and the block size is known, else the in-process radix tree.
 /// `None` without a usable prefix source.
+/// `tokens` are 64-bit as the engine caches them, so a multimodal prompt's
+/// pad sentinels (above 2^32) match the blocks the engine published.
 pub(crate) async fn lookup_prefix_for_tokens(
     ctx: &AppContext,
-    tokens: &[u32],
+    tokens: &[u64],
     namespace: &crate::state::kv_events::CacheNamespace,
     model: &str,
 ) -> Result<Option<PrefixLookupResult>, ApiError> {

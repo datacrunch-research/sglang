@@ -228,9 +228,11 @@ pub struct PrefixMatchRequest {
     /// The model the tokens belong to; must be the one this router serves.
     #[prost(string, optional, tag = "1")]
     pub model: ::core::option::Option<::prost::alloc::string::String>,
-    /// The prompt's leading token ids (a few thousand are enough).
-    #[prost(uint32, repeated, tag = "2")]
-    pub token_ids: ::prost::alloc::vec::Vec<u32>,
+    /// The prompt's leading token ids (a few thousand are enough), as the engine
+    /// caches them: 64-bit, so a multimodal prompt's pad sentinels (above
+    /// 2^32) travel as they are.
+    #[prost(uint64, repeated, tag = "2")]
+    pub token_ids: ::prost::alloc::vec::Vec<u64>,
     /// The whole prompt's length; defaults to token_ids.len().
     #[prost(uint64, optional, tag = "3")]
     pub input_tokens: ::core::option::Option<u64>,
