@@ -122,7 +122,7 @@ impl BlockSizeOracle {
 
     /// The prompt's block hashes as workers publish them; `None` until the
     /// block size is known.
-    pub fn block_hashes(&self, token_ids: &[u32], namespace: &CacheNamespace) -> Option<Vec<i64>> {
+    pub fn block_hashes(&self, token_ids: &[u64], namespace: &CacheNamespace) -> Option<Vec<i64>> {
         let block_size = self.get()? as usize;
         Some(namespace.block_hashes(token_ids, block_size, self.is_bigram()))
     }

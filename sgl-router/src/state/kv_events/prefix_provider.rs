@@ -54,7 +54,7 @@ impl RadixTreePrefixProvider {
 
     pub fn match_request_tokens(
         &self,
-        tokens: &[u32],
+        tokens: &[u64],
         namespace: &CacheNamespace,
     ) -> Option<PrefixLookupResult> {
         let hashes = self.block_hashes(tokens, namespace)?;
@@ -144,7 +144,7 @@ impl RadixTreePrefixProvider {
     /// `(dp_rank, cached prefix blocks)` for each rank of `worker_url`.
     pub fn rank_depths(
         &self,
-        tokens: &[u32],
+        tokens: &[u64],
         namespace: &CacheNamespace,
         worker_url: &str,
     ) -> Vec<(u32, usize)> {
@@ -159,7 +159,7 @@ impl RadixTreePrefixProvider {
             .collect()
     }
 
-    fn block_hashes(&self, tokens: &[u32], namespace: &CacheNamespace) -> Option<Vec<i64>> {
+    fn block_hashes(&self, tokens: &[u64], namespace: &CacheNamespace) -> Option<Vec<i64>> {
         let hashes = self.block_size_oracle.block_hashes(tokens, namespace)?;
         (!hashes.is_empty()).then_some(hashes)
     }
@@ -191,12 +191,12 @@ mod tests {
         RadixTreePrefixProvider::new(tree, oracle)
     }
 
-    fn tokens(blocks: usize) -> Vec<u32> {
-        (1..=(blocks * BLOCK as usize) as u32).collect()
+    fn tokens(blocks: usize) -> Vec<u64> {
+        (1..=(blocks * BLOCK as usize) as u64).collect()
     }
 
     /// Publish the first `blocks` blocks of `tokens` for `url` as KV events.
-    fn confirm(provider: &RadixTreePrefixProvider, url: &str, tokens: &[u32], blocks: usize) {
+    fn confirm(provider: &RadixTreePrefixProvider, url: &str, tokens: &[u64], blocks: usize) {
         let hashes = provider
             .block_hashes(tokens, &CacheNamespace::default())
             .expect("hashes");
@@ -216,7 +216,7 @@ mod tests {
             .store_event(&KvWorkerId::new(url.to_owned(), 0), &event);
     }
 
-    fn lookup(provider: &RadixTreePrefixProvider, tokens: &[u32]) -> PrefixLookupResult {
+    fn lookup(provider: &RadixTreePrefixProvider, tokens: &[u64]) -> PrefixLookupResult {
         provider
             .match_request_tokens(tokens, &CacheNamespace::default())
             .expect("lookup")
