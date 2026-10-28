@@ -8,5 +8,6 @@
 pub mod affinity_store;
 pub mod kv_events;
 pub mod load_monitor;
+pub mod session_estimator;
 
 pub use affinity_store::AffinityStore;

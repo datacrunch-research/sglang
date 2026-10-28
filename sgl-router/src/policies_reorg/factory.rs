@@ -8,14 +8,17 @@ use anyhow::{bail, ensure, Result};
 use serde::Deserialize;
 
 use crate::buckets_reorg::{
-    Bucket, BucketGroups, BucketResolver, EngineGroup, SloPreference, TokenLimits,
+    Bucket, BucketGroups, BucketResolver, EngineGroup, IdleSpec, SecondsLimits, SloPreference,
+    SpillTarget, TokenLimits,
 };
 use crate::config::{
     AffinityConfig, AffinityMode, BalancedBy, DecodePolicyKind, FilterKind, ModelConfig,
     PolicyKind, SessionAffinityMode,
 };
 use crate::discovery::WorkerId;
+use crate::server::bucket_admission::{BucketQueue, QueueSpec, TpmLimitSpec, TpmLimiter};
 use crate::state::kv_events::RadixTreePrefixProvider;
+use crate::state::session_estimator::{SessionEstimator, DEFAULT_SESSION_IDLE};
 use crate::state::{
     kv_events::KvEventIndex, load_monitor::router_inflight_load::JanitorHandle, AffinityStore,
 };
@@ -36,6 +39,26 @@ pub struct BucketsConfig {
     pub buckets: Vec<BucketSpec>,
     pub ttft_slo: SloPreference,
     pub tps_slo: SloPreference,
+    /// Seconds a session's last turn stays usable for the uncached estimate.
+    pub session_idle_secs: Option<u64>,
+    /// When an engine of a spill target counts as idle.
+    pub spill_idle: IdleSpec,
+    /// The pool's agreed tokens per minute; above it requests get 429.
+    pub tpm_limit: Option<TpmLimitSpec>,
+    /// What bucket bounds measure: `uncached_tokens` (`min/max_uncached_tokens`)
+    /// or `prefill_seconds` (`min/max_prefill_seconds`, uncached tokens over the
+    /// engines' measured prefill rate).
+    pub thresholds: Thresholds,
+    /// Under `prefill_seconds`, the rate used until the engines report one.
+    pub prefill_reference_rate_tokens_per_s: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Thresholds {
+    #[default]
+    UncachedTokens,
+    PrefillSeconds,
 }
 
 /// Set either `plain` or both `prefill` and `decode`.
@@ -46,9 +69,21 @@ pub struct BucketSpec {
     pub rank: u32,
     pub min_input_tokens: Option<u64>,
     pub max_input_tokens: Option<u64>,
+    /// Bounds on the request's estimated uncached prompt tokens.
+    pub min_uncached_tokens: Option<u64>,
+    pub max_uncached_tokens: Option<u64>,
+    /// Bounds on its estimated prefill seconds (`thresholds: prefill_seconds`).
+    pub min_prefill_seconds: Option<f64>,
+    pub max_prefill_seconds: Option<f64>,
     pub max_context_tokens: Option<u64>,
     pub ttft_ms: Option<u64>,
     pub tokens_per_second: Option<f64>,
+    /// Bounded wait queue: the request waits here for an engine of this
+    /// bucket instead of moving to the next fitting bucket.
+    pub queue: Option<QueueSpec>,
+    /// Longer buckets, in order, whose idle engines may take this bucket's
+    /// requests when none of its own admits one.
+    pub spill_to: Vec<String>,
     pub plain: Option<GroupSpec>,
     pub prefill: Option<GroupSpec>,
     pub decode: Option<GroupSpec>,
@@ -228,6 +263,13 @@ pub fn build_resolver(
             "bucket {id:?} needs min input tokens <= max input and context tokens, \
              and positive capacity and SLO estimates"
         );
+        ensure!(
+            spec.min_uncached_tokens
+                .zip(spec.max_uncached_tokens)
+                .is_none_or(|(min, max)| min <= max)
+                && spec.max_uncached_tokens != Some(0),
+            "bucket {id:?} needs min uncached tokens <= a positive max uncached tokens"
+        );
         let bucket_groups = match (&spec.plain, &spec.prefill, &spec.decode) {
             (Some(plain), None, None) => {
                 BucketGroups::Plain(groups.build(id, Stage::Plain, plain)?)
@@ -244,15 +286,130 @@ pub fn build_resolver(
             min: spec.min_input_tokens,
             max: spec.max_input_tokens,
         };
+        bucket.uncached = TokenLimits {
+            min: spec.min_uncached_tokens,
+            max: spec.max_uncached_tokens,
+        };
+        validate_thresholds(config, spec)?;
+        bucket.prefill_seconds = SecondsLimits {
+            min: spec.min_prefill_seconds,
+            max: spec.max_prefill_seconds,
+        };
+        if let Some(queue) = &spec.queue {
+            queue
+                .validate()
+                .map_err(|error| anyhow::anyhow!("bucket {id:?}: {error}"))?;
+            bucket.queue = Some(Arc::new(BucketQueue::new(id.clone(), queue.clone())));
+        }
+        bucket.spill_to = spec.spill_to.iter().map(SpillTarget::new).collect();
+        if let Some(decode) = &spec.decode {
+            let defaults = &model.reorg_admission;
+            bucket.decode_permits_per_engine = decode
+                .admission
+                .as_ref()
+                .map_or_else(|| defaults.clone(), |limits| limits.or(defaults))
+                .max_inflight_requests;
+        }
         bucket.max_context_tokens = spec.max_context_tokens;
         bucket.ttft_ms = spec.ttft_ms;
         bucket.tokens_per_second = spec.tokens_per_second;
         buckets.push(bucket);
     }
+    validate_spill(&buckets)?;
     let mut resolver = BucketResolver::new(buckets)?;
     resolver.ttft_slo = config.ttft_slo;
     resolver.tps_slo = config.tps_slo;
+    ensure!(
+        config.spill_idle.max_running_requests > 0,
+        "--bucket-config spill_idle.max_running_requests must be positive"
+    );
+    resolver.idle = config.spill_idle;
+    if config.thresholds == Thresholds::PrefillSeconds {
+        resolver.prefill_seconds_reference = config.prefill_reference_rate_tokens_per_s;
+    }
+    if let Some(spec) = &config.tpm_limit {
+        spec.validate()
+            .map_err(|error| anyhow::anyhow!("--bucket-config {error}"))?;
+        resolver.tpm = Some(Arc::new(TpmLimiter::new(spec.clone())));
+    }
+    ensure!(
+        config.session_idle_secs != Some(0),
+        "--bucket-config session_idle_secs must be positive"
+    );
+    if resolver.buckets.iter().any(Bucket::bounds_uncached_tokens) {
+        let idle = config
+            .session_idle_secs
+            .map_or(DEFAULT_SESSION_IDLE, Duration::from_secs);
+        resolver.estimator = Some(Arc::new(SessionEstimator::new(idle)));
+    }
     Ok((resolver, groups.cleanup))
+}
+
+/// A file bounds its buckets in one unit: uncached tokens, or prefill seconds
+/// with a positive reference rate.
+fn validate_thresholds(config: &BucketsConfig, spec: &BucketSpec) -> Result<()> {
+    let id = &spec.id;
+    let tokens = spec.min_uncached_tokens.is_some() || spec.max_uncached_tokens.is_some();
+    let seconds = spec.min_prefill_seconds.is_some() || spec.max_prefill_seconds.is_some();
+    match config.thresholds {
+        Thresholds::UncachedTokens => ensure!(
+            !seconds,
+            "bucket {id:?} sets prefill seconds; they need thresholds: prefill_seconds"
+        ),
+        Thresholds::PrefillSeconds => {
+            ensure!(
+                !tokens,
+                "bucket {id:?} sets uncached tokens under thresholds: prefill_seconds"
+            );
+            ensure!(
+                config
+                    .prefill_reference_rate_tokens_per_s
+                    .is_some_and(|rate| rate.is_finite() && rate > 0.0),
+                "thresholds: prefill_seconds needs a positive prefill_reference_rate_tokens_per_s"
+            );
+        }
+    }
+    let valid = |value: Option<f64>| value.is_none_or(|v| v.is_finite() && v >= 0.0);
+    ensure!(
+        valid(spec.min_prefill_seconds)
+            && valid(spec.max_prefill_seconds)
+            && spec.max_prefill_seconds != Some(0.0)
+            && spec
+                .min_prefill_seconds
+                .zip(spec.max_prefill_seconds)
+                .is_none_or(|(min, max)| min <= max),
+        "bucket {id:?} needs min prefill seconds <= a positive max prefill seconds"
+    );
+    Ok(())
+}
+
+/// Spill runs one way, from shorter lanes to longer ones: a target must take
+/// longer requests than its source (uncached bound first, then input bound).
+fn validate_spill(buckets: &[Bucket]) -> Result<()> {
+    let reach = |bucket: &Bucket| {
+        (
+            bucket.uncached_capacity(),
+            bucket.limits.max.unwrap_or(u64::MAX),
+        )
+    };
+    for bucket in buckets {
+        for target in &bucket.spill_to {
+            let Some(found) = buckets.iter().find(|b| b.id == target.bucket) else {
+                bail!(
+                    "bucket {:?} spills to unknown bucket {:?}",
+                    bucket.id,
+                    target.bucket
+                );
+            };
+            ensure!(
+                reach(found) > reach(bucket),
+                "bucket {:?} may spill only to a longer bucket, not {:?}",
+                bucket.id,
+                target.bucket
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Builds group policies; session stores and cache sources are shared by all groups.
@@ -372,6 +529,165 @@ impl Groups<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_model(buckets: serde_json::Value) -> ModelConfig {
+        ModelConfig {
+            id: "m".into(),
+            tokenizer_path: None,
+            disable_input_ids_forwarding: false,
+            tokenizer: Default::default(),
+            policy: PolicyKind::PowerOfTwo,
+            decode_policy: DecodePolicyKind::PowerOfTwo,
+            dp_aware: false,
+            dp_rank_policy: Default::default(),
+            bucket_config: None,
+            reorg_buckets: Some(serde_json::from_value(buckets).unwrap()),
+            reorg_admission: Default::default(),
+            circuit_breaker: None,
+            cache_aware: None,
+            sticky: None,
+            affinity: None,
+            fused: None,
+            eligibility: None,
+            sampling_overrides: Default::default(),
+            default_chat_template_kwargs: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn uncached_bounds_build_an_estimator_and_are_validated() {
+        let model = test_model;
+        let state = KvEventIndex::new();
+        let (resolver, _) = build_resolver(
+            &model(serde_json::json!({"buckets": [
+                {"id": "S", "max_uncached_tokens": 32000, "plain": {}},
+                {"id": "L", "min_uncached_tokens": 32001, "plain": {}}
+            ]})),
+            &state,
+            None,
+        )
+        .unwrap();
+        assert!(resolver.estimator.is_some());
+        let found = resolver
+            .resolve_uncached(900_000, Some(2_000), None, None, None)
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "S");
+        let (plain, _) = build_resolver(
+            &model(serde_json::json!({"buckets": [{"id": "all", "plain": {}}]})),
+            &state,
+            None,
+        )
+        .unwrap();
+        assert!(
+            plain.estimator.is_none(),
+            "length-only buckets keep no sessions"
+        );
+        assert!(plain.buckets[0].queue.is_none());
+        for invalid in [
+            serde_json::json!({"buckets": [{"id": "x", "min_uncached_tokens": 9, "max_uncached_tokens": 8, "plain": {}}]}),
+            serde_json::json!({"buckets": [{"id": "x", "max_uncached_tokens": 0, "plain": {}}]}),
+            serde_json::json!({"session_idle_secs": 0, "buckets": [{"id": "x", "max_uncached_tokens": 8, "plain": {}}]}),
+        ] {
+            assert!(build_resolver(&model(invalid), &state, None).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bucket_queue_is_built_from_its_spec_and_validated() {
+        let state = KvEventIndex::new();
+        let build = |queue: serde_json::Value| {
+            let mut model = test_model(serde_json::json!({"buckets": [
+                {"id": "S", "max_uncached_tokens": 32000, "queue": queue, "plain": {}}
+            ]}));
+            model.policy = PolicyKind::PowerOfTwo;
+            build_resolver(&model, &state, None).map(|(resolver, _)| resolver)
+        };
+        let resolver = build(serde_json::json!(
+            {"mean_wait_s": 4.0, "rate_tokens_per_s": 20000, "rate_requests_per_s": 3.0}
+        ))
+        .unwrap();
+        let queue = resolver.buckets[0].queue.as_ref().unwrap();
+        assert_eq!((queue.id.as_str(), queue.spec.deadline_factor), ("S", 2.3));
+        assert!(build(serde_json::json!(
+            {"mean_wait_s": -1, "rate_tokens_per_s": 1, "rate_requests_per_s": 1}
+        ))
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn spill_runs_only_from_shorter_to_longer_buckets() {
+        let state = KvEventIndex::new();
+        let build = |buckets: serde_json::Value| {
+            build_resolver(&test_model(buckets), &state, None).map(|(resolver, _)| resolver)
+        };
+        let resolver = build(serde_json::json!({
+            "spill_idle": {"max_running_requests": 2},
+            "buckets": [
+                {"id": "S", "max_uncached_tokens": 32000, "spill_to": ["M", "L"], "plain": {}},
+                {"id": "M", "min_uncached_tokens": 32001, "max_uncached_tokens": 256000, "spill_to": ["L"], "plain": {}},
+                {"id": "L", "min_uncached_tokens": 256001, "plain": {}}
+            ]
+        }))
+        .unwrap();
+        let targets: Vec<_> = (resolver.bucket("S").unwrap().spill_to.iter())
+            .map(|target| target.bucket.as_str())
+            .collect();
+        assert_eq!(targets, ["M", "L"]);
+        assert_eq!(resolver.idle.max_running_requests, 2);
+        assert_eq!(resolver.idle.max_waiting_uncached_tokens, 0);
+        for invalid in [
+            serde_json::json!({"buckets": [
+                {"id": "S", "max_uncached_tokens": 32000, "plain": {}},
+                {"id": "L", "min_uncached_tokens": 32001, "spill_to": ["S"], "plain": {}}
+            ]}),
+            serde_json::json!({"buckets": [
+                {"id": "S", "max_uncached_tokens": 32000, "spill_to": ["X"], "plain": {}}
+            ]}),
+            serde_json::json!({"buckets": [
+                {"id": "S", "max_uncached_tokens": 32000, "spill_to": ["S"], "plain": {}}
+            ]}),
+            serde_json::json!({"spill_idle": {"max_running_requests": 0}, "buckets": [
+                {"id": "S", "plain": {}}
+            ]}),
+        ] {
+            assert!(build(invalid).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn prefill_second_bounds_need_their_flag_and_a_reference_rate() {
+        let state = KvEventIndex::new();
+        let build = |buckets: serde_json::Value| {
+            build_resolver(&test_model(buckets), &state, None).map(|(resolver, _)| resolver)
+        };
+        let resolver = build(serde_json::json!({
+            "thresholds": "prefill_seconds",
+            "prefill_reference_rate_tokens_per_s": 20000,
+            "buckets": [
+                {"id": "S", "max_prefill_seconds": 1.5, "spill_to": ["L"], "plain": {}},
+                {"id": "L", "min_prefill_seconds": 1.5, "plain": {}}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(resolver.prefill_seconds_reference, Some(20_000.0));
+        assert!(
+            resolver.estimator.is_some(),
+            "seconds bounds read the estimate"
+        );
+        assert_eq!(resolver.bucket("S").unwrap().prefill_seconds.max, Some(1.5));
+        for invalid in [
+            serde_json::json!({"buckets": [{"id": "S", "max_prefill_seconds": 1, "plain": {}}]}),
+            serde_json::json!({"thresholds": "prefill_seconds", "buckets": [
+                {"id": "S", "max_prefill_seconds": 1, "plain": {}}]}),
+            serde_json::json!({"thresholds": "prefill_seconds", "prefill_reference_rate_tokens_per_s": 1000,
+                "buckets": [{"id": "S", "max_uncached_tokens": 1000, "plain": {}}]}),
+            serde_json::json!({"thresholds": "prefill_seconds", "prefill_reference_rate_tokens_per_s": 1000,
+                "buckets": [{"id": "S", "min_prefill_seconds": 3, "max_prefill_seconds": 2, "plain": {}}]}),
+        ] {
+            assert!(build(invalid).is_err());
+        }
+    }
 
     #[test]
     fn group_metric_change_drops_the_cli_gap() {

@@ -87,6 +87,34 @@ rank, so the tree drops those stores rather than filing them under a guess. Comp
 needs `sum without(pool)` on the engine side, and the two are not equal
 anyway: the engine also evicts device blocks it never backed up.
 
+## Bucket queues
+
+Emitted under `--chat-routing reorg`; the per-bucket series cover buckets with a
+`queue`, the spill counters cover `spill_to` entries (see
+[REFERENCE.md](../REFERENCE.md#uncached-token-buckets-and-queues)):
+
+| Metric | Type | What it shows |
+|---|---|---|
+| `sgl_router_bucket_queue_tokens{bucket}` | Gauge | Uncached tokens admitted to the bucket and not yet through prefill |
+| `sgl_router_bucket_queue_requests{bucket}` | Gauge | Requests admitted to the bucket and not yet through prefill |
+| `sgl_router_bucket_depth_tokens{bucket}` | Gauge | Tokens the bucket holds before answering 429 |
+| `sgl_router_bucket_depth_requests{bucket}` | Gauge | Requests the bucket holds before answering 429 (each member may also run one) |
+| `sgl_router_bucket_members{bucket}` | Gauge | Ready engines the depth scales with |
+| `sgl_router_bucket_rate_tokens_per_second{bucket}` | Gauge | Summed uncached-token rate of those engines (measured or configured) |
+| `sgl_router_prefill_rate_tokens_per_second{worker_url}` | Gauge | Each engine's smoothed reported prefill rate (tokens per busy second) |
+| `sgl_router_bucket_admitted_total{bucket}` | Counter | Requests admitted to the queue |
+| `sgl_router_bucket_rejected_total{bucket,reason}` | Counter | 429s by `bucket_full`, `deadline`, `decode_permits` |
+| `sgl_router_bucket_spill_total{from,to}` | Counter | Requests placed on an idle engine of a longer bucket |
+| `sgl_router_bucket_queue_wait_seconds{bucket}` | Histogram | Arrival to engine pick, for admitted requests |
+| `sgl_router_retry_after_seconds{bucket}` | Histogram | `Retry-After` values sent |
+| `sgl_router_decode_permits` | Gauge | Ready decode engines x their group's `max_inflight_requests`; -1 when a group sets none |
+| `sgl_router_decode_running{worker}` | Gauge | This router's in-flight requests per decode engine |
+| `sgl_router_session_uncached_estimate_error` | Histogram | Uncached estimate minus the engine's prompt minus cached tokens, per completed turn |
+| `sgl_router_tpm_limit_tokens_per_minute`, `sgl_router_tpm_available_tokens` | Gauge | The agreed rate and the tokens the pool may admit now (with `tpm_limit`) |
+| `sgl_router_tpm_admitted_total`, `sgl_router_tpm_rejected_total`, `sgl_router_tpm_output_tokens_total` | Counter | Requests under and over the agreed rate, output tokens charged |
+| `sgl_router_prefill_seconds_rate_tokens_per_second` | Gauge | Under prefill-second bounds, the rate converting uncached tokens into seconds |
+| `sgl_router_membership_events_total{kind}` | Counter | Discovery events applied: `added`, `removed`, `services_changed`, `mode_changed` |
+
 ## Prometheus scrape config
 
 Point Prometheus at the router's `/metrics` endpoint:

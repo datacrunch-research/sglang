@@ -13,7 +13,8 @@ use crate::proxy::grpc::{Additions, EngineRpc, GrpcResponse};
 use crate::proxy::sse::{self, ErrorEventScanner, PumpItem, StreamEnd, StreamEndReason};
 use crate::proxy::Proxy;
 use crate::server::app_context::AppContext;
-use crate::server::error::ApiError;
+use crate::server::bucket_admission::BucketSlot;
+use crate::server::error::{ApiError, X_SGL_BUCKET, X_SGL_QUEUE_WAIT_MS, X_SGL_UNCACHED_ESTIMATE};
 use crate::server::metrics::{
     classify_stream_end, outcome_from_status, MetricsRegistry, RequestLogContext, RequestOutcome,
     StaleRequestOutcome, WorkerModeLabel,
@@ -48,6 +49,53 @@ pub(super) struct SelectedWorkers {
     pub(super) prefill: Arc<Worker>,
     pub(super) decode: Option<Arc<Worker>>,
     pub(super) track_dispatch_timestamps: bool,
+    /// The request's place in its bucket's queue, held until prefill is done.
+    pub(super) bucket_slot: Option<BucketSlot>,
+    /// What a reorg bucket decided, returned to an HTTP client as headers.
+    pub(super) routing: Option<BucketRouting>,
+}
+
+pub(super) struct BucketRouting {
+    /// The request's own bucket, also when an idle longer bucket served it.
+    pub(super) bucket: String,
+    pub(super) uncached_tokens: Option<u64>,
+    /// Time from arrival to the engine pick, for a queued bucket.
+    pub(super) queue_wait: Option<std::time::Duration>,
+    /// The prefill rate behind prefill-second bounds, tokens per second.
+    pub(super) prefill_rate: Option<f64>,
+}
+
+const X_SGL_PREFILL_WORKER: HeaderName = HeaderName::from_static("x-sgl-prefill-worker");
+const X_SGL_DECODE_WORKER: HeaderName = HeaderName::from_static("x-sgl-decode-worker");
+const X_SGL_PREFILL_RATE: HeaderName = HeaderName::from_static("x-sgl-prefill-rate");
+
+/// `x-sgl-*` headers telling the client how a reorg bucket routed its request:
+/// bucket, uncached estimate, queue wait, and the engines picked.
+fn routing_headers(workers: &SelectedWorkers) -> Vec<(HeaderName, HeaderValue)> {
+    let Some(routing) = &workers.routing else {
+        return Vec::new();
+    };
+    let mut headers = Vec::new();
+    let mut push = |name: HeaderName, value: &str| {
+        if let Ok(value) = HeaderValue::from_str(value) {
+            headers.push((name, value));
+        }
+    };
+    push(X_SGL_BUCKET, &routing.bucket);
+    if let Some(tokens) = routing.uncached_tokens {
+        push(X_SGL_UNCACHED_ESTIMATE, &tokens.to_string());
+    }
+    if let Some(wait) = routing.queue_wait {
+        push(X_SGL_QUEUE_WAIT_MS, &wait.as_millis().to_string());
+    }
+    if let Some(rate) = routing.prefill_rate {
+        push(X_SGL_PREFILL_RATE, &format!("{}", rate.round()));
+    }
+    push(X_SGL_PREFILL_WORKER, &workers.prefill.id.0);
+    if let Some(decode) = &workers.decode {
+        push(X_SGL_DECODE_WORKER, &decode.id.0);
+    }
+    headers
 }
 
 /// PD sends to both workers and returns the decode response.
@@ -67,6 +115,7 @@ pub(super) async fn forward_request(
     request_started_at: Instant,
     duration: &Arc<RequestDurationGuard>,
 ) -> Result<HttpDispatched, ApiError> {
+    let routing = routing_headers(&workers);
     let dispatched = dispatch(
         Http,
         ctx,
@@ -86,6 +135,9 @@ pub(super) async fn forward_request(
         }
         Err(error) => error.into_response(),
     };
+    for (name, value) in routing {
+        response.headers_mut().insert(name, value);
+    }
     response.extensions_mut().insert(dispatched.log_context);
     Ok(HttpDispatched {
         response,
@@ -178,7 +230,15 @@ async fn dispatch<T: Transport>(
         prefill,
         decode,
         track_dispatch_timestamps,
+        bucket_slot,
+        routing: _,
     } = workers;
+    // Under PD the detached prefill holds the slot until it finishes; a plain
+    // engine's prefill is over once its response arrives.
+    let (prefill_slot, plain_slot) = match decode {
+        Some(_) => (bucket_slot, None),
+        None => (None, bucket_slot),
+    };
     if let Some(scope) = &request.scope {
         let mut proof = vec![Arc::clone(&prefill)];
         proof.extend(decode.iter().cloned());
@@ -297,6 +357,7 @@ async fn dispatch<T: Transport>(
                 bootstrap.room,
                 stream_abort.clone(),
                 decode_slot.clone(),
+                prefill_slot,
             );
             // Counted from arrival, so decode selection sees requests waiting here.
             let decode_load = decode.load_guard();
@@ -393,6 +454,7 @@ async fn dispatch<T: Transport>(
             (Err(ApiError::StaleRequestExpired { model }), None)
         }
     };
+    drop(plain_slot);
     if matches!(dispatch_outcome::<T>(&result), RequestOutcome::Success) {
         unanswered.0 = None;
     }
@@ -848,10 +910,13 @@ fn spawn_prefill_request<T: Transport>(
     bootstrap_room: u64,
     stream_abort: CancellationToken,
     slot: Option<DecodeSlot>,
+    bucket_slot: Option<BucketSlot>,
 ) -> tokio::task::JoinHandle<PrefillFailure<T::Response>> {
     let proxy = Arc::clone(&ctx.proxy);
     let (registry, model) = (Arc::clone(&metrics.registry), metrics.model.clone());
     tokio::spawn(async move {
+        // Every exit of this task ends the request's prefill work in its bucket.
+        let _bucket_slot = bucket_slot;
         let prefill_started = Instant::now();
         let cancelled = load_guards
             .3

@@ -9,7 +9,7 @@ use crate::state::load_monitor::router_inflight_load::RouterInflightLoadRegistry
 use crate::workers::introspect::{
     worker_client, DisaggregationRole, WorkerIntrospector, SERVER_INFO_TIMEOUT,
 };
-use crate::workers::{EngineProfile, WireProtocol, Worker, WorkerRegistry};
+use crate::workers::{EngineProfile, MembershipEvent, WireProtocol, Worker, WorkerRegistry};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -308,7 +308,8 @@ async fn handle_discovery_event(
             let kv_index_t = kv_index.clone();
             let introspector_t = introspector.clone();
             let handle = tokio::spawn(async move {
-                register_one(spec, registry_t, cfg_t, kv_index_t, introspector_t).await;
+                register_one(spec, registry_t.clone(), cfg_t, kv_index_t, introspector_t).await;
+                registry_t.membership.record(MembershipEvent::Added);
             });
             pending.insert(id, handle);
         }
@@ -354,6 +355,7 @@ async fn handle_discovery_event(
             if let Some(al) = router_inflight_load {
                 al.forget_worker(&id);
             }
+            registry.membership.record(MembershipEvent::Removed);
         }
         DiscoveryEvent::ServicesChanged { id, services } => {
             if let Some(prev) = pending.remove(&id) {
@@ -362,6 +364,7 @@ async fn handle_discovery_event(
             if let Some(worker) = registry.get(&id) {
                 worker.set_services(services);
             }
+            registry.membership.record(MembershipEvent::ServicesChanged);
         }
         DiscoveryEvent::ModeChanged { id, mode } => {
             if let Some(prev) = pending.remove(&id) {
@@ -379,6 +382,7 @@ async fn handle_discovery_event(
                 Some(w) => {
                     tracing::info!("discovery: ~worker {id} mode→{mode:?}");
                     w.set_mode(mode);
+                    registry.membership.record(MembershipEvent::ModeChanged);
                 }
                 None => {
                     tracing::warn!(
@@ -1049,6 +1053,66 @@ mod tests {
     /// `Removed` for an unknown id with kv-events enabled must not panic.
     /// The kv_index has no entry for that id either, so it must remain
     /// empty after the no-op.
+    /// Every applied event is counted by kind and wakes membership watchers,
+    /// an Added only once its registration has landed.
+    #[tokio::test]
+    async fn manager_counts_membership_events_after_applying_them() {
+        let (worker_url, _shutdown) =
+            spawn_fake_server_info_worker(json!({"served_model_name": "m"})).await;
+        let registry = Arc::new(WorkerRegistry::default());
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        let manager_handle = tokio::spawn(run_with_introspector(
+            rx,
+            registry.clone(),
+            None,
+            None,
+            None,
+            fast_introspector(),
+        ));
+        let id = WorkerId("w-1".into());
+        let added = registry.membership.changed();
+        tx.send(DiscoveryEvent::Added(WorkerSpec {
+            id: id.clone(),
+            url: worker_url,
+            mode: WorkerMode::Plain,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), added)
+            .await
+            .expect("an applied Added wakes watchers");
+        assert!(
+            registry.get(&id).is_some(),
+            "registered before the event counts"
+        );
+        tx.send(DiscoveryEvent::ServicesChanged {
+            id: id.clone(),
+            services: ["ns/prefill-m".to_string()].into(),
+        })
+        .await
+        .unwrap();
+        tx.send(DiscoveryEvent::Removed { id: id.clone() })
+            .await
+            .unwrap();
+        drop(tx);
+        let _ = manager_handle.await;
+        let counts: Vec<_> = MembershipEvent::ALL
+            .iter()
+            .map(|event| (event.label(), registry.membership.count(*event)))
+            .collect();
+        assert_eq!(
+            counts,
+            [
+                ("added", 1),
+                ("removed", 1),
+                ("services_changed", 1),
+                ("mode_changed", 0)
+            ]
+        );
+        assert!(registry.get(&id).is_none());
+    }
+
     #[tokio::test]
     async fn manager_removed_unknown_id_is_noop() {
         use tokio::time::sleep;

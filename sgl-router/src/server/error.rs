@@ -7,6 +7,8 @@ use axum::Json;
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::server::bucket_admission::BucketRejection;
+
 pub const X_ROUTER_ERROR_CODE: HeaderName = HeaderName::from_static("x-router-error-code");
 
 /// Original worker status when a failed prefill or incomplete body becomes a router 502.
@@ -72,6 +74,10 @@ fn grpc_error_class(code: tonic::Code) -> ErrorClass {
 pub enum ApiError {
     #[error("router concurrent-request limit reached")]
     AdmissionRejected,
+    /// A bucket's queue was full, or an admitted request's wait for an engine
+    /// passed the bucket's deadline. Always 429 with `Retry-After`.
+    #[error("bucket {} refused the request ({}); retry after {} s", .0.bucket, .0.reason.error_type(), .0.retry_after_s)]
+    BucketRejected(Box<BucketRejection>),
     #[error("bad request: {0}")]
     BadRequest(String),
 
@@ -203,7 +209,7 @@ impl ApiError {
     /// pick a different one.
     fn class(&self) -> ErrorClass {
         match self {
-            ApiError::AdmissionRejected => ErrorClass::Admission,
+            ApiError::AdmissionRejected | ApiError::BucketRejected(_) => ErrorClass::Admission,
             ApiError::BadRequest(_) => ErrorClass::BadRequest,
             ApiError::SamplingContract { .. } => ErrorClass::BadRequest,
             ApiError::ModelNotFound(_) => ErrorClass::NotFound,
@@ -231,6 +237,7 @@ impl ApiError {
     pub(crate) fn error_code(&self) -> &'static str {
         match self {
             ApiError::AdmissionRejected => "admission_rejected",
+            ApiError::BucketRejected(rejection) => rejection.reason.error_type(),
             ApiError::BadRequest(_) => "bad_request",
             // Shares `ErrorClass::BadRequest` (and thus the 400) with
             // `BadRequest`, but keeps its own code: an operator rolling a
@@ -268,6 +275,7 @@ impl ApiError {
             ApiError::UpstreamStatus { status } => Some(*status),
             ApiError::PrefillFailed { status } => *status,
             ApiError::AdmissionRejected
+            | ApiError::BucketRejected(_)
             | ApiError::BadRequest(_)
             | ApiError::SamplingContract { .. }
             | ApiError::ModelNotFound(_)
@@ -308,6 +316,9 @@ struct ErrorBody<'a> {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if let ApiError::BucketRejected(rejection) = &self {
+            return bucket_rejection_response(rejection, self.client_message());
+        }
         let status = self.class().status();
         let code = self.error_code();
         let typ = match status.as_u16() {
@@ -335,6 +346,44 @@ impl IntoResponse for ApiError {
     }
 }
 
+pub const X_SGL_BUCKET: HeaderName = HeaderName::from_static("x-sgl-bucket");
+pub const X_SGL_UNCACHED_ESTIMATE: HeaderName = HeaderName::from_static("x-sgl-uncached-estimate");
+pub const X_SGL_QUEUE_WAIT_MS: HeaderName = HeaderName::from_static("x-sgl-queue-wait-ms");
+
+/// 429 with `Retry-After` and a body naming the bucket and its depth, so a
+/// client can back off by the bucket's own arithmetic.
+fn bucket_rejection_response(rejection: &BucketRejection, message: String) -> Response {
+    let reason = rejection.reason.error_type();
+    let body = serde_json::json!({"error": {
+        "type": reason,
+        "code": reason,
+        "message": message,
+        "bucket": rejection.bucket,
+        "depth_tokens": rejection.depth_tokens,
+        "queued_tokens": rejection.queued_tokens,
+        "retry_after_s": rejection.retry_after_s,
+    }});
+    let mut resp = (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response();
+    let headers = resp.headers_mut();
+    headers.insert(X_ROUTER_ERROR_CODE, HeaderValue::from_static(reason));
+    headers.insert(
+        axum::http::header::RETRY_AFTER,
+        HeaderValue::from(rejection.retry_after_s),
+    );
+    if let Ok(bucket) = HeaderValue::from_str(&rejection.bucket) {
+        headers.insert(X_SGL_BUCKET, bucket);
+    }
+    headers.insert(
+        X_SGL_UNCACHED_ESTIMATE,
+        HeaderValue::from(rejection.uncached_tokens),
+    );
+    headers.insert(
+        X_SGL_QUEUE_WAIT_MS,
+        HeaderValue::from(rejection.waited.as_millis() as u64),
+    );
+    resp
+}
+
 impl ApiError {
     /// What a gRPC client receives: an engine's status unchanged, otherwise the
     /// error's class as a gRPC code, with the HTTP path's message and error code.
@@ -358,7 +407,7 @@ impl ApiError {
     /// which are logged here instead.
     fn client_message(&self) -> String {
         match self {
-            ApiError::AdmissionRejected => self.to_string(),
+            ApiError::AdmissionRejected | ApiError::BucketRejected(_) => self.to_string(),
             ApiError::Internal(e) => {
                 // `{:#}` prints the anyhow chain (top error + sources) — `?e`
                 // would only show the outermost message.
@@ -494,6 +543,51 @@ mod tests {
         let env: ErrEnv = serde_json::from_str(&body_str)
             .unwrap_or_else(|e| panic!("envelope did not match expected shape: {e}: {body_str}"));
         (status, code_header, env)
+    }
+
+    #[test]
+    fn a_bucket_rejection_is_a_429_with_retry_after_and_the_bucket_depth() {
+        use crate::server::bucket_admission::RejectReason;
+        let resp = ApiError::BucketRejected(Box::new(BucketRejection {
+            bucket: "S".into(),
+            reason: RejectReason::Full,
+            retry_after_s: 3,
+            depth_tokens: 160_000,
+            queued_tokens: 150_000,
+            uncached_tokens: 9_000,
+            waited: std::time::Duration::ZERO,
+        }))
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(header("retry-after"), "3");
+        assert_eq!(header("x-router-error-code"), "bucket_full");
+        assert_eq!(header("x-sgl-bucket"), "S");
+        assert_eq!(header("x-sgl-uncached-estimate"), "9000");
+        let body: serde_json::Value = serde_json::from_str(&collect_body(resp)).unwrap();
+        assert_eq!(body["error"]["type"], "bucket_full");
+        assert_eq!(body["error"]["bucket"], "S");
+        assert_eq!(body["error"]["depth_tokens"], 160_000);
+        assert_eq!(body["error"]["queued_tokens"], 150_000);
+        assert_eq!(body["error"]["retry_after_s"], 3);
+        let status = ApiError::BucketRejected(Box::new(BucketRejection {
+            bucket: "L".into(),
+            reason: RejectReason::DecodePermits,
+            retry_after_s: 5,
+            depth_tokens: 0,
+            queued_tokens: 0,
+            uncached_tokens: 1,
+            waited: std::time::Duration::ZERO,
+        }))
+        .into_grpc_status();
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
     }
 
     #[test]
