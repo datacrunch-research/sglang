@@ -228,6 +228,9 @@ impl TokenizerRegistry {
             reasoning_toggle: None,
             chat_encoding_spec: None,
             deepseek: None,
+            // The engines' --enable-multimodal is not read here: image parts keep
+            // going to the engine's own OpenAI route as text.
+            is_multimodal: false,
         };
         me.inner.insert(m.id.clone(), t);
         me.stats = stats;

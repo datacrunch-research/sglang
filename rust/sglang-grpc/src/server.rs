@@ -424,6 +424,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                             meta_info: data.meta_info,
                             finished: false,
                             text: data.text.filter(|_| return_text),
+                            index: None,
                         });
                     }
                     Ok(Some(ResponseChunk::Finished(data))) => {
@@ -433,6 +434,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                             meta_info: data.meta_info,
                             finished: true,
                             text: data.text.filter(|_| return_text),
+                            index: None,
                         });
                         break;
                     }

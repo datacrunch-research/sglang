@@ -338,6 +338,11 @@ pub(crate) fn build_generate_dict(
             d.insert(name.into(), serde_json::json!(sources));
         }
     }
+    // Caller-supplied media identities (`sha256:<64 hex>`), which the engine
+    // keys its media and KV caches on instead of hashing the processor output.
+    if !req.mm_hashes.is_empty() {
+        d.insert("mm_hashes".into(), serde_json::json!(req.mm_hashes));
+    }
     d.insert(
         "sampling_params".into(),
         sampling_params_to_map(&req.sampling_params)?,
@@ -710,9 +715,19 @@ mod tests {
     fn tokenized_request_omits_empty_media_data() {
         let mapped = build_generate_dict("request", &proto::GenerateRequest::default()).unwrap();
 
-        for key in ["image_data", "video_data", "audio_data"] {
+        for key in ["image_data", "video_data", "audio_data", "mm_hashes"] {
             assert!(!mapped.contains_key(key));
         }
+        let with_hashes = build_generate_dict(
+            "request",
+            &proto::GenerateRequest {
+                image_data: vec!["data:image/png;base64,AA".into()],
+                mm_hashes: vec!["sha256:00".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(with_hashes["mm_hashes"], serde_json::json!(["sha256:00"]));
     }
 
     #[test]
