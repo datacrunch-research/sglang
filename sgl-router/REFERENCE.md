@@ -217,7 +217,7 @@ three-lane file.
 | field | where | meaning |
 |---|---|---|
 | `min_uncached_tokens`, `max_uncached_tokens` | bucket | inclusive range of the request's estimated uncached tokens; narrower buckets are tried first |
-| `queue` | bucket | `mean_wait_s`, `rate_tokens_per_s`, `rate_requests_per_s` (per ready engine), optional `deadline_factor` (2.3), `retry_after_max_s` (30), `deadline_retry_after_s` (2), `decode_retry_after_s` (5) |
+| `queue` | bucket | `mean_wait_s`, `rate_tokens_per_s`, `rate_requests_per_s` (per ready engine), optional `rate_source` (`measured` or `static`), `deadline_factor` (2.3), `retry_after_max_s` (30), `deadline_retry_after_s` (2), `decode_retry_after_s` (5) |
 | `spill_to` | bucket | longer buckets, in order, whose idle engines may take this bucket's requests |
 | `spill_idle` | file | `max_waiting_uncached_tokens` (0) and `max_running_requests` (4): an engine is idle when its reported waiting uncached tokens are at most the first and its running requests, and this router's in-flight count to it, are below the second |
 | `session_idle_secs` | file | how long a session's last turn stays usable for the estimate (7200) |
@@ -245,6 +245,15 @@ prefill) at `members x rate_tokens_per_s x mean_wait_s` tokens and
 `members x rate_requests_per_s x mean_wait_s` requests, where members are its
 ready engines (plain, or prefill engines with a paired decode). Each member may
 also run one request whatever its size.
+
+With `rate_source: measured` (the default) each member counts at its own
+measured rate instead of `rate_tokens_per_s`: the uncached tokens per busy second
+its load reports show between two reports (`total_prefill_uncached_tokens` and
+`total_prefill_busy_us`, needing `--load-publish-endpoint`), smoothed, kept
+while it idles, and bounded to 0.25-4x `rate_tokens_per_s`. A member that has not
+reported counts at `rate_tokens_per_s`; the request depth and the drain rate
+behind `Retry-After` scale with the same factor. `static` keeps the configured
+rate.
 
 - Over the depth: `429` at once, error type `bucket_full`, `Retry-After` = the
   excess over `members x rate` in seconds, between 1 and `retry_after_max_s`.

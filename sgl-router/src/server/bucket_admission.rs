@@ -28,11 +28,14 @@ use tokio::time::Instant;
 use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::discovery::WorkerMode;
+use crate::buckets_reorg::Bucket;
+use crate::discovery::{ModelId, WorkerMode};
 use crate::server::app_context::{AppContext, ChatRouting};
 use crate::server::histogram::Histogram;
 use crate::server::metrics::escape_label;
+use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
 use crate::workers::{MembershipEvent, WorkerRegistry};
+use dashmap::DashMap;
 
 /// How often a waiting request re-checks engine admission: engine load
 /// reports change without notifying the queue. Arbitrary; well under a band.
@@ -61,7 +64,26 @@ pub struct QueueSpec {
     /// `Retry-After` when the wait ended on the decode side.
     #[serde(default = "default_decode_retry_after_s")]
     pub decode_retry_after_s: u64,
+    /// Where a member's uncached-token rate comes from: the engine's reported
+    /// prefill throughput (`measured`, the default; `rate_tokens_per_s` until a
+    /// member reports) or always `rate_tokens_per_s` (`static`).
+    #[serde(default)]
+    pub rate_source: RateSource,
 }
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateSource {
+    #[default]
+    Measured,
+    Static,
+}
+
+/// A measured rate counts within this factor of the configured one, so one
+/// odd sample cannot empty or flood a bucket. Arbitrary bound.
+const MEASURED_RATE_BOUNDS: (f64, f64) = (0.25, 4.0);
+/// Weight of the newest throughput sample in a member's smoothed rate.
+const RATE_SMOOTHING: f64 = 0.3;
 
 fn default_deadline_factor() -> f64 {
     2.3
@@ -150,6 +172,8 @@ pub struct Depth {
 #[derive(Debug, Default)]
 struct QueueState {
     members: u64,
+    /// Sum of the members' uncached-token rates the depth scales with.
+    rate_tokens_per_s: f64,
     tokens: u64,
     requests: u64,
 }
@@ -200,16 +224,34 @@ impl BucketQueue {
         }
     }
 
-    fn depth_for(&self, members: u64) -> Depth {
-        let scaled = |rate: f64| (members as f64 * rate * self.spec.mean_wait_s).floor() as u64;
+    /// The members' request rate: the configured per-member rate, scaled by
+    /// how their summed token rate compares with the configured one.
+    fn request_rate(&self, state: &QueueState) -> f64 {
+        let configured = state.members as f64 * self.spec.rate_tokens_per_s;
+        if configured > 0.0 {
+            state.members as f64
+                * self.spec.rate_requests_per_s
+                * (state.rate_tokens_per_s / configured)
+        } else {
+            state.members as f64 * self.spec.rate_requests_per_s
+        }
+    }
+
+    fn depth_for(&self, state: &QueueState) -> Depth {
+        let scaled = |rate: f64| (rate * self.spec.mean_wait_s).floor() as u64;
         Depth {
-            tokens: scaled(self.spec.rate_tokens_per_s),
-            requests: scaled(self.spec.rate_requests_per_s),
+            tokens: scaled(state.rate_tokens_per_s),
+            requests: scaled(self.request_rate(state)),
         }
     }
 
     pub fn depth(&self) -> Depth {
-        self.depth_for(self.state.lock().members)
+        self.depth_for(&self.state.lock())
+    }
+
+    /// The summed member rate the depth scales with, uncached tokens per second.
+    pub fn rate_tokens_per_s(&self) -> f64 {
+        self.state.lock().rate_tokens_per_s
     }
 
     pub fn members(&self) -> u64 {
@@ -222,22 +264,49 @@ impl BucketQueue {
         (state.tokens, state.requests)
     }
 
-    /// Set the ready-member count the depth scales with. Work already admitted
-    /// keeps its place; only new arrivals see the new depth.
+    /// Set `members` ready engines at the configured per-member rate.
     pub fn set_members(&self, members: u64) -> bool {
+        self.set_capacity(members, members as f64 * self.spec.rate_tokens_per_s)
+    }
+
+    /// Set the ready-member count and their summed uncached-token rate the
+    /// depth scales with. Work already admitted keeps its place; only new
+    /// arrivals see the new depth. True when the depth or members changed.
+    pub fn set_capacity(&self, members: u64, rate_tokens_per_s: f64) -> bool {
+        let rate_tokens_per_s = if rate_tokens_per_s.is_finite() {
+            rate_tokens_per_s.max(0.0)
+        } else {
+            0.0
+        };
         let grew = {
             let mut state = self.state.lock();
-            if state.members == members {
+            let before = (state.members, self.depth_for(&state));
+            state.members = members;
+            state.rate_tokens_per_s = rate_tokens_per_s;
+            let after = (members, self.depth_for(&state));
+            if before == after {
                 return false;
             }
-            let grew = members > state.members;
-            state.members = members;
-            grew
+            after.0 > before.0 || after.1.tokens > before.1.tokens
         };
         if grew {
             self.changed.notify_waiters();
         }
         true
+    }
+
+    /// One member's uncached-token rate for the depth: its smoothed measured
+    /// rate within bounds of the configured one, or the configured one.
+    pub fn member_rate(&self, measured: Option<f64>) -> f64 {
+        let configured = self.spec.rate_tokens_per_s;
+        match (self.spec.rate_source, measured) {
+            (RateSource::Measured, Some(rate)) if configured > 0.0 => rate.clamp(
+                configured * MEASURED_RATE_BOUNDS.0,
+                configured * MEASURED_RATE_BOUNDS.1,
+            ),
+            (RateSource::Measured, Some(rate)) => rate,
+            _ => configured,
+        }
     }
 
     /// How long an admitted request may wait for an engine.
@@ -250,7 +319,7 @@ impl BucketQueue {
     /// time the bucket needs to drain the excess.
     pub fn try_enter(self: &Arc<Self>, tokens: u64) -> Result<BucketSlot, BucketRejection> {
         let mut state = self.state.lock();
-        let depth = self.depth_for(state.members);
+        let depth = self.depth_for(&state);
         let runner_free = state.requests < state.members;
         let within_depth = state.requests < depth.requests.max(state.members)
             && state.tokens.saturating_add(tokens) <= depth.tokens;
@@ -280,10 +349,9 @@ impl BucketQueue {
     /// in tokens or requests, whichever is longer; at least 1, at most the cap.
     fn drain_seconds(&self, state: &QueueState, depth: Depth, tokens: u64) -> u64 {
         let max = self.spec.retry_after_max_s;
-        let members = state.members as f64;
         let over = |excess: u64, rate: f64| match excess {
             0 => 0.0,
-            excess if members * rate > 0.0 => excess as f64 / (members * rate),
+            excess if rate > 0.0 => excess as f64 / rate,
             _ => f64::INFINITY,
         };
         let tokens_over = state
@@ -291,8 +359,8 @@ impl BucketQueue {
             .saturating_add(tokens)
             .saturating_sub(depth.tokens);
         let requests_over = (state.requests + 1).saturating_sub(depth.requests.max(state.members));
-        let seconds = over(tokens_over, self.spec.rate_tokens_per_s)
-            .max(over(requests_over, self.spec.rate_requests_per_s))
+        let seconds = over(tokens_over, state.rate_tokens_per_s)
+            .max(over(requests_over, self.request_rate(state)))
             .ceil();
         if seconds.is_finite() {
             (seconds as u64).clamp(1, max)
@@ -313,7 +381,7 @@ impl BucketQueue {
             bucket: self.id.clone(),
             reason,
             retry_after_s,
-            depth_tokens: self.depth_for(state.members).tokens,
+            depth_tokens: self.depth_for(&state).tokens,
             queued_tokens: state.tokens,
             uncached_tokens: tokens,
             waited,
@@ -351,22 +419,96 @@ impl BucketQueue {
     }
 }
 
-/// Set every queued bucket's member count from the registry; true if any changed.
-pub fn refresh_members(routing: &ChatRouting, registry: &WorkerRegistry) -> bool {
+/// Smoothed uncached-token rate per engine URL, from each engine's reported
+/// prefill throughput (uncached tokens per busy second between two reports).
+#[derive(Debug, Default)]
+pub struct PrefillRates {
+    by_url: DashMap<String, f64>,
+}
+
+impl PrefillRates {
+    /// Fold a throughput sample into the engine's rate; `None` (no prefill
+    /// between its last two reports) keeps the rate it had.
+    pub fn observe(&self, url: &str, sample: Option<f64>) {
+        let Some(sample) = sample.filter(|rate| rate.is_finite() && *rate > 0.0) else {
+            return;
+        };
+        self.by_url
+            .entry(url.to_owned())
+            .and_modify(|rate| *rate += RATE_SMOOTHING * (sample - *rate))
+            .or_insert(sample);
+    }
+
+    pub fn rate(&self, url: &str) -> Option<f64> {
+        self.by_url.get(url).map(|rate| *rate)
+    }
+
+    /// Engine URLs and rates, sorted, for metrics.
+    pub fn rates(&self) -> Vec<(String, f64)> {
+        let mut rates: Vec<_> = (self.by_url.iter())
+            .map(|entry| (entry.key().clone(), *entry.value()))
+            .collect();
+        rates.sort_by(|a, b| a.0.cmp(&b.0));
+        rates
+    }
+
+    /// Drop engines that left the registry.
+    pub fn retain(&self, live: &std::collections::HashSet<String>) {
+        self.by_url.retain(|url, _| live.contains(url));
+    }
+}
+
+/// Size `queue` from `bucket`'s ready engines and their rates; true if its
+/// depth or members changed.
+pub fn size_queue(
+    bucket: &Bucket,
+    queue: &BucketQueue,
+    registry: &WorkerRegistry,
+    model: &ModelId,
+    rates: &PrefillRates,
+) -> bool {
+    let engines = bucket.ready_prefill_engines(registry, model);
+    let rate = engines
+        .iter()
+        .map(|engine| queue.member_rate(rates.rate(&engine.url)))
+        .sum();
+    queue.set_capacity(engines.len() as u64, rate)
+}
+
+/// Fold the engines' latest prefill throughput into the resolvers' rates (when
+/// `load` is given), then size every queued bucket; true if any changed.
+pub fn refresh_members(
+    routing: &ChatRouting,
+    registry: &WorkerRegistry,
+    load: Option<&EngineReportedLoadTable>,
+) -> bool {
     let ChatRouting::Reorg(resolvers) = routing else {
         return false;
     };
+    let snapshot = load.map(|load| load.capture_snapshot(std::time::Instant::now()));
     let mut changed = false;
     for (model, resolver) in resolvers {
+        if let Some(snapshot) = &snapshot {
+            let engines = registry.workers_for(model);
+            for engine in &engines {
+                let sample = snapshot
+                    .fresh_native_cache_load_for_url(&engine.url)
+                    .and_then(|load| load.prefill_throughput_tokens_per_s);
+                resolver.prefill_rates.observe(&engine.url, sample);
+            }
+            let live = engines.iter().map(|engine| engine.url.clone()).collect();
+            resolver.prefill_rates.retain(&live);
+        }
         for bucket in &resolver.buckets {
             if let Some(queue) = &bucket.queue {
-                let members = bucket.ready_members(registry, model) as u64;
-                if queue.set_members(members) {
+                if size_queue(bucket, queue, registry, model, &resolver.prefill_rates) {
+                    let depth = queue.depth();
                     tracing::info!(
                         bucket = %bucket.id,
-                        members,
-                        depth_tokens = queue.depth().tokens,
-                        depth_requests = queue.depth().requests,
+                        members = queue.members(),
+                        rate_tokens_per_s = queue.rate_tokens_per_s(),
+                        depth_tokens = depth.tokens,
+                        depth_requests = depth.requests,
                         "bucket depth recomputed"
                     );
                     changed = true;
@@ -395,7 +537,11 @@ pub fn spawn_membership_watch(ctx: Arc<AppContext>) -> Option<tokio::task::JoinH
         tokio::spawn(async move {
             loop {
                 let changed = ctx.registry.membership.changed();
-                refresh_members(&ctx.chat_routing, &ctx.registry);
+                refresh_members(
+                    &ctx.chat_routing,
+                    &ctx.registry,
+                    Some(&ctx.engine_reported_load),
+                );
                 tokio::select! {
                     () = changed => {}
                     () = tokio::time::sleep(MEMBERSHIP_RECHECK) => {}
@@ -494,6 +640,29 @@ pub fn render_metrics(ctx: &AppContext) -> String {
                 escape_label(&bucket.id),
                 escape_label(&target.bucket),
                 target.spilled.load(Ordering::Relaxed)
+            )
+        }),
+    );
+    family(
+        "sgl_router_bucket_rate_tokens_per_second",
+        "gauge",
+        "Summed uncached-token rate of the bucket's ready engines that its depth scales with.",
+        &mut queues.iter().map(|q| {
+            format!(
+                "sgl_router_bucket_rate_tokens_per_second{{bucket=\"{}\"}} {}\n",
+                escape_label(&q.id),
+                q.rate_tokens_per_s()
+            )
+        }),
+    );
+    family(
+        "sgl_router_prefill_rate_tokens_per_second",
+        "gauge",
+        "Smoothed uncached-token rate each engine reports for its prefill (tokens per busy second).",
+        &mut resolvers.values().flat_map(|resolver| resolver.prefill_rates.rates()).map(|(url, rate)| {
+            format!(
+                "sgl_router_prefill_rate_tokens_per_second{{worker_url=\"{}\"}} {rate}\n",
+                escape_label(&url)
             )
         }),
     );
@@ -800,16 +969,130 @@ mod tests {
                     .unwrap(),
             )
         };
-        assert!(refresh_members(&routing, &registry));
+        assert!(refresh_members(&routing, &registry, None));
         assert_eq!((queue(0).members(), queue(1).members()), (2, 0));
         assert_eq!(queue(0).depth().tokens, 200);
-        assert!(!refresh_members(&routing, &registry), "nothing moved");
+        assert!(!refresh_members(&routing, &registry, None), "nothing moved");
         registry.remove(&WorkerId("b".into()));
         add("c");
-        assert!(refresh_members(&routing, &registry));
+        assert!(refresh_members(&routing, &registry, None));
         assert_eq!((queue(0).members(), queue(1).members()), (1, 1));
         assert_eq!(queue(0).depth().tokens, 100);
-        assert!(!refresh_members(&ChatRouting::Legacy, &registry));
+        assert!(!refresh_members(&ChatRouting::Legacy, &registry, None));
+    }
+
+    #[test]
+    fn depth_scales_with_the_members_summed_rate() {
+        // Configured: 1,000 tokens/s and 1 request/s per member, 10 s mean wait.
+        let queue = queue(0, spec(10.0, 1_000.0, 1.0));
+        assert!(queue.set_capacity(2, 5_000.0));
+        assert_eq!(
+            queue.depth(),
+            Depth {
+                tokens: 50_000,
+                requests: 50
+            },
+            "2.5x the configured token rate carries the request rate with it"
+        );
+        let _held = queue.try_enter(50_000).unwrap();
+        let _held2 = queue.try_enter(1).unwrap();
+        // 50,001 + 6,000 - 50,000 tokens over the measured 5,000 tokens/s.
+        assert_eq!(queue.try_enter(6_000).unwrap_err().retry_after_s, 2);
+        assert!(!queue.set_capacity(2, 5_000.0), "no change");
+    }
+
+    #[test]
+    fn a_member_rate_is_measured_within_bounds_or_configured() {
+        let measured = queue(1, spec(1.0, 1_000.0, 1.0));
+        assert_eq!(measured.member_rate(Some(3_000.0)), 3_000.0);
+        assert_eq!(measured.member_rate(Some(90_000.0)), 4_000.0);
+        assert_eq!(measured.member_rate(Some(10.0)), 250.0);
+        assert_eq!(measured.member_rate(None), 1_000.0);
+        let mut fixed = spec(1.0, 1_000.0, 1.0);
+        fixed.rate_source = RateSource::Static;
+        assert_eq!(queue(1, fixed).member_rate(Some(3_000.0)), 1_000.0);
+        let parsed: QueueSpec = serde_json::from_value(serde_json::json!({
+            "mean_wait_s": 1, "rate_tokens_per_s": 1, "rate_requests_per_s": 1, "rate_source": "static"
+        }))
+        .unwrap();
+        assert_eq!(parsed.rate_source, RateSource::Static);
+    }
+
+    #[test]
+    fn reported_prefill_throughput_sets_the_bucket_depth() {
+        use crate::buckets_reorg::{BucketGroups, BucketResolver, EngineGroup};
+        use crate::discovery::{WorkerId, WorkerSpec};
+        use crate::policies_reorg::power_of_two::PowerOfTwoPolicy;
+        use crate::state::load_monitor::engine_reported_load::{LoadStat, NativeCacheRankLoad};
+
+        let registry = WorkerRegistry::default();
+        for id in ["a", "b"] {
+            registry
+                .add(WorkerSpec {
+                    id: WorkerId(id.into()),
+                    url: format!("http://{id}:1"),
+                    mode: WorkerMode::Plain,
+                    model_ids: vec![ModelId("m".into())],
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let load = EngineReportedLoadTable::new();
+        let report = |url: &str, tokens: u64, busy_us: u64| {
+            load.set(
+                url,
+                0,
+                LoadStat {
+                    num_running_reqs: 0,
+                    num_waiting_reqs: 0,
+                    num_tokens: 0,
+                    max_total_num_tokens: 1_000,
+                    native_cache: Some(NativeCacheRankLoad {
+                        num_waiting_uncached_tokens: 0,
+                        num_total_tokens: 0,
+                        max_running_requests: 64,
+                        total_prefill_uncached_tokens: tokens,
+                        total_prefill_busy_us: busy_us,
+                    }),
+                },
+                std::time::Instant::now(),
+            )
+        };
+        let mut group = EngineGroup::new(Arc::new(PowerOfTwoPolicy::new(Arc::clone(&load))));
+        group.worker_ids = Some([WorkerId("a".into()), WorkerId("b".into())].into());
+        let mut bucket = Bucket::new("S", BucketGroups::Plain(group));
+        bucket.queue = Some(Arc::new(BucketQueue::new("S", spec(2.0, 10_000.0, 1.0))));
+        let routing = ChatRouting::Reorg(
+            [(
+                ModelId("m".into()),
+                BucketResolver::new(vec![bucket]).unwrap(),
+            )]
+            .into(),
+        );
+        let ChatRouting::Reorg(resolvers) = &routing else {
+            unreachable!()
+        };
+        let queue = Arc::clone(
+            resolvers[&ModelId("m".into())].buckets[0]
+                .queue
+                .as_ref()
+                .unwrap(),
+        );
+        // Nothing reported yet: the configured rate per member.
+        refresh_members(&routing, &registry, Some(&load));
+        assert_eq!(queue.depth().tokens, 40_000);
+        // a prefilled 15,000 tokens in one busy second; b reports nothing.
+        report("http://a:1", 100_000, 10_000_000);
+        report("http://a:1", 115_000, 11_000_000);
+        assert!(refresh_members(&routing, &registry, Some(&load)));
+        assert_eq!(queue.rate_tokens_per_s(), 25_000.0);
+        assert_eq!(queue.depth().tokens, 50_000);
+        // A rate is remembered when the engine idles between reports.
+        report("http://a:1", 115_000, 11_000_000);
+        refresh_members(&routing, &registry, Some(&load));
+        assert_eq!(queue.depth().tokens, 50_000);
+        let rates = resolvers[&ModelId("m".into())].prefill_rates.rates();
+        assert_eq!(rates, [("http://a:1".to_string(), 15_000.0)]);
     }
 
     #[test]

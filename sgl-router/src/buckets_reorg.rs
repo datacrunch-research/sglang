@@ -26,7 +26,7 @@ use std::sync::Arc;
 use crate::discovery::{ModelId, WorkerId};
 use crate::policies_reorg::admission::EngineMetrics;
 use crate::policies_reorg::{Pick, PickError, PickRequest, Policy, Stage};
-use crate::server::bucket_admission::BucketQueue;
+use crate::server::bucket_admission::{BucketQueue, PrefillRates};
 use crate::state::kv_events::CacheNamespace;
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::state::session_estimator::SessionEstimator;
@@ -299,13 +299,21 @@ impl Bucket {
     /// Engines that can serve this bucket now: plain members, or prefill
     /// members with a decode in their version group. Its queue depth scales with them.
     pub fn ready_members(&self, workers: &WorkerRegistry, model: &ModelId) -> usize {
+        self.ready_prefill_engines(workers, model).len()
+    }
+
+    /// The engines [`Self::ready_members`] counts.
+    pub fn ready_prefill_engines(
+        &self,
+        workers: &WorkerRegistry,
+        model: &ModelId,
+    ) -> Vec<Arc<Worker>> {
         match &self.groups {
-            BucketGroups::Plain(group) => group.members(workers, model, Stage::Plain).len(),
+            BucketGroups::Plain(group) => group.members(workers, model, Stage::Plain),
             BucketGroups::Pd { prefill, decode } => paired_prefills(
                 prefill.members(workers, model, Stage::Prefill),
                 &decode.members(workers, model, Stage::Decode),
-            )
-            .len(),
+            ),
         }
     }
 
@@ -476,6 +484,8 @@ pub struct BucketResolver {
     pub tps_slo: SloPreference,
     /// What makes an engine of a spill target idle.
     pub idle: IdleSpec,
+    /// Each engine's smoothed prefill rate, for queue depths.
+    pub prefill_rates: PrefillRates,
     /// Set when a bucket bounds uncached tokens; estimates them per session.
     pub estimator: Option<Arc<SessionEstimator>>,
 }

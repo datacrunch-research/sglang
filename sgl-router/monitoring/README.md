@@ -100,6 +100,8 @@ Emitted under `--chat-routing reorg`; the per-bucket series cover buckets with a
 | `sgl_router_bucket_depth_tokens{bucket}` | Gauge | Tokens the bucket holds before answering 429 |
 | `sgl_router_bucket_depth_requests{bucket}` | Gauge | Requests the bucket holds before answering 429 (each member may also run one) |
 | `sgl_router_bucket_members{bucket}` | Gauge | Ready engines the depth scales with |
+| `sgl_router_bucket_rate_tokens_per_second{bucket}` | Gauge | Summed uncached-token rate of those engines (measured or configured) |
+| `sgl_router_prefill_rate_tokens_per_second{worker_url}` | Gauge | Each engine's smoothed reported prefill rate (tokens per busy second) |
 | `sgl_router_bucket_admitted_total{bucket}` | Counter | Requests admitted to the queue |
 | `sgl_router_bucket_rejected_total{bucket,reason}` | Counter | 429s by `bucket_full`, `deadline`, `decode_permits` |
 | `sgl_router_bucket_spill_total{from,to}` | Counter | Requests placed on an idle engine of a longer bucket |

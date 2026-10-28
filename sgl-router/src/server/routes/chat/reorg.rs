@@ -11,7 +11,7 @@ use crate::buckets_reorg::{Bucket, BucketPick, BucketRequest, BucketResolver, Sl
 use crate::discovery::{ModelId, WorkerId};
 use crate::policies_reorg::{PickError, Stage};
 use crate::server::app_context::AppContext;
-use crate::server::bucket_admission::{BucketQueue, BucketSlot, RejectReason};
+use crate::server::bucket_admission::{size_queue, BucketQueue, BucketSlot, RejectReason};
 use crate::server::error::ApiError;
 use crate::state::session_estimator::{session_key, PendingTurn};
 use axum::http::HeaderMap;
@@ -185,7 +185,7 @@ async fn pick_queued(
     tokens: u64,
     model: &ModelId,
 ) -> Result<(BucketPick, BucketSlot, std::time::Duration), ApiError> {
-    queue.set_members(home.ready_members(&ctx.registry, model) as u64);
+    size_queue(home, queue, &ctx.registry, model, &resolver.prefill_rates);
     let arrived = Instant::now();
     let slot = queue
         .try_enter(tokens)
