@@ -345,6 +345,10 @@ pub fn build_router_with_body_limit(ctx: Arc<AppContext>, max_body_bytes: usize)
         .route(
             crate::server::routes::cell::CELL_INFO_PATH,
             get(crate::server::routes::cell::cell_info),
+        )
+        .route(
+            crate::server::routes::cell::CELL_FILES_PATH,
+            get(crate::server::routes::cell::cell_file),
         );
     let router = crate::server::routes::unsupported::UNSUPPORTED_PATHS
         .iter()
