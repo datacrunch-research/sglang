@@ -13,4 +13,5 @@
 pub(crate) mod app;
 mod info;
 mod native_api;
+pub(crate) mod runtime;
 pub(crate) mod service;

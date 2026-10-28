@@ -217,12 +217,29 @@ when no engine reports).
 load the matching tokenizer and parsers without being configured by hand:
 `model` (this router's `--model-id`), `tokenizer_path` (this router's
 `--tokenizer-path`, a path on this router's filesystem or an HF repo id; the
-model id is an HF repo id to fall back to), `page_size`, `chat` (the engines'
+model id is an HF repo id to fall back to), `page_size`, `grpc_port` (this router's `--grpc-port`, when it serves
+the native gRPC API, so an upstream can send `Generate` calls there), `chat` (the engines'
 OpenAI-layer launch arguments from `/server_info`: `served_model_name`,
 `reasoning_parser`, `tool_call_parser`, `default_chat_template_kwargs`,
 `context_length`; `null` until an engine reports them), `consistent` (every
-reporting engine agrees on `chat`), `router_default_chat_template_kwargs`
-(this router's own render defaults), `engines` and `engines_reporting_chat`.
+reporting engine agrees on `chat`), `mm` (what media this cell takes, the
+intersection of the engines' `--mm` launch args from `/server_info`:
+`modalities`, the smallest `max_items` per modality from
+`--limit-mm-data-per-request`, `max_request_bytes` from
+`--media-url-max-file-size-mb`, `families` with their processor spec (empty
+until engines report it), `hash` (`sha256`, the content identity of
+`mm_content_hashes`), `trust_content_hashes`, `engines_multimodal` and
+`engines_reporting_multimodal`; `null` unless every reporting engine has
+`enable_multimodal`), `router_default_chat_template_kwargs` (this router's own
+render defaults), `engines` and `engines_reporting_chat`.
+
+The same three signals are served on the router's gRPC port
+(`--grpc-port`) as `sglang.runtime.v1.SglangService` RPCs `PrefixMatch`,
+`GetCellLoad` and `GetCellInfo`, answered from the router's own state without
+an engine round-trip; an upstream that already sends `Generate` there can
+keep one connection. `PrefixMatch` fails with `DEADLINE_EXCEEDED` when the
+lookup misses `deadline_ms`; `GetCellInfo` carries the nested `chat` and `mm`
+objects as JSON strings.
 
 ## Bucket file membership
 

@@ -53,6 +53,8 @@ pub struct EngineProfile {
     pub grpc_port: Option<u16>,
     /// The engine's chat template renders a system message after the first.
     pub supports_inline_system: bool,
+    /// The engine's multimodal launch args; `None` if unread.
+    pub mm: Option<Arc<crate::workers::introspect::EngineMm>>,
 }
 
 impl From<WireProtocol> for EngineProfile {
@@ -63,6 +65,7 @@ impl From<WireProtocol> for EngineProfile {
             openai: None,
             grpc_port: None,
             supports_inline_system: false,
+            mm: None,
         }
     }
 }
@@ -264,6 +267,7 @@ pub struct Worker {
     dp_rank_turn: AtomicUsize,
     openai: Option<Arc<OpenAiSettings>>,
     supports_inline_system: bool,
+    mm: Option<Arc<crate::workers::introspect::EngineMm>>,
 }
 
 impl Worker {
@@ -285,6 +289,7 @@ impl Worker {
             openai,
             grpc_port,
             supports_inline_system,
+            mm,
         } = profile.into();
         let breaker = match cb {
             Some(cfg) => Arc::new(CircuitBreaker::with_config(cfg)),
@@ -316,6 +321,7 @@ impl Worker {
             dp_rank_turn: AtomicUsize::new(0),
             openai,
             supports_inline_system,
+            mm,
         }
     }
 
@@ -325,6 +331,11 @@ impl Worker {
 
     pub fn supports_inline_system(&self) -> bool {
         self.supports_inline_system
+    }
+
+    /// The engine's multimodal launch args, when `/server_info` reported them.
+    pub fn mm_settings(&self) -> Option<&Arc<crate::workers::introspect::EngineMm>> {
+        self.mm.as_ref()
     }
 
     pub fn services(&self) -> BTreeSet<String> {

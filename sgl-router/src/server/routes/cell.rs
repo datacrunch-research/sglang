@@ -31,6 +31,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use sgl_kv_indexer::PrefixOutcome;
+use sglang_api_types::runtime::v1 as proto;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -100,36 +101,61 @@ pub struct CellLoad {
     pub router_inflight_requests: u64,
 }
 
+/// Why a prefix match produced no answer: the budget ran out.
+#[derive(Debug)]
+pub enum PrefixMatchFailure {
+    Api(ApiError),
+    /// The lookup did not finish within `deadline_ms`.
+    Deadline,
+}
+
+impl From<ApiError> for PrefixMatchFailure {
+    fn from(error: ApiError) -> Self {
+        PrefixMatchFailure::Api(error)
+    }
+}
+
 /// `POST /internal/prefix_match`.
 pub async fn prefix_match(
     State(ctx): State<Arc<AppContext>>,
     Json(request): Json<PrefixMatchRequest>,
 ) -> Result<Response, ApiError> {
-    let model = served_model(&ctx, request.model.as_deref())?;
+    match prefix_match_answer(&ctx, request).await {
+        Ok(answer) => Ok(Json(answer).into_response()),
+        Err(PrefixMatchFailure::Deadline) => Ok((
+            StatusCode::GATEWAY_TIMEOUT,
+            "prefix lookup did not finish within deadline_ms",
+        )
+            .into_response()),
+        Err(PrefixMatchFailure::Api(error)) => Err(error),
+    }
+}
+
+/// The prefix-match answer for one query, shared by the HTTP route and the
+/// gRPC `PrefixMatch` RPC.
+pub async fn prefix_match_answer(
+    ctx: &AppContext,
+    request: PrefixMatchRequest,
+) -> Result<PrefixMatchResponse, PrefixMatchFailure> {
+    let model = served_model(ctx, request.model.as_deref())?;
     let namespace = CacheNamespace {
         cache_salt: request.cache_salt.filter(|s| !s.is_empty()),
         lora_name: request.lora_name.filter(|s| !s.is_empty()),
         ambiguous: false,
     };
-    let lookup = lookup_prefix_for_tokens(&ctx, &request.token_ids, &namespace, &model.0);
+    let lookup = lookup_prefix_for_tokens(ctx, &request.token_ids, &namespace, &model.0);
     let signal = match request.deadline_ms {
         Some(ms) if ms > 0 => {
             match tokio::time::timeout(Duration::from_millis(u64::from(ms)), lookup).await {
                 Ok(signal) => signal?,
-                Err(_) => {
-                    return Ok((
-                        StatusCode::GATEWAY_TIMEOUT,
-                        "prefix lookup did not finish within deadline_ms",
-                    )
-                        .into_response());
-                }
+                Err(_) => return Err(PrefixMatchFailure::Deadline),
             }
         }
         _ => lookup.await?,
     };
 
     let now = Instant::now();
-    let engines = prefill_engines(&ctx, &model);
+    let engines = prefill_engines(ctx, &model);
     let urls: HashSet<&str> = engines.iter().map(|w| w.url.as_str()).collect();
     let (matched_prefix_blocks, pending) = cell_depth(signal.as_ref(), &urls);
     let page_size = ctx.block_size_oracle.get().unwrap_or(0);
@@ -140,8 +166,8 @@ pub async fn prefix_match(
     let input_tokens = request
         .input_tokens
         .unwrap_or(request.token_ids.len() as u64);
-    let admits = admits(&ctx, &model, input_tokens, &snapshot);
-    Ok(Json(PrefixMatchResponse {
+    let admits = admits(ctx, &model, input_tokens, &snapshot);
+    Ok(PrefixMatchResponse {
         matched_prefix_tokens,
         matched_prefix_blocks,
         page_size,
@@ -149,16 +175,20 @@ pub async fn prefix_match(
         load,
         admits,
     })
-    .into_response())
 }
 
 /// `GET /internal/cell_load`.
 pub async fn cell_load(State(ctx): State<Arc<AppContext>>) -> Json<CellLoad> {
+    Json(cell_load_answer(&ctx))
+}
+
+/// The cell's load now, shared by the HTTP route and the gRPC `GetCellLoad` RPC.
+pub fn cell_load_answer(ctx: &AppContext) -> CellLoad {
     let now = Instant::now();
     let model = ModelId(ctx.config.model.id.clone());
-    let engines = prefill_engines(&ctx, &model);
+    let engines = prefill_engines(ctx, &model);
     let snapshot = ctx.engine_reported_load.capture_snapshot(now);
-    Json(summarize_load(&engines, &snapshot, now))
+    summarize_load(&engines, &snapshot, now)
 }
 
 /// `GET /internal/cell_info`: the model this cell serves and the facts an
@@ -173,17 +203,92 @@ pub struct CellInfo {
     pub tokenizer_path: Option<String>,
     /// The cell's block size; 0 until an engine reports one.
     pub page_size: u32,
+    /// This router's native gRPC port (`--grpc-port`), when it serves one:
+    /// `sglang.runtime.v1.SglangService` on the same host as the HTTP port.
+    pub grpc_port: Option<u16>,
     /// The engines' OpenAI-layer launch arguments that shape rendering and
     /// parsing, from `/server_info`; `None` when no engine reported them.
     pub chat: Option<CellChatSettings>,
     /// Whether every engine that reported agrees on `chat`. An upstream that
     /// renders for a cell whose engines disagree cannot match all of them.
     pub consistent: bool,
+    /// What media this cell takes; `None` when no engine reports multimodal
+    /// support, or when any reporting engine lacks it (the router may send a
+    /// request to any of them).
+    pub mm: Option<CellMm>,
     /// This router's own `--default-chat-template-kwargs`, which it applies
     /// when it renders; the engines' are in `chat`.
     pub router_default_chat_template_kwargs: serde_json::Map<String, serde_json::Value>,
     pub engines: u32,
     pub engines_reporting_chat: u32,
+}
+
+/// The cell's media capability: the intersection of its engines' `--mm`
+/// launch args. An upstream router sends media only to cells that report
+/// the modality, within the smallest `max_items`, and derives cache
+/// identities with `hash`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CellMm {
+    /// Modalities the engines take. Engines report no per-modality list, so
+    /// a multimodal engine is taken to accept images; video and audio are
+    /// listed when `--limit-mm-data-per-request` names them.
+    pub modalities: Vec<String>,
+    /// The smallest per-request item limit any engine sets, per modality.
+    pub max_items: std::collections::BTreeMap<String, u32>,
+    /// The smallest remote-media byte cap any engine sets.
+    pub max_request_bytes: Option<u64>,
+    /// Model families with their processor spec. Empty until engines report
+    /// their processor configuration; an upstream without a planner for the
+    /// family matches on the text prefix only.
+    pub families: Vec<serde_json::Value>,
+    /// The identity algorithm the engines key their media caches on:
+    /// `sha256:<64 hex>` of the raw bytes (`mm_content_hashes`).
+    pub hash: &'static str,
+    /// Whether the engines adopt caller content hashes without re-hashing.
+    pub trust_content_hashes: bool,
+    pub engines_multimodal: u32,
+    pub engines_reporting_multimodal: u32,
+}
+
+impl CellMm {
+    /// The intersection over the engines that reported; `None` unless every
+    /// reporting engine is multimodal.
+    fn from_engines(engines: &[Arc<Worker>]) -> Option<Self> {
+        let reported: Vec<&crate::workers::introspect::EngineMm> = engines
+            .iter()
+            .filter_map(|w| w.mm_settings())
+            .map(|m| m.as_ref())
+            .collect();
+        if reported.is_empty() || reported.iter().any(|m| !m.enabled) {
+            return None;
+        }
+        let mut max_items: std::collections::BTreeMap<String, u32> = Default::default();
+        for mm in &reported {
+            for (modality, limit) in &mm.max_items {
+                max_items
+                    .entry(modality.clone())
+                    .and_modify(|current| *current = (*current).min(*limit))
+                    .or_insert(*limit);
+            }
+        }
+        let mut modalities: Vec<String> = vec!["image".to_owned()];
+        for modality in max_items.keys() {
+            if !modalities.contains(modality) && max_items[modality] > 0 {
+                modalities.push(modality.clone());
+            }
+        }
+        modalities.retain(|m| max_items.get(m).is_none_or(|limit| *limit > 0));
+        Some(Self {
+            modalities,
+            max_items,
+            max_request_bytes: reported.iter().filter_map(|m| m.max_media_bytes).min(),
+            families: Vec::new(),
+            hash: "sha256",
+            trust_content_hashes: reported.iter().all(|m| m.trust_content_hashes),
+            engines_multimodal: reported.iter().filter(|m| m.enabled).count() as u32,
+            engines_reporting_multimodal: reported.len() as u32,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -208,8 +313,13 @@ impl CellChatSettings {
 }
 
 pub async fn cell_info(State(ctx): State<Arc<AppContext>>) -> Json<CellInfo> {
+    Json(cell_info_answer(&ctx))
+}
+
+/// What this cell serves, shared by the HTTP route and the gRPC `GetCellInfo` RPC.
+pub fn cell_info_answer(ctx: &AppContext) -> CellInfo {
     let model = ModelId(ctx.config.model.id.clone());
-    let engines = prefill_engines(&ctx, &model);
+    let engines = prefill_engines(ctx, &model);
     let reported: Vec<CellChatSettings> = engines
         .iter()
         .filter_map(|w| w.openai_settings())
@@ -223,16 +333,92 @@ pub async fn cell_info(State(ctx): State<Arc<AppContext>>) -> Json<CellInfo> {
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    Json(CellInfo {
+    CellInfo {
         model: model.0,
         tokenizer_path: ctx.config.model.tokenizer_path.clone(),
         page_size: ctx.block_size_oracle.get().unwrap_or(0),
+        grpc_port: ctx.config.server.grpc_port,
         engines: engines.len() as u32,
         engines_reporting_chat: reported.len() as u32,
         chat: reported.into_iter().next(),
         consistent,
+        mm: CellMm::from_engines(&engines),
         router_default_chat_template_kwargs: router_kwargs,
-    })
+    }
+}
+
+// --- The same signals as `sglang.runtime.v1` messages, for the gRPC ingress. ---
+
+impl From<proto::PrefixMatchRequest> for PrefixMatchRequest {
+    fn from(request: proto::PrefixMatchRequest) -> Self {
+        Self {
+            model: request.model,
+            token_ids: request.token_ids,
+            input_tokens: request.input_tokens,
+            cache_salt: request.cache_salt,
+            lora_name: request.lora_name,
+            deadline_ms: request.deadline_ms,
+        }
+    }
+}
+
+impl From<CellLoad> for proto::CellLoad {
+    fn from(load: CellLoad) -> Self {
+        Self {
+            waiting_uncached_tokens: load.waiting_uncached_tokens,
+            estimated_prefill_queue_ms: load.estimated_prefill_queue_ms,
+            waiting_requests: load.waiting_requests,
+            running_requests: load.running_requests,
+            min_worker_queue: load.min_worker_queue,
+            snapshot_age_ms: load.snapshot_age_ms,
+            engines: load.engines,
+            reporting_engines: load.reporting_engines,
+            router_inflight_requests: load.router_inflight_requests,
+        }
+    }
+}
+
+impl From<PrefixMatchResponse> for proto::PrefixMatchResponse {
+    fn from(answer: PrefixMatchResponse) -> Self {
+        Self {
+            matched_prefix_tokens: answer.matched_prefix_tokens,
+            matched_prefix_blocks: answer.matched_prefix_blocks,
+            page_size: answer.page_size,
+            pending: answer.pending,
+            load: Some(answer.load.into()),
+            admits: answer.admits,
+        }
+    }
+}
+
+impl From<CellInfo> for proto::CellInfo {
+    fn from(info: CellInfo) -> Self {
+        // The nested objects travel as the JSON the HTTP route serves, so both
+        // forms read the same.
+        Self {
+            model: info.model,
+            tokenizer_path: info.tokenizer_path,
+            page_size: info.page_size,
+            grpc_port: info.grpc_port.map(u32::from),
+            chat_json: info
+                .chat
+                .as_ref()
+                .and_then(|chat| serde_json::to_string(chat).ok())
+                .unwrap_or_default(),
+            consistent: info.consistent,
+            router_default_chat_template_kwargs_json: serde_json::to_string(
+                &info.router_default_chat_template_kwargs,
+            )
+            .unwrap_or_default(),
+            engines: info.engines,
+            engines_reporting_chat: info.engines_reporting_chat,
+            mm_json: info
+                .mm
+                .as_ref()
+                .and_then(|mm| serde_json::to_string(mm).ok())
+                .unwrap_or_default(),
+        }
+    }
 }
 
 /// The one model this router serves, or 404 when the caller names another.
@@ -586,10 +772,67 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["model"], model);
         assert_eq!(body["page_size"], BLOCK);
+        assert!(body["grpc_port"].is_null(), "the stub serves no gRPC port");
+        assert!(
+            body["mm"].is_null(),
+            "no engine reported multimodal support"
+        );
         assert_eq!(body["engines"], 2);
         assert_eq!(body["engines_reporting_chat"], 0);
         assert!(body["chat"].is_null());
         assert_eq!(body["consistent"], true);
+    }
+
+    #[tokio::test]
+    async fn cell_signals_convert_to_their_grpc_messages() {
+        let prompt: Vec<u32> = (1..=40).collect();
+        let ctx = ctx_with_tree(&prompt, 6);
+        let info: proto::CellInfo = cell_info_answer(&ctx).into();
+        assert_eq!(info.model, ctx.config.model.id);
+        assert_eq!(info.engines, 2);
+        assert_eq!(info.page_size, BLOCK);
+        assert!(
+            info.chat_json.is_empty(),
+            "no engine reported chat settings"
+        );
+        assert!(
+            info.mm_json.is_empty(),
+            "no engine reported multimodal support"
+        );
+        let kwargs: Value =
+            serde_json::from_str(&info.router_default_chat_template_kwargs_json).unwrap();
+        assert!(kwargs.is_object());
+
+        let load: proto::CellLoad = cell_load_answer(&ctx).into();
+        assert_eq!(load.engines, 2);
+        assert_eq!(load.reporting_engines, 0);
+        assert_eq!(load.snapshot_age_ms, u32::MAX);
+
+        let request = proto::PrefixMatchRequest {
+            model: Some(ctx.config.model.id.clone()),
+            token_ids: prompt.clone(),
+            input_tokens: Some(40),
+            cache_salt: None,
+            lora_name: None,
+            deadline_ms: Some(1000),
+        };
+        let answer: proto::PrefixMatchResponse = prefix_match_answer(&ctx, request.into())
+            .await
+            .expect("the cell answers")
+            .into();
+        assert_eq!(answer.matched_prefix_blocks, 6);
+        assert_eq!(answer.matched_prefix_tokens, 24);
+        assert_eq!(answer.page_size, BLOCK);
+        assert!(answer.admits);
+        assert_eq!(answer.load.expect("load rides along").engines, 2);
+        let other = proto::PrefixMatchRequest {
+            model: Some("someone-else".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            prefix_match_answer(&ctx, other.into()).await,
+            Err(PrefixMatchFailure::Api(_))
+        ));
     }
 
     #[test]

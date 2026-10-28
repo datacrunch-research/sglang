@@ -153,6 +153,7 @@ mod tests {
             openai: None,
             grpc_port: None,
             supports_inline_system: false,
+            mm: None,
         };
         Worker::with_cb_config(spec, None, profile)
     }
