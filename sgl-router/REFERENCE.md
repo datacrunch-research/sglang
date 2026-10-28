@@ -226,8 +226,9 @@ reporting engine agrees on `chat`), `mm` (what media this cell takes, the
 intersection of the engines' `--mm` launch args from `/server_info`:
 `modalities`, the smallest `max_items` per modality from
 `--limit-mm-data-per-request`, `max_request_bytes` from
-`--media-url-max-file-size-mb`, `families` with their processor spec (empty
-until engines report it), `hash` (`sha256`, the content identity of
+`--media-url-max-file-size-mb`, `families`, the model's family and processor
+spec read from the model files beside the tokenizer (`config.json`'s
+`model_type`, `preprocessor_config.json`'s `media_proc_cfg`), `hash` (`sha256`, the content identity of
 `mm_content_hashes`), `trust_content_hashes`, `engines_multimodal` and
 `engines_reporting_multimodal`; `null` unless every reporting engine has
 `enable_multimodal`), `router_default_chat_template_kwargs` (this router's own

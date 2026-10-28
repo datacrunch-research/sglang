@@ -239,9 +239,12 @@ pub struct CellMm {
     pub max_items: std::collections::BTreeMap<String, u32>,
     /// The smallest remote-media byte cap any engine sets.
     pub max_request_bytes: Option<u64>,
-    /// Model families with their processor spec. Empty until engines report
-    /// their processor configuration; an upstream without a planner for the
-    /// family matches on the text prefix only.
+    /// The model's family with its processor spec, read from the model files
+    /// beside the tokenizer (`config.json`'s `model_type`,
+    /// `preprocessor_config.json`'s `media_proc_cfg`, or the whole file for a
+    /// model without one): `[{name, modalities, spec}]`. Empty when the files
+    /// are not there; an upstream without a planner for the family matches on
+    /// the text prefix only.
     pub families: Vec<serde_json::Value>,
     /// The identity algorithm the engines key their media caches on:
     /// `sha256:<64 hex>` of the raw bytes (`mm_content_hashes`).
@@ -254,8 +257,9 @@ pub struct CellMm {
 
 impl CellMm {
     /// The intersection over the engines that reported; `None` unless every
-    /// reporting engine is multimodal.
-    fn from_engines(engines: &[Arc<Worker>]) -> Option<Self> {
+    /// reporting engine is multimodal. `tokenizer_path` names the model files
+    /// the family spec is read from.
+    fn from_engines(engines: &[Arc<Worker>], tokenizer_path: Option<&str>) -> Option<Self> {
         let reported: Vec<&crate::workers::introspect::EngineMm> = engines
             .iter()
             .filter_map(|w| w.mm_settings())
@@ -284,7 +288,7 @@ impl CellMm {
             modalities,
             max_items,
             max_request_bytes: reported.iter().filter_map(|m| m.max_media_bytes).min(),
-            families: Vec::new(),
+            families: tokenizer_path.map(model_families).unwrap_or_default(),
             hash: "sha256",
             trust_content_hashes: reported.iter().all(|m| m.trust_content_hashes),
             engines_multimodal: reported.iter().filter(|m| m.enabled).count() as u32,
@@ -344,9 +348,54 @@ pub fn cell_info_answer(ctx: &AppContext) -> CellInfo {
         engines_reporting_chat: reported.len() as u32,
         chat: reported.into_iter().next(),
         consistent,
-        mm: CellMm::from_engines(&engines),
+        mm: CellMm::from_engines(&engines, ctx.config.model.tokenizer_path.as_deref()),
         router_default_chat_template_kwargs: router_kwargs,
     }
+}
+
+/// The model's family and processor spec from the files beside the tokenizer,
+/// read once per path (an HF repo id downloads the two files on first use, as
+/// the tokenizer's own files are). An upstream router builds its planner from
+/// `spec`, so it plans the exact geometry the engines apply.
+fn model_families(tokenizer_path: &str) -> Vec<serde_json::Value> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<String, Vec<serde_json::Value>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(families) = cache.lock().unwrap().get(tokenizer_path) {
+        return families.clone();
+    }
+    let families = read_model_families(tokenizer_path);
+    cache
+        .lock()
+        .unwrap()
+        .insert(tokenizer_path.to_owned(), families.clone());
+    families
+}
+
+fn read_model_families(tokenizer_path: &str) -> Vec<serde_json::Value> {
+    let files = crate::tokenizer::adapter::ModelFiles::open(tokenizer_path);
+    let Ok(Some(preprocessor)) = files.json("preprocessor_config.json") else {
+        return Vec::new();
+    };
+    let config = files.json("config.json").ok().flatten();
+    let name = config
+        .as_ref()
+        .and_then(|c| c.get("model_type"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    // Kimi's processors nest their geometry under `media_proc_cfg`; others
+    // spell it at the top level.
+    let spec = preprocessor
+        .get("media_proc_cfg")
+        .cloned()
+        .unwrap_or(preprocessor);
+    vec![serde_json::json!({
+        "name": name,
+        "modalities": ["image"],
+        "spec": spec,
+    })]
 }
 
 // --- The same signals as `sglang.runtime.v1` messages, for the gRPC ingress. ---
@@ -835,6 +884,62 @@ mod tests {
             prefix_match_answer(&ctx, other.into()).await,
             Err(PrefixMatchFailure::Api(_))
         ));
+    }
+
+    #[test]
+    fn multimodal_cells_report_the_models_processor_spec() {
+        let dir = std::env::temp_dir().join(format!("sgl-router-cell-mm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"model_type": "kimi_k3", "media_placeholder_token_id": 163605}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("preprocessor_config.json"),
+            r#"{"media_proc_cfg": {"patch_size": 14, "merge_kernel_size": 2, "in_patch_limit": 65536,
+                "patch_limit_on_one_side": 512, "image_mean": [0.5, 0.5, 0.5]}, "auto_map": {}}"#,
+        )
+        .unwrap();
+        let mut ctx = AppContext::stub();
+        ctx.config.model.tokenizer_path =
+            Some(dir.join("tokenizer.json").to_string_lossy().into_owned());
+        let profile = crate::workers::EngineProfile {
+            protocol: crate::workers::WireProtocol::default(),
+            dp_ranks: 1,
+            openai: None,
+            grpc_port: None,
+            mm: Some(Arc::new(crate::workers::introspect::EngineMm {
+                enabled: true,
+                max_items: [("image".to_owned(), 4)].into_iter().collect(),
+                max_media_bytes: Some(64 << 20),
+                trust_content_hashes: false,
+            })),
+        };
+        ctx.registry
+            .add_with_cb(
+                WorkerSpec {
+                    id: WorkerId("mm".into()),
+                    url: "http://mm:30000".into(),
+                    mode: WorkerMode::Plain,
+                    model_ids: vec![ModelId(ctx.config.model.id.clone())],
+                    ..Default::default()
+                },
+                None,
+                profile,
+            )
+            .expect("worker accepted");
+        let info = cell_info_answer(&ctx);
+        let mm = info
+            .mm
+            .expect("a multimodal engine makes the cell multimodal");
+        assert_eq!(mm.modalities, vec!["image"]);
+        assert_eq!(mm.max_items.get("image"), Some(&4));
+        assert_eq!(mm.families.len(), 1);
+        assert_eq!(mm.families[0]["name"], "kimi_k3");
+        assert_eq!(mm.families[0]["spec"]["patch_size"], 14);
+        assert_eq!(mm.families[0]["spec"]["patch_limit_on_one_side"], 512);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
