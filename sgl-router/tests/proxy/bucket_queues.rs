@@ -709,3 +709,58 @@ async fn metrics_export_the_bucket_series_under_their_fixed_names() {
         "{body}"
     );
 }
+
+#[tokio::test]
+async fn above_the_agreed_tokens_per_minute_the_pool_answers_429_with_retry_after() {
+    let engine = Engine::start(Duration::ZERO).await;
+    // 100 tokens per second, 100 at once; each request is about 115 input tokens.
+    let ctx = context(
+        &[("s", WorkerMode::Plain, &engine)],
+        serde_json::json!({
+            "tpm_limit": {"tokens_per_minute": 6000, "burst_seconds": 1},
+            "buckets": [{
+                "id": "S", "max_uncached_tokens": 1000000,
+                "queue": {"mean_wait_s": 4, "rate_tokens_per_s": 20000, "rate_requests_per_s": 3},
+                "plain": {"worker_ids": ["s"]}
+            }]
+        }),
+    );
+    let app = build_router(Arc::clone(&ctx));
+    let prompt = "x".repeat(400);
+    // A full bucket admits one request larger than the burst.
+    assert_eq!(
+        send(&app, chat(Some("a"), &[("user", prompt.as_str())]))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (status, headers, body) = send(&app, chat(Some("b"), &[("user", prompt.as_str())])).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers["x-router-error-code"], "tpm_limit");
+    assert_eq!(headers["x-sgl-bucket"], "S");
+    assert_eq!(headers["retry-after"], "2");
+    assert_eq!(body["error"]["type"], "tpm_limit");
+    assert_eq!(engine.hits(), 1, "refused before any engine");
+    let metrics = scrape(&app).await;
+    assert!(
+        metrics.contains("sgl_router_tpm_rejected_total 1\n"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("sgl_router_tpm_limit_tokens_per_minute 6000\n"),
+        "{metrics}"
+    );
+    assert!(
+        metrics
+            .contains("sgl_router_bucket_rejected_total{bucket=\"S\",reason=\"bucket_full\"} 0\n"),
+        "{metrics}"
+    );
+    // Once the refill covers the deficit the pool admits again.
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    assert_eq!(
+        send(&app, chat(Some("c"), &[("user", prompt.as_str())]))
+            .await
+            .0,
+        StatusCode::OK
+    );
+}

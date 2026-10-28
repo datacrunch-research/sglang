@@ -41,6 +41,7 @@ pub(crate) struct Lifecycle {
     prefill_observation: Mutex<Option<u64>>,
     generation_workers: Mutex<Vec<Arc<crate::workers::Worker>>>,
     session_turn: OnceLock<crate::state::session_estimator::PendingTurn>,
+    tpm: OnceLock<Arc<crate::server::bucket_admission::TpmLimiter>>,
 }
 impl Default for Lifecycle {
     fn default() -> Self {
@@ -57,6 +58,7 @@ impl Default for Lifecycle {
             prefill_observation: Mutex::new(None),
             generation_workers: Mutex::new(Vec::new()),
             session_turn: OnceLock::new(),
+            tpm: OnceLock::new(),
         }
     }
 }
@@ -134,6 +136,10 @@ impl Lifecycle {
     /// once the request has finished; the first routed attempt's turn counts.
     pub fn track_session_turn(&self, turn: crate::state::session_estimator::PendingTurn) {
         let _ = self.session_turn.set(turn);
+    }
+    /// Charge this request's output tokens to the pool's agreed rate once answered.
+    pub fn charge_tpm_output(&self, limiter: Arc<crate::server::bucket_admission::TpmLimiter>) {
+        let _ = self.tpm.set(limiter);
     }
     pub fn bind_generation_workers(&self, workers: Vec<Arc<crate::workers::Worker>>) {
         *self.generation_workers.lock().unwrap() = workers;
@@ -218,6 +224,9 @@ impl Drop for Lifecycle {
         };
         ctx.metrics
             .record_cache_observation(&ctx.model, route.predicted, actual);
+        if let (Some(limiter), Some(output)) = (self.tpm.get(), completion_tokens) {
+            limiter.charge(output);
+        }
         // Only a completed turn is in the engine's cache for the next one to extend.
         if let Some(turn) = self.session_turn.get() {
             if self.terminal.load(Ordering::Relaxed) == 1 && !error {

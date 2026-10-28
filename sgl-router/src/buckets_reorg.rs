@@ -26,7 +26,7 @@ use std::sync::Arc;
 use crate::discovery::{ModelId, WorkerId};
 use crate::policies_reorg::admission::EngineMetrics;
 use crate::policies_reorg::{Pick, PickError, PickRequest, Policy, Stage};
-use crate::server::bucket_admission::{BucketQueue, PrefillRates};
+use crate::server::bucket_admission::{BucketQueue, PrefillRates, TpmLimiter};
 use crate::state::kv_events::CacheNamespace;
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::state::session_estimator::SessionEstimator;
@@ -486,6 +486,8 @@ pub struct BucketResolver {
     pub idle: IdleSpec,
     /// Each engine's smoothed prefill rate, for queue depths.
     pub prefill_rates: PrefillRates,
+    /// The pool's agreed tokens per minute, checked before any bucket.
+    pub tpm: Option<Arc<TpmLimiter>>,
     /// Set when a bucket bounds uncached tokens; estimates them per session.
     pub estimator: Option<Arc<SessionEstimator>>,
 }

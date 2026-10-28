@@ -221,6 +221,7 @@ three-lane file.
 | `spill_to` | bucket | longer buckets, in order, whose idle engines may take this bucket's requests |
 | `spill_idle` | file | `max_waiting_uncached_tokens` (0) and `max_running_requests` (4): an engine is idle when its reported waiting uncached tokens are at most the first and its running requests, and this router's in-flight count to it, are below the second |
 | `session_idle_secs` | file | how long a session's last turn stays usable for the estimate (7200) |
+| `tpm_limit` | file | `tokens_per_minute` (the agreed rate), optional `burst_seconds` (60) and `retry_after_max_s` (60) |
 
 ### Uncached estimate
 
@@ -264,6 +265,14 @@ rate.
   `decode_permits` when the decode side refused (`decode_retry_after_s`).
 - The body is `{"error": {"type", "code", "message", "bucket", "depth_tokens",
   "queued_tokens", "retry_after_s"}}`; no bucket path answers 5xx.
+
+With `tpm_limit` the pool first takes the request's input tokens from a token
+bucket that refills at `tokens_per_minute` and holds `burst_seconds` of it; the
+answer's output tokens are charged when it completes, and the input goes back
+when no engine ends up serving the request. Above the agreed rate the answer is
+`429` `tpm_limit` with `Retry-After` = the seconds the refill needs (1 to
+`retry_after_max_s`); at or below it, a bucket answers 429 only when full or past
+its deadline. A request larger than the burst passes once the bucket is full.
 
 A request's place is released when its prefill finishes: under prefill/decode
 when the detached prefill request ends, for a plain engine when its response

@@ -129,6 +129,8 @@ pub enum RejectReason {
     Deadline,
     /// Admitted, but no decode engine took the request before the deadline.
     DecodePermits,
+    /// The pool is above its agreed tokens per minute.
+    TpmLimit,
 }
 
 impl RejectReason {
@@ -138,6 +140,7 @@ impl RejectReason {
             Self::Full => "bucket_full",
             Self::Deadline => "deadline",
             Self::DecodePermits => "decode_permits",
+            Self::TpmLimit => "tpm",
         }
     }
 
@@ -147,6 +150,7 @@ impl RejectReason {
             Self::Full => "bucket_full",
             Self::Deadline => "bucket_deadline",
             Self::DecodePermits => "decode_permits",
+            Self::TpmLimit => "tpm_limit",
         }
     }
 }
@@ -419,6 +423,130 @@ impl BucketQueue {
     }
 }
 
+/// The agreed tokens per minute for the pool, from `--bucket-config`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TpmLimitSpec {
+    /// Input plus output tokens per minute the pool serves before answering 429.
+    pub tokens_per_minute: u64,
+    /// Seconds of the agreed rate that may arrive at once.
+    #[serde(default = "default_burst_seconds")]
+    pub burst_seconds: f64,
+    /// Upper bound of `Retry-After`.
+    #[serde(default = "default_tpm_retry_after_max_s")]
+    pub retry_after_max_s: u64,
+}
+
+fn default_burst_seconds() -> f64 {
+    60.0
+}
+fn default_tpm_retry_after_max_s() -> u64 {
+    60
+}
+
+impl TpmLimitSpec {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.tokens_per_minute == 0
+            || !(self.burst_seconds.is_finite() && self.burst_seconds > 0.0)
+            || self.retry_after_max_s == 0
+        {
+            return Err(
+                "tpm_limit needs positive tokens_per_minute, burst_seconds and retry_after_max_s"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// A token bucket at the agreed tokens per minute. A request takes its input
+/// tokens at admission and its output tokens once answered, so the level
+/// follows the tokens actually served; output can take it below zero, which
+/// the refill pays back before the next admission.
+#[derive(Debug)]
+pub struct TpmLimiter {
+    pub spec: TpmLimitSpec,
+    state: Mutex<TpmState>,
+    pub admitted: AtomicU64,
+    pub rejected: AtomicU64,
+    pub charged_tokens: AtomicU64,
+}
+
+#[derive(Debug)]
+struct TpmState {
+    level: f64,
+    updated: Instant,
+}
+
+impl TpmLimiter {
+    pub fn new(spec: TpmLimitSpec) -> Self {
+        let capacity = spec.tokens_per_minute as f64 * spec.burst_seconds / 60.0;
+        Self {
+            spec,
+            state: Mutex::new(TpmState {
+                level: capacity,
+                updated: Instant::now(),
+            }),
+            admitted: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+            charged_tokens: AtomicU64::new(0),
+        }
+    }
+
+    fn rate_per_s(&self) -> f64 {
+        self.spec.tokens_per_minute as f64 / 60.0
+    }
+
+    pub fn capacity(&self) -> f64 {
+        self.rate_per_s() * self.spec.burst_seconds
+    }
+
+    fn refilled(&self) -> parking_lot::MutexGuard<'_, TpmState> {
+        let mut state = self.state.lock();
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(state.updated).as_secs_f64();
+        state.level = (state.level + elapsed * self.rate_per_s()).min(self.capacity());
+        state.updated = now;
+        state
+    }
+
+    /// Tokens the pool may take now; negative after output overran the rate.
+    pub fn available(&self) -> f64 {
+        self.refilled().level
+    }
+
+    /// Take `tokens` of input, or refuse with the seconds the refill needs. A
+    /// request larger than the burst passes once the bucket is full.
+    pub fn try_take(&self, tokens: u64) -> Result<(), u64> {
+        let mut state = self.refilled();
+        let need = (tokens as f64).min(self.capacity());
+        if state.level >= need {
+            state.level -= tokens as f64;
+            self.admitted.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        self.rejected.fetch_add(1, Ordering::Relaxed);
+        let seconds = ((need - state.level) / self.rate_per_s()).ceil();
+        Err(if seconds.is_finite() {
+            (seconds as u64).clamp(1, self.spec.retry_after_max_s)
+        } else {
+            self.spec.retry_after_max_s
+        })
+    }
+
+    /// Return input taken for a request that was not served.
+    pub fn refund(&self, tokens: u64) {
+        let mut state = self.refilled();
+        state.level = (state.level + tokens as f64).min(self.capacity());
+    }
+
+    /// Charge tokens served after admission (the answer's output).
+    pub fn charge(&self, tokens: u64) {
+        self.refilled().level -= tokens as f64;
+        self.charged_tokens.fetch_add(tokens, Ordering::Relaxed);
+    }
+}
+
 /// Smoothed uncached-token rate per engine URL, from each engine's reported
 /// prefill throughput (uncached tokens per busy second between two reports).
 #[derive(Debug, Default)]
@@ -666,6 +794,26 @@ pub fn render_metrics(ctx: &AppContext) -> String {
             )
         }),
     );
+    let limiters: Vec<_> = resolvers
+        .values()
+        .filter_map(|resolver| resolver.tpm.as_ref())
+        .collect();
+    type TpmValue = fn(&TpmLimiter) -> f64;
+    let tpm: [(&str, &str, &str, TpmValue); 5] = [
+        ("sgl_router_tpm_limit_tokens_per_minute", "gauge", "The pool's agreed tokens per minute.", |l| l.spec.tokens_per_minute as f64),
+        ("sgl_router_tpm_available_tokens", "gauge", "Tokens the pool may admit now under the agreed rate; negative after output overran it.", TpmLimiter::available),
+        ("sgl_router_tpm_admitted_total", "counter", "Requests admitted under the agreed rate.", |l| l.admitted.load(Ordering::Relaxed) as f64),
+        ("sgl_router_tpm_rejected_total", "counter", "Requests answered 429 tpm_limit.", |l| l.rejected.load(Ordering::Relaxed) as f64),
+        ("sgl_router_tpm_output_tokens_total", "counter", "Output tokens charged after answers completed.", |l| l.charged_tokens.load(Ordering::Relaxed) as f64),
+    ];
+    for (name, kind, help, value) in tpm {
+        family(
+            name,
+            kind,
+            help,
+            &mut limiters.iter().map(|l| format!("{name} {}\n", value(l))),
+        );
+    }
     let (permits, running) = decode_permits(ctx);
     family(
         "sgl_router_decode_permits",
@@ -1093,6 +1241,42 @@ mod tests {
         assert_eq!(queue.depth().tokens, 50_000);
         let rates = resolvers[&ModelId("m".into())].prefill_rates.rates();
         assert_eq!(rates, [("http://a:1".to_string(), 15_000.0)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_agreed_rate_refuses_above_it_with_the_refill_time() {
+        let limiter = TpmLimiter::new(
+            serde_json::from_value(
+                serde_json::json!({"tokens_per_minute": 6000, "burst_seconds": 1}),
+            )
+            .unwrap(),
+        );
+        // 100 tokens per second, 100 at once.
+        assert_eq!(limiter.capacity(), 100.0);
+        assert_eq!(limiter.try_take(60), Ok(()));
+        assert_eq!(limiter.try_take(60), Err(1), "20 tokens short at 100/s");
+        tokio::time::advance(Duration::from_millis(200)).await;
+        assert_eq!(limiter.try_take(60), Ok(()));
+        // Output served after admission is charged too.
+        limiter.charge(150);
+        assert!(limiter.available() < -100.0);
+        assert_eq!(limiter.try_take(10), Err(2), "160 tokens short at 100/s");
+        // Larger than the burst: passes once the bucket is full.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(limiter.try_take(500), Ok(()));
+        assert_eq!(limiter.try_take(1), Err(5));
+        limiter.refund(500);
+        assert_eq!(limiter.try_take(1), Ok(()), "a refund returns the input");
+        assert_eq!(
+            (
+                limiter.admitted.load(Ordering::Relaxed),
+                limiter.rejected.load(Ordering::Relaxed)
+            ),
+            (4, 3)
+        );
+        let invalid: TpmLimitSpec =
+            serde_json::from_value(serde_json::json!({"tokens_per_minute": 0})).unwrap();
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

@@ -16,7 +16,7 @@ use crate::config::{
     PolicyKind, SessionAffinityMode,
 };
 use crate::discovery::WorkerId;
-use crate::server::bucket_admission::{BucketQueue, QueueSpec};
+use crate::server::bucket_admission::{BucketQueue, QueueSpec, TpmLimitSpec, TpmLimiter};
 use crate::state::kv_events::RadixTreePrefixProvider;
 use crate::state::session_estimator::{SessionEstimator, DEFAULT_SESSION_IDLE};
 use crate::state::{
@@ -43,6 +43,8 @@ pub struct BucketsConfig {
     pub session_idle_secs: Option<u64>,
     /// When an engine of a spill target counts as idle.
     pub spill_idle: IdleSpec,
+    /// The pool's agreed tokens per minute; above it requests get 429.
+    pub tpm_limit: Option<TpmLimitSpec>,
 }
 
 /// Set either `plain` or both `prefill` and `decode`.
@@ -300,6 +302,11 @@ pub fn build_resolver(
         "--bucket-config spill_idle.max_running_requests must be positive"
     );
     resolver.idle = config.spill_idle;
+    if let Some(spec) = &config.tpm_limit {
+        spec.validate()
+            .map_err(|error| anyhow::anyhow!("--bucket-config {error}"))?;
+        resolver.tpm = Some(Arc::new(TpmLimiter::new(spec.clone())));
+    }
     ensure!(
         config.session_idle_secs != Some(0),
         "--bucket-config session_idle_secs must be positive"

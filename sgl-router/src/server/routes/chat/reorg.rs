@@ -11,10 +11,13 @@ use crate::buckets_reorg::{Bucket, BucketPick, BucketRequest, BucketResolver, Sl
 use crate::discovery::{ModelId, WorkerId};
 use crate::policies_reorg::{PickError, Stage};
 use crate::server::app_context::AppContext;
-use crate::server::bucket_admission::{size_queue, BucketQueue, BucketSlot, RejectReason};
+use crate::server::bucket_admission::{
+    size_queue, BucketQueue, BucketRejection, BucketSlot, RejectReason, TpmLimiter,
+};
 use crate::server::error::ApiError;
 use crate::state::session_estimator::{session_key, PendingTurn};
 use axum::http::HeaderMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::time::Instant;
 
@@ -96,6 +99,30 @@ pub(super) async fn select_workers(
             .and_then(|config| nonempty_header(headers, &config.header_name)),
         excluded,
     };
+    let home = buckets[0];
+    // Above the agreed tokens per minute the pool refuses before any bucket.
+    if let Some(limiter) = &resolver.tpm {
+        if let Err(retry_after_s) = limiter.try_take(request.input_token_count as u64) {
+            return Err(ApiError::BucketRejected(Box::new(BucketRejection {
+                bucket: home.id.clone(),
+                reason: RejectReason::TpmLimit,
+                retry_after_s,
+                depth_tokens: limiter.capacity() as u64,
+                queued_tokens: 0,
+                uncached_tokens: uncached_tokens.unwrap_or(input_tokens),
+                waited: std::time::Duration::ZERO,
+            })));
+        }
+        if let Some(scope) = &request.scope {
+            scope.life.charge_tpm_output(Arc::clone(limiter));
+        }
+    }
+    // Input taken for a request no engine ends up serving goes back.
+    let tpm_refund = TpmRefund {
+        limiter: resolver.tpm.as_deref(),
+        tokens: request.input_token_count as u64,
+        armed: AtomicBool::new(true),
+    };
     let selected = |picks: BucketPick,
                     bucket_slot: Option<BucketSlot>,
                     bucket: &str,
@@ -113,6 +140,7 @@ pub(super) async fn select_workers(
             prefix.local_signal().as_deref(),
             &picks.prefill.engine.url,
         );
+        tpm_refund.armed.store(false, Ordering::Relaxed);
         // Dispatch only after this bucket supplies the entire plain or PD selection.
         SelectedWorkers {
             prefill: picks.prefill.engine,
@@ -127,7 +155,6 @@ pub(super) async fn select_workers(
         }
     };
     // A queued home bucket keeps the request: it waits there for an engine.
-    let home = buckets[0];
     if let Some(queue) = &home.queue {
         let tokens = uncached_tokens.unwrap_or(input_tokens);
         let (picks, slot, waited) = pick_queued(
@@ -219,6 +246,20 @@ async fn pick_queued(
                 queue.wait_for_change(deadline).await;
             }
             Err((stage, error)) => return Err(selection_error(error, model, Some(stage))),
+        }
+    }
+}
+
+struct TpmRefund<'a> {
+    limiter: Option<&'a TpmLimiter>,
+    tokens: u64,
+    armed: AtomicBool,
+}
+
+impl Drop for TpmRefund<'_> {
+    fn drop(&mut self) {
+        if let (Some(limiter), true) = (self.limiter, self.armed.load(Ordering::Relaxed)) {
+            limiter.refund(self.tokens);
         }
     }
 }
