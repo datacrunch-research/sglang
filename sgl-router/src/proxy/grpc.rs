@@ -389,6 +389,7 @@ pub fn text_to_generate(
         image_data: Vec::new(),
         video_data: Vec::new(),
         audio_data: Vec::new(),
+        mm_hashes: Vec::new(),
         return_text: Some(true),
     }
 }

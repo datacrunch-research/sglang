@@ -185,16 +185,34 @@ pub(crate) fn render(
 /// `normalize_assistant_tool_call_arguments(strict=False)`.
 fn prepare_message(mut message: Value) -> Result<Value, RenderError> {
     if let Some(parts) = message["content"].as_array_mut() {
-        // Media expands into image tokens only on the engine.
+        // Images render as one `<|media_pad|>` each (the engine expands them);
+        // video and audio have no K3 rendering here.
         if parts.iter().any(|part| {
             matches!(
                 part["type"].as_str(),
-                Some("image_url" | "video_url" | "audio_url" | "input_audio")
+                Some("video_url" | "audio_url" | "input_audio")
             )
         }) {
             return Err(RenderError::Declined("Kimi K3 media".into()));
         }
-        parts.retain(|part| part["type"] == "text");
+        let mut kept = Vec::with_capacity(parts.len());
+        for part in parts.iter() {
+            match part["type"].as_str() {
+                Some("text" | "input_text") => {
+                    kept.push(json!({"type": "text", "text": part["text"]}))
+                }
+                Some("image_url" | "input_image") => {
+                    let image = match &part["image_url"] {
+                        Value::String(url) => json!({"url": url, "detail": part["detail"]}),
+                        Value::Object(image) => Value::Object(image.clone()),
+                        _ => json!({}),
+                    };
+                    kept.push(json!({"type": "image_url", "image_url": image}));
+                }
+                _ => {}
+            }
+        }
+        *parts = kept;
     }
     neutralize(&mut message["content"]);
     if let Some(reasoning) = message.get_mut("reasoning_content") {
