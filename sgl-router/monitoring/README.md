@@ -112,6 +112,7 @@ Emitted under `--chat-routing reorg`; the per-bucket series cover buckets with a
 | `sgl_router_session_uncached_estimate_error` | Histogram | Uncached estimate minus the engine's prompt minus cached tokens, per completed turn |
 | `sgl_router_tpm_limit_tokens_per_minute`, `sgl_router_tpm_available_tokens` | Gauge | The agreed rate and the tokens the pool may admit now (with `tpm_limit`) |
 | `sgl_router_tpm_admitted_total`, `sgl_router_tpm_rejected_total`, `sgl_router_tpm_output_tokens_total` | Counter | Requests under and over the agreed rate, output tokens charged |
+| `sgl_router_prefill_seconds_rate_tokens_per_second` | Gauge | Under prefill-second bounds, the rate converting uncached tokens into seconds |
 | `sgl_router_membership_events_total{kind}` | Counter | Discovery events applied: `added`, `removed`, `services_changed`, `mode_changed` |
 
 ## Prometheus scrape config

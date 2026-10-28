@@ -60,10 +60,12 @@ pub(super) async fn select_workers(
     let uncached_tokens = session
         .as_ref()
         .map(|(_, _, estimate)| estimate.uncached_tokens);
+    let prefill_rate = resolver.prefill_rate_for_seconds(&ctx.registry, &request.model);
     let buckets = resolver
-        .resolve_uncached(
+        .resolve_estimate(
             input_tokens,
             uncached_tokens,
+            prefill_rate,
             expected_peak_tokens,
             ttft_ms,
             tokens_per_second,
@@ -151,6 +153,7 @@ pub(super) async fn select_workers(
                 bucket: bucket.to_owned(),
                 uncached_tokens,
                 queue_wait,
+                prefill_rate,
             }),
         }
     };

@@ -764,3 +764,77 @@ async fn above_the_agreed_tokens_per_minute_the_pool_answers_429_with_retry_afte
         StatusCode::OK
     );
 }
+
+#[tokio::test]
+async fn prefill_second_bounds_follow_the_engines_measured_rate() {
+    use sgl_router::state::load_monitor::engine_reported_load::{LoadStat, NativeCacheRankLoad};
+    let (short, long) = (
+        Engine::start(Duration::ZERO).await,
+        Engine::start(Duration::ZERO).await,
+    );
+    // Two seconds of prefill splits the lanes; 100 tokens/s until engines report.
+    let ctx = context(
+        &[
+            ("s", WorkerMode::Plain, &short),
+            ("l", WorkerMode::Plain, &long),
+        ],
+        serde_json::json!({
+            "thresholds": "prefill_seconds",
+            "prefill_reference_rate_tokens_per_s": 100,
+            "buckets": [
+                {"id": "S", "max_prefill_seconds": 2, "plain": {"worker_ids": ["s"]}},
+                {"id": "L", "min_prefill_seconds": 2.000001, "plain": {"worker_ids": ["l"]}}
+            ]
+        }),
+    );
+    let app = build_router(Arc::clone(&ctx));
+    let prompt = "p".repeat(2_000);
+    // About 515 cold tokens: 5 s at the reference rate.
+    let (status, headers, _) = send(&app, chat(None, &[("user", prompt.as_str())])).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        (
+            headers["x-sgl-bucket"].to_str().unwrap(),
+            headers["x-sgl-prefill-rate"].to_str().unwrap()
+        ),
+        ("L", "100")
+    );
+    // The engines report 1,000 tokens per busy second: the same prompt is 0.5 s.
+    for engine in [&short, &long] {
+        for (tokens, busy_us) in [(0, 0), (1_000, 1_000_000)] {
+            ctx.engine_reported_load.set(
+                &engine.url,
+                0,
+                LoadStat {
+                    num_running_reqs: 0,
+                    num_waiting_reqs: 0,
+                    num_tokens: 0,
+                    max_total_num_tokens: 1_000,
+                    native_cache: Some(NativeCacheRankLoad {
+                        num_waiting_uncached_tokens: 0,
+                        num_total_tokens: 0,
+                        max_running_requests: 64,
+                        total_prefill_uncached_tokens: tokens,
+                        total_prefill_busy_us: busy_us,
+                    }),
+                },
+                Instant::now(),
+            );
+        }
+    }
+    sgl_router::server::bucket_admission::refresh_members(
+        &ctx.chat_routing,
+        &ctx.registry,
+        Some(&ctx.engine_reported_load),
+    );
+    let (status, headers, _) = send(&app, chat(Some("other"), &[("user", prompt.as_str())])).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["x-sgl-bucket"], "S");
+    assert_eq!(headers["x-sgl-prefill-rate"], "1000");
+    let metrics = scrape(&app).await;
+    assert!(
+        metrics.contains("sgl_router_prefill_seconds_rate_tokens_per_second 1000\n"),
+        "{metrics}"
+    );
+    assert_eq!((short.hits(), long.hits()), (1, 1));
+}

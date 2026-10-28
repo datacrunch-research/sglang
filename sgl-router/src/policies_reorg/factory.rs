@@ -8,8 +8,8 @@ use anyhow::{bail, ensure, Result};
 use serde::Deserialize;
 
 use crate::buckets_reorg::{
-    Bucket, BucketGroups, BucketResolver, EngineGroup, IdleSpec, SloPreference, SpillTarget,
-    TokenLimits,
+    Bucket, BucketGroups, BucketResolver, EngineGroup, IdleSpec, SecondsLimits, SloPreference,
+    SpillTarget, TokenLimits,
 };
 use crate::config::{
     AffinityConfig, AffinityMode, BalancedBy, DecodePolicyKind, FilterKind, ModelConfig,
@@ -45,6 +45,20 @@ pub struct BucketsConfig {
     pub spill_idle: IdleSpec,
     /// The pool's agreed tokens per minute; above it requests get 429.
     pub tpm_limit: Option<TpmLimitSpec>,
+    /// What bucket bounds measure: `uncached_tokens` (`min/max_uncached_tokens`)
+    /// or `prefill_seconds` (`min/max_prefill_seconds`, uncached tokens over the
+    /// engines' measured prefill rate).
+    pub thresholds: Thresholds,
+    /// Under `prefill_seconds`, the rate used until the engines report one.
+    pub prefill_reference_rate_tokens_per_s: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Thresholds {
+    #[default]
+    UncachedTokens,
+    PrefillSeconds,
 }
 
 /// Set either `plain` or both `prefill` and `decode`.
@@ -58,6 +72,9 @@ pub struct BucketSpec {
     /// Bounds on the request's estimated uncached prompt tokens.
     pub min_uncached_tokens: Option<u64>,
     pub max_uncached_tokens: Option<u64>,
+    /// Bounds on its estimated prefill seconds (`thresholds: prefill_seconds`).
+    pub min_prefill_seconds: Option<f64>,
+    pub max_prefill_seconds: Option<f64>,
     pub max_context_tokens: Option<u64>,
     pub ttft_ms: Option<u64>,
     pub tokens_per_second: Option<f64>,
@@ -273,6 +290,11 @@ pub fn build_resolver(
             min: spec.min_uncached_tokens,
             max: spec.max_uncached_tokens,
         };
+        validate_thresholds(config, spec)?;
+        bucket.prefill_seconds = SecondsLimits {
+            min: spec.min_prefill_seconds,
+            max: spec.max_prefill_seconds,
+        };
         if let Some(queue) = &spec.queue {
             queue
                 .validate()
@@ -302,6 +324,9 @@ pub fn build_resolver(
         "--bucket-config spill_idle.max_running_requests must be positive"
     );
     resolver.idle = config.spill_idle;
+    if config.thresholds == Thresholds::PrefillSeconds {
+        resolver.prefill_seconds_reference = config.prefill_reference_rate_tokens_per_s;
+    }
     if let Some(spec) = &config.tpm_limit {
         spec.validate()
             .map_err(|error| anyhow::anyhow!("--bucket-config {error}"))?;
@@ -320,12 +345,50 @@ pub fn build_resolver(
     Ok((resolver, groups.cleanup))
 }
 
+/// A file bounds its buckets in one unit: uncached tokens, or prefill seconds
+/// with a positive reference rate.
+fn validate_thresholds(config: &BucketsConfig, spec: &BucketSpec) -> Result<()> {
+    let id = &spec.id;
+    let tokens = spec.min_uncached_tokens.is_some() || spec.max_uncached_tokens.is_some();
+    let seconds = spec.min_prefill_seconds.is_some() || spec.max_prefill_seconds.is_some();
+    match config.thresholds {
+        Thresholds::UncachedTokens => ensure!(
+            !seconds,
+            "bucket {id:?} sets prefill seconds; they need thresholds: prefill_seconds"
+        ),
+        Thresholds::PrefillSeconds => {
+            ensure!(
+                !tokens,
+                "bucket {id:?} sets uncached tokens under thresholds: prefill_seconds"
+            );
+            ensure!(
+                config
+                    .prefill_reference_rate_tokens_per_s
+                    .is_some_and(|rate| rate.is_finite() && rate > 0.0),
+                "thresholds: prefill_seconds needs a positive prefill_reference_rate_tokens_per_s"
+            );
+        }
+    }
+    let valid = |value: Option<f64>| value.is_none_or(|v| v.is_finite() && v >= 0.0);
+    ensure!(
+        valid(spec.min_prefill_seconds)
+            && valid(spec.max_prefill_seconds)
+            && spec.max_prefill_seconds != Some(0.0)
+            && spec
+                .min_prefill_seconds
+                .zip(spec.max_prefill_seconds)
+                .is_none_or(|(min, max)| min <= max),
+        "bucket {id:?} needs min prefill seconds <= a positive max prefill seconds"
+    );
+    Ok(())
+}
+
 /// Spill runs one way, from shorter lanes to longer ones: a target must take
 /// longer requests than its source (uncached bound first, then input bound).
 fn validate_spill(buckets: &[Bucket]) -> Result<()> {
     let reach = |bucket: &Bucket| {
         (
-            bucket.uncached.max.unwrap_or(u64::MAX),
+            bucket.uncached_capacity(),
             bucket.limits.max.unwrap_or(u64::MAX),
         )
     };
@@ -587,6 +650,40 @@ mod tests {
             serde_json::json!({"spill_idle": {"max_running_requests": 0}, "buckets": [
                 {"id": "S", "plain": {}}
             ]}),
+        ] {
+            assert!(build(invalid).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn prefill_second_bounds_need_their_flag_and_a_reference_rate() {
+        let state = KvEventIndex::new();
+        let build = |buckets: serde_json::Value| {
+            build_resolver(&test_model(buckets), &state, None).map(|(resolver, _)| resolver)
+        };
+        let resolver = build(serde_json::json!({
+            "thresholds": "prefill_seconds",
+            "prefill_reference_rate_tokens_per_s": 20000,
+            "buckets": [
+                {"id": "S", "max_prefill_seconds": 1.5, "spill_to": ["L"], "plain": {}},
+                {"id": "L", "min_prefill_seconds": 1.5, "plain": {}}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(resolver.prefill_seconds_reference, Some(20_000.0));
+        assert!(
+            resolver.estimator.is_some(),
+            "seconds bounds read the estimate"
+        );
+        assert_eq!(resolver.bucket("S").unwrap().prefill_seconds.max, Some(1.5));
+        for invalid in [
+            serde_json::json!({"buckets": [{"id": "S", "max_prefill_seconds": 1, "plain": {}}]}),
+            serde_json::json!({"thresholds": "prefill_seconds", "buckets": [
+                {"id": "S", "max_prefill_seconds": 1, "plain": {}}]}),
+            serde_json::json!({"thresholds": "prefill_seconds", "prefill_reference_rate_tokens_per_s": 1000,
+                "buckets": [{"id": "S", "max_uncached_tokens": 1000, "plain": {}}]}),
+            serde_json::json!({"thresholds": "prefill_seconds", "prefill_reference_rate_tokens_per_s": 1000,
+                "buckets": [{"id": "S", "min_prefill_seconds": 3, "max_prefill_seconds": 2, "plain": {}}]}),
         ] {
             assert!(build(invalid).is_err());
         }

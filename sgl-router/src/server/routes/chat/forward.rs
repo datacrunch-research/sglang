@@ -61,10 +61,13 @@ pub(super) struct BucketRouting {
     pub(super) uncached_tokens: Option<u64>,
     /// Time from arrival to the engine pick, for a queued bucket.
     pub(super) queue_wait: Option<std::time::Duration>,
+    /// The prefill rate behind prefill-second bounds, tokens per second.
+    pub(super) prefill_rate: Option<f64>,
 }
 
 const X_SGL_PREFILL_WORKER: HeaderName = HeaderName::from_static("x-sgl-prefill-worker");
 const X_SGL_DECODE_WORKER: HeaderName = HeaderName::from_static("x-sgl-decode-worker");
+const X_SGL_PREFILL_RATE: HeaderName = HeaderName::from_static("x-sgl-prefill-rate");
 
 /// `x-sgl-*` headers telling the client how a reorg bucket routed its request:
 /// bucket, uncached estimate, queue wait, and the engines picked.
@@ -84,6 +87,9 @@ fn routing_headers(workers: &SelectedWorkers) -> Vec<(HeaderName, HeaderValue)> 
     }
     if let Some(wait) = routing.queue_wait {
         push(X_SGL_QUEUE_WAIT_MS, &wait.as_millis().to_string());
+    }
+    if let Some(rate) = routing.prefill_rate {
+        push(X_SGL_PREFILL_RATE, &format!("{}", rate.round()));
     }
     push(X_SGL_PREFILL_WORKER, &workers.prefill.id.0);
     if let Some(decode) = &workers.decode {

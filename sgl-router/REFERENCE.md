@@ -221,6 +221,7 @@ three-lane file.
 | `spill_to` | bucket | longer buckets, in order, whose idle engines may take this bucket's requests |
 | `spill_idle` | file | `max_waiting_uncached_tokens` (0) and `max_running_requests` (4): an engine is idle when its reported waiting uncached tokens are at most the first and its running requests, and this router's in-flight count to it, are below the second |
 | `session_idle_secs` | file | how long a session's last turn stays usable for the estimate (7200) |
+| `thresholds` | file | `uncached_tokens` (default) or `prefill_seconds`: buckets then set `min/max_prefill_seconds` and the file `prefill_reference_rate_tokens_per_s` |
 | `tpm_limit` | file | `tokens_per_minute` (the agreed rate), optional `burst_seconds` (60) and `retry_after_max_s` (60) |
 
 ### Uncached estimate
@@ -238,6 +239,16 @@ is learned only once it completes, from the counts the engine reports
 (`usage.prompt_tokens_details.cached_tokens` with `--enable-cache-report`, or
 `meta_info.cached_tokens`; the prefill leg's under prefill/decode). Without an
 estimate the whole prompt counts, which lands in the longer bucket.
+
+### Bounds in prefill seconds
+
+With `thresholds: prefill_seconds` a bucket is bounded by
+`min/max_prefill_seconds`: the uncached estimate divided by the mean measured
+prefill rate of the model's ready prefill engines (see `rate_source` below), or
+by `prefill_reference_rate_tokens_per_s` before any engine reports. The same
+file then routes a small model on fast engines and a large model on slow ones
+by the time their prefill takes rather than by its size. Responses carry the
+rate used in `x-sgl-prefill-rate`; a file sets token or second bounds, not both.
 
 ### Queues, 429 and Retry-After
 
@@ -294,7 +305,9 @@ client's per-request records (JSON lines carrying `x-sgl-bucket`,
 `x-sgl-uncached-estimate` and the response's `usage.prompt_tokens` and
 `usage.prompt_tokens_details.cached_tokens`, or flat `bucket`,
 `uncached_estimate`, `prompt_tokens`, `cached_tokens`). The engine's uncached
-tokens place each request in its bucket of the bucket file, and the gate is:
+tokens place each request in its bucket of the bucket file (divided by the
+record's `x-sgl-prefill-rate`, or `--prefill-rate`, under prefill-second bounds),
+and the gate is:
 requests in a longer bucket than the router chose (unsafe) under 0.5 %, the
 longest bucket's requests routed to the shortest under 0.1 %, requests in a
 shorter bucket than chosen (safe) under 5 %, and the estimate within 10 % of the

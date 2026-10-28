@@ -39,12 +39,12 @@ def correct(count):
 
 
 class CheckerTest(unittest.TestCase):
-    def run_checker(self, records, *extra):
+    def run_checker(self, records, *extra, bucket_file=BUCKETS):
         with tempfile.TemporaryDirectory() as tmp:
             buckets = os.path.join(tmp, "buckets.json")
             rows = os.path.join(tmp, "records.jsonl")
             with open(buckets, "w") as handle:
-                json.dump(BUCKETS, handle)
+                json.dump(bucket_file, handle)
             with open(rows, "w") as handle:
                 handle.write("\n".join(json.dumps(row) for row in records) + "\n")
             out = io.StringIO()
@@ -103,6 +103,25 @@ class CheckerTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(result["counts"]["usable"], 1)
         self.assertEqual(result["counts"]["skipped"], 2)
+
+    def test_prefill_second_bounds_use_each_records_rate(self):
+        seconds = {
+            "thresholds": "prefill_seconds",
+            "buckets": [
+                {"id": "S", "max_prefill_seconds": 2},
+                {"id": "L", "min_prefill_seconds": 2.000001},
+            ],
+        }
+        # 3,000 uncached tokens: 0.3 s at 10,000 tokens/s, 3 s at 1,000.
+        fast = dict(record("S", 3_000), **{"x-sgl-prefill-rate": 10_000})
+        slow = dict(record("S", 3_000), **{"x-sgl-prefill-rate": 1_000})
+        code, result = self.run_checker([fast] * 999 + [slow], bucket_file=seconds)
+        self.assertEqual(code, 1)
+        self.assertFalse(self.verdicts(result)["long_as_short"])
+        code, result = self.run_checker([record("S", 3_000)], "--prefill-rate", "10000", bucket_file=seconds)
+        self.assertEqual((code, result["counts"]["usable"]), (0, 1))
+        code, result = self.run_checker([record("S", 3_000)], bucket_file=seconds)
+        self.assertEqual(code, 2, "no rate, no usable record")
 
     def test_no_usable_record_exits_2(self):
         self.assertEqual(self.run_checker([{"bucket": "S"}])[0], 2)

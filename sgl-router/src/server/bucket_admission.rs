@@ -816,6 +816,15 @@ pub fn render_metrics(ctx: &AppContext) -> String {
             &mut limiters.iter().map(|l| format!("{name} {}\n", value(l))),
         );
     }
+    family(
+        "sgl_router_prefill_seconds_rate_tokens_per_second",
+        "gauge",
+        "Under prefill-second bounds, the rate converting uncached tokens to seconds: the ready engines' mean measured rate, or the reference rate.",
+        &mut resolvers.iter().filter_map(|(model, resolver)| {
+            let rate = resolver.prefill_rate_for_seconds(&ctx.registry, model)?;
+            Some(format!("sgl_router_prefill_seconds_rate_tokens_per_second {rate}\n"))
+        }),
+    );
     let (permits, running) = decode_permits(ctx);
     family(
         "sgl_router_decode_permits",

@@ -44,6 +44,32 @@ impl TokenLimits {
     }
 }
 
+/// Inclusive range of estimated prefill seconds: uncached tokens over the
+/// pool's prefill rate.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SecondsLimits {
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+}
+
+impl SecondsLimits {
+    fn is_set(&self) -> bool {
+        self.min.is_some() || self.max.is_some()
+    }
+
+    /// Unbounded limits fit anything; bounded ones need a positive rate.
+    fn fits(&self, tokens: u64, rate: Option<f64>) -> bool {
+        if !self.is_set() {
+            return true;
+        }
+        let Some(rate) = rate.filter(|rate| rate.is_finite() && *rate > 0.0) else {
+            return false;
+        };
+        let seconds = tokens as f64 / rate;
+        self.min.is_none_or(|min| seconds >= min) && self.max.is_none_or(|max| seconds <= max)
+    }
+}
+
 #[derive(Debug)]
 pub struct EngineGroup {
     /// Exact identities. Omit both membership fields to include all engines of the role.
@@ -168,6 +194,9 @@ pub struct Bucket {
     /// Inclusive range of estimated uncached prompt tokens; the whole prompt
     /// counts when no estimate is supplied.
     pub uncached: TokenLimits,
+    /// The same range in estimated prefill seconds, when the bucket file
+    /// sets `thresholds: prefill_seconds`.
+    pub prefill_seconds: SecondsLimits,
     /// Full sequence capacity, checked against the expected peak when known.
     pub max_context_tokens: Option<u64>,
     /// Optional service estimates used only for bucket ordering.
@@ -240,6 +269,7 @@ impl Bucket {
             rank: 0,
             limits: TokenLimits::default(),
             uncached: TokenLimits::default(),
+            prefill_seconds: SecondsLimits::default(),
             max_context_tokens: None,
             ttft_ms: None,
             tokens_per_second: None,
@@ -431,10 +461,13 @@ impl Bucket {
         &self,
         input_tokens: u64,
         uncached_tokens: Option<u64>,
+        prefill_rate: Option<f64>,
         expected_peak_tokens: Option<u64>,
     ) -> bool {
+        let uncached = uncached_tokens.unwrap_or(input_tokens);
         self.limits.fits(input_tokens)
-            && self.uncached.fits(uncached_tokens.unwrap_or(input_tokens))
+            && self.uncached.fits(uncached)
+            && self.prefill_seconds.fits(uncached, prefill_rate)
             && self
                 .max_context_tokens
                 .is_none_or(|max| expected_peak_tokens.unwrap_or(input_tokens) <= max)
@@ -442,11 +475,17 @@ impl Bucket {
 
     /// Whether the bucket is chosen on the uncached estimate.
     pub fn bounds_uncached_tokens(&self) -> bool {
-        self.uncached.min.is_some() || self.uncached.max.is_some()
+        self.uncached.min.is_some() || self.uncached.max.is_some() || self.prefill_seconds.is_set()
     }
 
-    fn uncached_capacity(&self) -> u64 {
-        self.uncached.max.unwrap_or(u64::MAX)
+    /// The upper bound short-to-long ordering uses: uncached tokens, or
+    /// prefill microseconds (a file uses one kind for all its buckets).
+    pub fn uncached_capacity(&self) -> u64 {
+        match (self.uncached.max, self.prefill_seconds.max) {
+            (Some(tokens), _) => tokens,
+            (None, Some(seconds)) => (seconds * 1e6).min(u64::MAX as f64) as u64,
+            (None, None) => u64::MAX,
+        }
     }
 
     fn input_capacity(&self) -> u64 {
@@ -488,6 +527,9 @@ pub struct BucketResolver {
     pub prefill_rates: PrefillRates,
     /// The pool's agreed tokens per minute, checked before any bucket.
     pub tpm: Option<Arc<TpmLimiter>>,
+    /// Set under `thresholds: prefill_seconds`: the prefill rate used until
+    /// the engines report one.
+    pub prefill_seconds_reference: Option<f64>,
     /// Set when a bucket bounds uncached tokens; estimates them per session.
     pub estimator: Option<Arc<SessionEstimator>>,
 }
@@ -502,6 +544,28 @@ impl BucketResolver {
             buckets,
             ..Self::default()
         })
+    }
+
+    /// The rate that converts uncached tokens into prefill seconds: the mean
+    /// measured rate of the ready prefill engines, or the reference rate
+    /// before any reports. `None` unless buckets are bounded in seconds.
+    pub fn prefill_rate_for_seconds(
+        &self,
+        workers: &WorkerRegistry,
+        model: &ModelId,
+    ) -> Option<f64> {
+        let reference = self.prefill_seconds_reference?;
+        let mut seen = HashSet::new();
+        let measured: Vec<f64> = (self.buckets.iter())
+            .flat_map(|bucket| bucket.ready_prefill_engines(workers, model))
+            .filter(|engine| seen.insert(engine.url.clone()))
+            .filter_map(|engine| self.prefill_rates.rate(&engine.url))
+            .collect();
+        if measured.is_empty() {
+            Some(reference)
+        } else {
+            Some(measured.iter().sum::<f64>() / measured.len() as f64)
+        }
     }
 
     pub fn bucket(&self, id: &str) -> Option<&Bucket> {
@@ -567,6 +631,27 @@ impl BucketResolver {
         ttft_ms: Option<u64>,
         tokens_per_second: Option<f64>,
     ) -> Result<Vec<&Bucket>, PickError> {
+        self.resolve_estimate(
+            input_tokens,
+            uncached_tokens,
+            None,
+            expected_peak_tokens,
+            ttft_ms,
+            tokens_per_second,
+        )
+    }
+
+    /// [`Self::resolve_uncached`] with the prefill rate that converts the
+    /// estimate into seconds for buckets bounded in prefill seconds.
+    pub fn resolve_estimate(
+        &self,
+        input_tokens: u64,
+        uncached_tokens: Option<u64>,
+        prefill_rate: Option<f64>,
+        expected_peak_tokens: Option<u64>,
+        ttft_ms: Option<u64>,
+        tokens_per_second: Option<f64>,
+    ) -> Result<Vec<&Bucket>, PickError> {
         if expected_peak_tokens.is_some_and(|tokens| tokens < input_tokens) {
             return Err(PickError::InvalidSignal(
                 "expected peak tokens are below input length".into(),
@@ -587,7 +672,14 @@ impl BucketResolver {
         let mut buckets: Vec<_> = self
             .buckets
             .iter()
-            .filter(|bucket| bucket.fits(input_tokens, uncached_tokens, expected_peak_tokens))
+            .filter(|bucket| {
+                bucket.fits(
+                    input_tokens,
+                    uncached_tokens,
+                    prefill_rate,
+                    expected_peak_tokens,
+                )
+            })
             .collect();
         buckets.sort_by_key(|bucket| {
             let ttft_matches = ttft_ms.map(|target| {
@@ -684,6 +776,67 @@ mod tests {
         // Without an estimate the whole prompt counts.
         assert_eq!(ids(900_000, None), ["long"]);
         assert_eq!(ids(20_000, None), ["short"]);
+    }
+
+    /// Under prefill-second bounds the same estimate lands in a different
+    /// bucket as the prefill rate changes.
+    #[test]
+    fn prefill_second_bounds_convert_the_estimate_at_the_given_rate() {
+        let seconds = |id: &str, min: Option<f64>, max: Option<f64>| {
+            let mut bucket = load_only_bucket(id);
+            bucket.prefill_seconds = SecondsLimits { min, max };
+            bucket
+        };
+        let resolver = BucketResolver::new(vec![
+            seconds("L", Some(1.5), None),
+            seconds("S", None, Some(1.5)),
+        ])
+        .unwrap();
+        assert!(resolver.buckets.iter().all(Bucket::bounds_uncached_tokens));
+        let ids = |uncached, rate| {
+            resolver
+                .resolve_estimate(900_000, Some(uncached), rate, None, None, None)
+                .unwrap()
+                .iter()
+                .map(|bucket| bucket.id.as_str())
+                .collect::<Vec<_>>()
+        };
+        // 30,000 tokens: 1.5 s at 20,000 tokens/s, 3 s at 10,000.
+        assert_eq!(ids(30_000, Some(20_000.0)), ["S", "L"]);
+        assert_eq!(ids(20_000, Some(20_000.0)), ["S"]);
+        assert_eq!(ids(30_000, Some(10_000.0)), ["L"]);
+        assert!(ids(30_000, None).is_empty(), "bounded seconds need a rate");
+    }
+
+    #[test]
+    fn the_seconds_rate_is_the_measured_mean_or_the_reference() {
+        use crate::discovery::WorkerSpec;
+        let workers = WorkerRegistry::default();
+        for id in ["a", "b"] {
+            workers
+                .add(WorkerSpec {
+                    id: WorkerId(id.into()),
+                    url: format!("http://{id}:1"),
+                    mode: Stage::Plain,
+                    model_ids: vec![ModelId("m".into())],
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let mut resolver = BucketResolver::new(vec![load_only_bucket("all")]).unwrap();
+        let model = ModelId("m".into());
+        assert_eq!(resolver.prefill_rate_for_seconds(&workers, &model), None);
+        resolver.prefill_seconds_reference = Some(5_000.0);
+        assert_eq!(
+            resolver.prefill_rate_for_seconds(&workers, &model),
+            Some(5_000.0)
+        );
+        resolver.prefill_rates.observe("http://a:1", Some(30_000.0));
+        resolver.prefill_rates.observe("http://b:1", Some(10_000.0));
+        assert_eq!(
+            resolver.prefill_rate_for_seconds(&workers, &model),
+            Some(20_000.0)
+        );
     }
 
     /// Overlapping uncached ranges order by the smaller uncached bound first.

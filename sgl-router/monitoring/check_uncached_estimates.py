@@ -9,6 +9,8 @@ counts, from the response's `usage.prompt_tokens` and
 `usage.prompt_tokens_details.cached_tokens`. The engine's uncached tokens
 (prompt - cached) name the bucket the request belonged in, by the bucket file's
 `min/max_uncached_tokens`; buckets are ordered short to long by their upper bound.
+Under `thresholds: prefill_seconds` the bounds are `min/max_prefill_seconds` and
+the tokens are divided by the record's `x-sgl-prefill-rate` (or --prefill-rate).
 
 Gate, each a share of the usable records:
   unsafe     the engine's bucket is longer than the router's     (< --max-unsafe, 0.5 %)
@@ -31,6 +33,7 @@ BUCKET_FIELDS = ("bucket", "x-sgl-bucket")
 ESTIMATE_FIELDS = ("uncached_estimate", "uncached_router", "x-sgl-uncached-estimate")
 PROMPT_FIELDS = ("prompt_tokens", "usage.prompt_tokens")
 CACHED_FIELDS = ("cached_tokens", "usage.prompt_tokens_details.cached_tokens")
+RATE_FIELDS = ("prefill_rate", "x-sgl-prefill-rate")
 
 
 def field(record, names):
@@ -46,11 +49,17 @@ def field(record, names):
     return None
 
 
+def seconds_bounds(bucket_file):
+    """Whether the file bounds buckets in prefill seconds rather than tokens."""
+    return bucket_file.get("thresholds") == "prefill_seconds"
+
+
 def lanes(bucket_file):
-    """Bucket ids short to long, with their inclusive uncached-token bounds."""
+    """Bucket ids short to long, with their inclusive bounds (tokens or seconds)."""
+    unit = "prefill_seconds" if seconds_bounds(bucket_file) else "uncached_tokens"
     buckets = []
     for spec in bucket_file.get("buckets", []):
-        low, high = spec.get("min_uncached_tokens"), spec.get("max_uncached_tokens")
+        low, high = spec.get(f"min_{unit}"), spec.get(f"max_{unit}")
         if low is None and high is None:
             continue
         buckets.append((spec["id"], low or 0, math.inf if high is None else high))
@@ -72,7 +81,7 @@ def quantile(values, q):
     return ordered[rank - 1]
 
 
-def check(records, buckets, limits):
+def check(records, buckets, limits, seconds=False, rate=None):
     index = {bucket_id: i for i, (bucket_id, _, _) in enumerate(buckets)}
     counts = {"records": 0, "usable": 0, "skipped": 0, "unsafe": 0, "long_as_short": 0, "safe": 0}
     errors = []
@@ -86,7 +95,14 @@ def check(records, buckets, limits):
             counts["skipped"] += 1
             continue
         actual = max(0, int(prompt) - int(cached))
-        engine_lane = lane_of(buckets, actual)
+        measure = actual
+        if seconds:
+            record_rate = float(field(record, RATE_FIELDS) or rate or 0)
+            if record_rate <= 0:
+                counts["skipped"] += 1
+                continue
+            measure = actual / record_rate
+        engine_lane = lane_of(buckets, measure)
         if engine_lane is None:
             counts["skipped"] += 1
             continue
@@ -139,12 +155,18 @@ def main(argv=None):
     parser.add_argument("--max-safe", type=float, default=0.05)
     parser.add_argument("--tolerance", type=float, default=0.10)
     parser.add_argument("--quantile", type=float, default=0.90)
+    parser.add_argument(
+        "--prefill-rate",
+        type=float,
+        help="tokens per second for prefill-second bounds when a record carries no x-sgl-prefill-rate",
+    )
     parser.add_argument("--json", action="store_true", help="print the result as JSON")
     args = parser.parse_args(argv)
     with open(args.buckets) as handle:
-        buckets = lanes(json.load(handle))
+        bucket_file = json.load(handle)
+    buckets = lanes(bucket_file)
     if not buckets:
-        parser.error("the bucket file has no bucket with uncached-token bounds")
+        parser.error("the bucket file has no bucket with uncached-token or prefill-second bounds")
     limits = {
         "max_unsafe": args.max_unsafe,
         "max_long_as_short": args.max_long_as_short,
@@ -152,7 +174,13 @@ def main(argv=None):
         "tolerance": args.tolerance,
         "quantile": args.quantile,
     }
-    counts, rules = check(records=read_records(args.records), buckets=buckets, limits=limits)
+    counts, rules = check(
+        records=read_records(args.records),
+        buckets=buckets,
+        limits=limits,
+        seconds=seconds_bounds(bucket_file),
+        rate=args.prefill_rate,
+    )
     if args.json:
         print(json.dumps({"counts": counts, "rules": rules}, indent=2))
     else:
