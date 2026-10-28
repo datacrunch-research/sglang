@@ -74,6 +74,9 @@ pub struct ServerInfo {
     pub openai: Option<OpenAiSettings>,
     /// The engine's native gRPC port (`--grpc-port`), served beside HTTP.
     pub grpc_port: Option<u16>,
+    /// The engine's multimodal launch args; `None` when `/server_info` did
+    /// not report `enable_multimodal`.
+    pub mm: Option<EngineMm>,
     /// Whether a prefill engine computes a request before its decode peer
     /// bootstraps: `--optimistic-prefill-attempts` above 0 or
     /// `--disaggregation-decode-allocation-policy prefill_complete`.
@@ -81,6 +84,54 @@ pub struct ServerInfo {
     /// arrived, so a prefill without either never starts. `None` when
     /// `/server_info` predates the field or did not answer.
     pub prefill_before_bootstrap: Option<bool>,
+}
+
+/// What an engine takes besides text, from its `--mm` launch args.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct EngineMm {
+    /// `--enable-multimodal`, resolved by the engine for its model.
+    pub enabled: bool,
+    /// `--limit-mm-data-per-request`, per modality, when set.
+    pub max_items: std::collections::BTreeMap<String, u32>,
+    /// `--media-url-max-file-size-mb` in bytes; `None` when unlimited.
+    pub max_media_bytes: Option<u64>,
+    /// `--trust-mm-content-hashes`: caller `mm_content_hashes` are adopted.
+    pub trust_content_hashes: bool,
+}
+
+impl EngineMm {
+    fn from_server_info(info: &serde_json::Value) -> Option<Self> {
+        let enabled = info.get("enable_multimodal")?.as_bool()?;
+        let max_items = match info.get("limit_mm_data_per_request") {
+            Some(serde_json::Value::Object(map)) => map
+                .iter()
+                .filter_map(|(k, v)| {
+                    v.as_u64()
+                        .map(|n| (k.clone(), u32::try_from(n).unwrap_or(u32::MAX)))
+                })
+                .collect(),
+            Some(serde_json::Value::String(text)) => {
+                serde_json::from_str::<std::collections::BTreeMap<String, u32>>(text)
+                    .unwrap_or_default()
+            }
+            _ => Default::default(),
+        };
+        let max_media_bytes = info
+            .get("media_url_max_file_size_mb")
+            .and_then(|v| v.as_u64())
+            .filter(|mb| *mb > 0)
+            .map(|mb| mb << 20);
+        let trust_content_hashes = info
+            .get("trust_mm_content_hashes")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        Some(Self {
+            enabled,
+            max_items,
+            max_media_bytes,
+            trust_content_hashes,
+        })
+    }
 }
 
 /// PD classification derived from a worker's `/server_info` response.
@@ -154,6 +205,7 @@ impl WorkerIntrospector {
             .as_ref()
             .filter(|info| info.get("incremental_streaming_output").is_some())
             .and_then(|info| OpenAiSettings::deserialize(info).ok());
+        let mm = parsed.as_ref().and_then(EngineMm::from_server_info);
         let parsed: ServerInfoBody = parsed
             .and_then(|info| {
                 serde_json::from_value(info)
@@ -207,6 +259,7 @@ impl WorkerIntrospector {
                 .saturating_mul(parsed.attn_dp_size.unwrap_or(1)),
             openai,
             grpc_port: parsed.grpc_port,
+            mm,
             prefill_before_bootstrap: parsed.optimistic_prefill_attempts.map(|attempts| {
                 attempts > 0
                     || parsed.disaggregation_decode_allocation_policy.as_deref()
@@ -955,5 +1008,39 @@ mod tests {
         .await;
         let got = fast_introspector().fetch(&url).await;
         assert!(got.disaggregation_role.is_none());
+    }
+}
+
+#[cfg(test)]
+mod engine_mm_tests {
+    use super::EngineMm;
+    use serde_json::json;
+
+    #[test]
+    fn multimodal_launch_args_parse_from_server_info() {
+        let info = json!({
+            "enable_multimodal": true,
+            "limit_mm_data_per_request": {"image": 4, "video": 1},
+            "media_url_max_file_size_mb": 64,
+            "trust_mm_content_hashes": true,
+        });
+        let mm = EngineMm::from_server_info(&info).expect("multimodal engine");
+        assert!(mm.enabled);
+        assert_eq!(mm.max_items.get("image"), Some(&4));
+        assert_eq!(mm.max_items.get("video"), Some(&1));
+        assert_eq!(mm.max_media_bytes, Some(64 << 20));
+        assert!(mm.trust_content_hashes);
+
+        // The limit may arrive as the JSON string the flag was given.
+        let info = json!({"enable_multimodal": false, "limit_mm_data_per_request": "{\"image\": 2}",
+            "media_url_max_file_size_mb": 0});
+        let mm = EngineMm::from_server_info(&info).expect("text engine still reports");
+        assert!(!mm.enabled);
+        assert_eq!(mm.max_items.get("image"), Some(&2));
+        assert_eq!(mm.max_media_bytes, None);
+
+        // An engine that predates the flag, or resolved it to null, reports nothing.
+        assert!(EngineMm::from_server_info(&json!({"enable_multimodal": null})).is_none());
+        assert!(EngineMm::from_server_info(&json!({})).is_none());
     }
 }

@@ -212,6 +212,105 @@ pub struct GenerateResponse {
     /// Set only when the request asked for return_text.
     #[prost(string, optional, tag = "4")]
     pub text: ::core::option::Option<::prost::alloc::string::String>,
+    /// The sample this frame belongs to when the request asked for n > 1
+    /// (sampling_params.n); absent for a single sample.
+    #[prost(uint32, optional, tag = "5")]
+    pub index: ::core::option::Option<u32>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PrefixMatchRequest {
+    /// The model the tokens belong to; must be the one this router serves.
+    #[prost(string, optional, tag = "1")]
+    pub model: ::core::option::Option<::prost::alloc::string::String>,
+    /// The prompt's leading token ids (a few thousand are enough).
+    #[prost(uint32, repeated, tag = "2")]
+    pub token_ids: ::prost::alloc::vec::Vec<u32>,
+    /// The whole prompt's length; defaults to token_ids.len().
+    #[prost(uint64, optional, tag = "3")]
+    pub input_tokens: ::core::option::Option<u64>,
+    /// KV namespace components, as the chat request would carry them.
+    #[prost(string, optional, tag = "4")]
+    pub cache_salt: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "5")]
+    pub lora_name: ::core::option::Option<::prost::alloc::string::String>,
+    /// The caller's remaining budget; a lookup that cannot finish inside it
+    /// fails with DEADLINE_EXCEEDED rather than answering late.
+    #[prost(uint32, optional, tag = "6")]
+    pub deadline_ms: ::core::option::Option<u32>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct PrefixMatchResponse {
+    /// Deepest contiguous prefix any engine of this cell holds, in tokens,
+    /// capped at the query length.
+    #[prost(uint64, tag = "1")]
+    pub matched_prefix_tokens: u64,
+    #[prost(uint32, tag = "2")]
+    pub matched_prefix_blocks: u32,
+    /// The cell's block size; 0 until an engine reports one.
+    #[prost(uint32, tag = "3")]
+    pub page_size: u32,
+    /// The depth came from a pending stake, not a confirmed KV event.
+    #[prost(bool, tag = "4")]
+    pub pending: bool,
+    #[prost(message, optional, tag = "5")]
+    pub load: ::core::option::Option<CellLoad>,
+    /// Whether some engine would currently admit a request of input_tokens.
+    #[prost(bool, tag = "6")]
+    pub admits: bool,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetCellLoadRequest {}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct CellLoad {
+    #[prost(uint64, tag = "1")]
+    pub waiting_uncached_tokens: u64,
+    #[prost(double, optional, tag = "2")]
+    pub estimated_prefill_queue_ms: ::core::option::Option<f64>,
+    #[prost(uint64, tag = "3")]
+    pub waiting_requests: u64,
+    #[prost(uint64, tag = "4")]
+    pub running_requests: u64,
+    #[prost(uint64, tag = "5")]
+    pub min_worker_queue: u64,
+    /// Age of the newest report; uint32 max when no engine has a fresh one.
+    #[prost(uint32, tag = "6")]
+    pub snapshot_age_ms: u32,
+    #[prost(uint32, tag = "7")]
+    pub engines: u32,
+    #[prost(uint32, tag = "8")]
+    pub reporting_engines: u32,
+    #[prost(uint64, tag = "9")]
+    pub router_inflight_requests: u64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetCellInfoRequest {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CellInfo {
+    #[prost(string, tag = "1")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "2")]
+    pub tokenizer_path: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint32, tag = "3")]
+    pub page_size: u32,
+    #[prost(uint32, optional, tag = "4")]
+    pub grpc_port: ::core::option::Option<u32>,
+    /// The engines' OpenAI-layer launch arguments, as JSON (the HTTP body's
+    /// `chat` object); empty when no engine reported them.
+    #[prost(string, tag = "5")]
+    pub chat_json: ::prost::alloc::string::String,
+    #[prost(bool, tag = "6")]
+    pub consistent: bool,
+    /// The router's own --default-chat-template-kwargs, as JSON.
+    #[prost(string, tag = "7")]
+    pub router_default_chat_template_kwargs_json: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "8")]
+    pub engines: u32,
+    #[prost(uint32, tag = "9")]
+    pub engines_reporting_chat: u32,
+    /// What media this cell takes, as JSON (the HTTP body's `mm` object);
+    /// empty when the cell is text only.
+    #[prost(string, tag = "10")]
+    pub mm_json: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TextEmbedRequest {

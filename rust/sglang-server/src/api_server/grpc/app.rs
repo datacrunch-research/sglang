@@ -6,8 +6,10 @@
 //! [`crate::api_server::core::CoreHandle`] contract.
 
 use sglang_api_types::api::v1::sglang_service_server::SglangServiceServer;
+use sglang_api_types::runtime::v1::sglang_service_server::SglangServiceServer as RuntimeServiceServer;
 use tokio_stream::wrappers::TcpListenerStream;
 
+use super::runtime::RuntimeFacade;
 use super::service::GrpcService;
 
 /// Tonic's 4 MiB default is too small for large token or multimodal request
@@ -59,11 +61,17 @@ pub(crate) async fn serve(
     };
     let incoming = TcpListenerStream::new(listener);
     let max_message_size = max_message_size();
+    // The engine bridge's protocol (`sglang.runtime.v1`) on the same port, so
+    // a router that speaks it to engines reaches this server unchanged.
+    let runtime = RuntimeServiceServer::new(RuntimeFacade::new(service.clone()))
+        .max_decoding_message_size(max_message_size)
+        .max_encoding_message_size(max_message_size);
     let service = SglangServiceServer::new(service)
         .max_decoding_message_size(max_message_size)
         .max_encoding_message_size(max_message_size);
     let serve = tonic::transport::Server::builder()
         .add_service(service)
+        .add_service(runtime)
         .serve_with_incoming(incoming);
 
     if let Some(addr) = addr {

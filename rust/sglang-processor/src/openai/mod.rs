@@ -11,6 +11,7 @@ mod completions;
 mod kimi_k3_tag;
 mod pieces;
 mod request;
+pub mod responses;
 mod wire;
 
 use serde::Deserialize;

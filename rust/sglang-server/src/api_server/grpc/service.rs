@@ -38,6 +38,7 @@ struct AdapterConfig {
 }
 
 /// Tonic-facing implementation backed by the transport-neutral core.
+#[derive(Clone)]
 pub(crate) struct GrpcService {
     core: CoreHandle,
     config: AdapterConfig,
@@ -64,6 +65,12 @@ impl GrpcService {
             },
             hicache_manager,
         }
+    }
+
+    /// Whether streamed frames carry deltas (`--incremental-streaming-output`)
+    /// rather than the cumulative output.
+    pub(super) fn incremental_streaming_output(&self) -> bool {
+        self.config.incremental_streaming_output
     }
 
     #[cfg(test)]
