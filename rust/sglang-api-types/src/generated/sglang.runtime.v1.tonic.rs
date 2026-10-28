@@ -506,6 +506,63 @@ pub mod sglang_service_client {
                 .insert(GrpcMethod::new("sglang.runtime.v1.SglangService", "Rerank"));
             self.inner.unary(req, path, codec).await
         }
+        /// Cell signals for an upstream router (served by sgl-router; the HTTP
+        /// forms are /internal/prefix_match, /internal/cell_load, /internal/cell_info).
+        pub async fn prefix_match(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PrefixMatchRequest>,
+        ) -> std::result::Result<tonic::Response<super::PrefixMatchResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.runtime.v1.SglangService/PrefixMatch",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.runtime.v1.SglangService",
+                "PrefixMatch",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn get_cell_load(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetCellLoadRequest>,
+        ) -> std::result::Result<tonic::Response<super::CellLoad>, tonic::Status> {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.runtime.v1.SglangService/GetCellLoad",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.runtime.v1.SglangService",
+                "GetCellLoad",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn get_cell_info(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetCellInfoRequest>,
+        ) -> std::result::Result<tonic::Response<super::CellInfo>, tonic::Status> {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.runtime.v1.SglangService/GetCellInfo",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.runtime.v1.SglangService",
+                "GetCellInfo",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
         /// Admin/Ops RPCs
         pub async fn start_profile(
             &mut self,
@@ -734,6 +791,27 @@ pub mod sglang_service_server {
             &self,
             request: tonic::Request<super::OpenAiRequest>,
         ) -> std::result::Result<tonic::Response<super::OpenAiResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
+        /// Cell signals for an upstream router (served by sgl-router; the HTTP
+        /// forms are /internal/prefix_match, /internal/cell_load, /internal/cell_info).
+        async fn prefix_match(
+            &self,
+            request: tonic::Request<super::PrefixMatchRequest>,
+        ) -> std::result::Result<tonic::Response<super::PrefixMatchResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
+        async fn get_cell_load(
+            &self,
+            request: tonic::Request<super::GetCellLoadRequest>,
+        ) -> std::result::Result<tonic::Response<super::CellLoad>, tonic::Status> {
+            Err(tonic::Status::unimplemented("Not yet implemented"))
+        }
+        async fn get_cell_info(
+            &self,
+            request: tonic::Request<super::GetCellInfoRequest>,
+        ) -> std::result::Result<tonic::Response<super::CellInfo>, tonic::Status> {
             Err(tonic::Status::unimplemented("Not yet implemented"))
         }
         /// Admin/Ops RPCs
@@ -1747,6 +1825,129 @@ pub mod sglang_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = RerankSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.runtime.v1.SglangService/PrefixMatch" => {
+                    #[allow(non_camel_case_types)]
+                    struct PrefixMatchSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::PrefixMatchRequest>
+                        for PrefixMatchSvc<T>
+                    {
+                        type Response = super::PrefixMatchResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::PrefixMatchRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::prefix_match(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PrefixMatchSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.runtime.v1.SglangService/GetCellLoad" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetCellLoadSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::GetCellLoadRequest>
+                        for GetCellLoadSvc<T>
+                    {
+                        type Response = super::CellLoad;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetCellLoadRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::get_cell_load(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetCellLoadSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.runtime.v1.SglangService/GetCellInfo" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetCellInfoSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::GetCellInfoRequest>
+                        for GetCellInfoSvc<T>
+                    {
+                        type Response = super::CellInfo;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetCellInfoRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::get_cell_info(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetCellInfoSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

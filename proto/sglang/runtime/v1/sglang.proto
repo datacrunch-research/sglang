@@ -31,6 +31,12 @@ service SglangService {
   rpc Score(OpenAIRequest) returns (OpenAIResponse);
   rpc Rerank(OpenAIRequest) returns (OpenAIResponse);
 
+  // Cell signals for an upstream router (served by sgl-router; the HTTP
+  // forms are /internal/prefix_match, /internal/cell_load, /internal/cell_info).
+  rpc PrefixMatch(PrefixMatchRequest) returns (PrefixMatchResponse);
+  rpc GetCellLoad(GetCellLoadRequest) returns (CellLoad);
+  rpc GetCellInfo(GetCellInfoRequest) returns (CellInfo);
+
   // Admin/Ops RPCs
   rpc StartProfile(StartProfileRequest) returns (StartProfileResponse);
   rpc StopProfile(StopProfileRequest) returns (StopProfileResponse);
@@ -162,6 +168,77 @@ message GenerateResponse {
   bool finished = 3;
   // Set only when the request asked for return_text.
   optional string text = 4;
+  // The sample this frame belongs to when the request asked for n > 1
+  // (sampling_params.n); absent for a single sample.
+  optional uint32 index = 5;
+}
+
+// --- Cell signals: one router and the engines it serves, as seen by an
+// upstream router that chooses the cell by prefix affinity and load. Every
+// field is advisory; an upstream that gets no answer routes by load. ---
+
+message PrefixMatchRequest {
+  // The model the tokens belong to; must be the one this router serves.
+  optional string model = 1;
+  // The prompt's leading token ids (a few thousand are enough).
+  repeated uint32 token_ids = 2;
+  // The whole prompt's length; defaults to token_ids.len().
+  optional uint64 input_tokens = 3;
+  // KV namespace components, as the chat request would carry them.
+  optional string cache_salt = 4;
+  optional string lora_name = 5;
+  // The caller's remaining budget; a lookup that cannot finish inside it
+  // fails with DEADLINE_EXCEEDED rather than answering late.
+  optional uint32 deadline_ms = 6;
+}
+
+message PrefixMatchResponse {
+  // Deepest contiguous prefix any engine of this cell holds, in tokens,
+  // capped at the query length.
+  uint64 matched_prefix_tokens = 1;
+  uint32 matched_prefix_blocks = 2;
+  // The cell's block size; 0 until an engine reports one.
+  uint32 page_size = 3;
+  // The depth came from a pending stake, not a confirmed KV event.
+  bool pending = 4;
+  CellLoad load = 5;
+  // Whether some engine would currently admit a request of input_tokens.
+  bool admits = 6;
+}
+
+message GetCellLoadRequest {}
+
+message CellLoad {
+  uint64 waiting_uncached_tokens = 1;
+  optional double estimated_prefill_queue_ms = 2;
+  uint64 waiting_requests = 3;
+  uint64 running_requests = 4;
+  uint64 min_worker_queue = 5;
+  // Age of the newest report; uint32 max when no engine has a fresh one.
+  uint32 snapshot_age_ms = 6;
+  uint32 engines = 7;
+  uint32 reporting_engines = 8;
+  uint64 router_inflight_requests = 9;
+}
+
+message GetCellInfoRequest {}
+
+message CellInfo {
+  string model = 1;
+  optional string tokenizer_path = 2;
+  uint32 page_size = 3;
+  optional uint32 grpc_port = 4;
+  // The engines' OpenAI-layer launch arguments, as JSON (the HTTP body's
+  // `chat` object); empty when no engine reported them.
+  string chat_json = 5;
+  bool consistent = 6;
+  // The router's own --default-chat-template-kwargs, as JSON.
+  string router_default_chat_template_kwargs_json = 7;
+  uint32 engines = 8;
+  uint32 engines_reporting_chat = 9;
+  // What media this cell takes, as JSON (the HTTP body's `mm` object);
+  // empty when the cell is text only.
+  string mm_json = 10;
 }
 
 // ---- Text-based embed (text in, embedding out) ----

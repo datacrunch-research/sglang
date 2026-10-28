@@ -13,6 +13,7 @@ use crate::server::app::pod_id;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{outcome_from_status, RequestLogContext};
+use crate::server::routes::cell;
 use crate::server::routes::chat::{
     prompt_ids, route_grpc, route_typed, Endpoint, MAX_CHAT_BODY_BYTES,
 };
@@ -283,6 +284,27 @@ sglang_service! {
 
         async fn embed(&self, request: Request<proto::EmbedRequest>) -> RpcResult<proto::EmbedResponse> {
             typed!(self, request, Embeddings, "Embed", finish_unary)
+        }
+
+        // Cell signals for an upstream router: answered from this router's own
+        // state, never forwarded to an engine (routes/cell.rs has the HTTP forms).
+        async fn prefix_match(&self, request: Request<proto::PrefixMatchRequest>) -> RpcResult<proto::PrefixMatchResponse> {
+            let request: cell::PrefixMatchRequest = request.into_inner().into();
+            match cell::prefix_match_answer(&self.ctx, request).await {
+                Ok(answer) => Ok(Response::new(answer.into())),
+                Err(cell::PrefixMatchFailure::Deadline) => Err(Status::deadline_exceeded(
+                    "prefix lookup did not finish within deadline_ms",
+                )),
+                Err(cell::PrefixMatchFailure::Api(error)) => Err(error.into_grpc_status()),
+            }
+        }
+
+        async fn get_cell_load(&self, _: Request<proto::GetCellLoadRequest>) -> RpcResult<proto::CellLoad> {
+            Ok(Response::new(cell::cell_load_answer(&self.ctx).into()))
+        }
+
+        async fn get_cell_info(&self, _: Request<proto::GetCellInfoRequest>) -> RpcResult<proto::CellInfo> {
+            Ok(Response::new(cell::cell_info_answer(&self.ctx).into()))
         }
 
         async fn text_embed(&self, request: Request<proto::TextEmbedRequest>) -> RpcResult<proto::TextEmbedResponse> {

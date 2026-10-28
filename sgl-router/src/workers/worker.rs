@@ -51,6 +51,8 @@ pub struct EngineProfile {
     pub openai: Option<Arc<OpenAiSettings>>,
     /// The engine's native gRPC port; `None` means gRPC clients cannot reach it.
     pub grpc_port: Option<u16>,
+    /// The engine's multimodal launch args; `None` if unread.
+    pub mm: Option<Arc<crate::workers::introspect::EngineMm>>,
 }
 
 impl From<WireProtocol> for EngineProfile {
@@ -60,6 +62,7 @@ impl From<WireProtocol> for EngineProfile {
             dp_ranks: 1,
             openai: None,
             grpc_port: None,
+            mm: None,
         }
     }
 }
@@ -256,6 +259,7 @@ pub struct Worker {
     /// Round-robin position over this worker's DP ranks.
     dp_rank_turn: AtomicUsize,
     openai: Option<Arc<OpenAiSettings>>,
+    mm: Option<Arc<crate::workers::introspect::EngineMm>>,
 }
 
 impl Worker {
@@ -276,6 +280,7 @@ impl Worker {
             dp_ranks,
             openai,
             grpc_port,
+            mm,
         } = profile.into();
         let breaker = match cb {
             Some(cfg) => Arc::new(CircuitBreaker::with_config(cfg)),
@@ -303,11 +308,17 @@ impl Worker {
             dp_rank_inflight: (0..dp_ranks.max(1)).map(|_| AtomicUsize::new(0)).collect(),
             dp_rank_turn: AtomicUsize::new(0),
             openai,
+            mm,
         }
     }
 
     pub fn openai_settings(&self) -> Option<&Arc<OpenAiSettings>> {
         self.openai.as_ref()
+    }
+
+    /// The engine's multimodal launch args, when `/server_info` reported them.
+    pub fn mm_settings(&self) -> Option<&Arc<crate::workers::introspect::EngineMm>> {
+        self.mm.as_ref()
     }
 
     pub fn services(&self) -> BTreeSet<String> {
