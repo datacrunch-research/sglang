@@ -287,6 +287,24 @@ recounts each queued bucket's ready members; the watch also re-reads them every
 second, since health checks change readiness without an event. Lower depth
 applies to new arrivals only; admitted work keeps its place.
 
+### Checking the estimate offline
+
+`monitoring/check_uncached_estimates.py` grades the estimate from a load
+client's per-request records (JSON lines carrying `x-sgl-bucket`,
+`x-sgl-uncached-estimate` and the response's `usage.prompt_tokens` and
+`usage.prompt_tokens_details.cached_tokens`, or flat `bucket`,
+`uncached_estimate`, `prompt_tokens`, `cached_tokens`). The engine's uncached
+tokens place each request in its bucket of the bucket file, and the gate is:
+requests in a longer bucket than the router chose (unsafe) under 0.5 %, the
+longest bucket's requests routed to the shortest under 0.1 %, requests in a
+shorter bucket than chosen (safe) under 5 %, and the estimate within 10 % of the
+engine's uncached tokens at p90. Every limit is a flag; the exit status is 0
+when the gate passes, 1 when it fails.
+
+```bash
+python3 monitoring/check_uncached_estimates.py --buckets buckets.json records.jsonl
+```
+
 ### Routing headers and metrics
 
 A response routed by a reorg bucket carries `x-sgl-bucket` (the request's own
