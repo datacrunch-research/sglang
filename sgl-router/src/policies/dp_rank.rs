@@ -74,6 +74,7 @@ mod tests {
             openai: None,
             grpc_port: None,
             mm: None,
+            answered: true,
         };
         Worker::with_cb_config(spec, None, profile)
     }

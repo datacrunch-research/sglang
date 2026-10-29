@@ -252,7 +252,7 @@ pub async fn run_with_introspector_and_reconcile(
                     &kv_index,
                     &introspector,
                     &mut pending,
-                    |w| w.model_ids.is_empty() || w.lacks_bootstrap_port(),
+                    |w| w.model_ids.is_empty() || w.lacks_bootstrap_port() || !w.introspected(),
                 );
             }
             _ = port_retry.tick() => {
@@ -416,8 +416,12 @@ async fn handle_discovery_event(
 /// registry, so a worker that genuinely left is not resurrected.
 ///
 /// A worker that answers but never advertises a `served_model_name` (or,
-/// for a prefill, its bootstrap port) also stays in this set and is
-/// re-introspected every interval — a benign, bounded poll, not a leak.
+/// for a prefill, its bootstrap port), or whose `/server_info` has not yet
+/// yielded its OpenAI settings (an engine still loading when the router
+/// started: the static `--model-id` resolves its model, but the parsers,
+/// context length and media capability the cell reports come only from the
+/// engine), also stays in this set and is re-introspected every interval — a
+/// benign, bounded poll, not a leak.
 /// It is never escalated, so the per-attempt logging stays at `debug!`;
 /// the introspector emits the `warn!` that surfaces a persistently failing
 /// worker.
@@ -610,6 +614,7 @@ async fn register_one(
         openai: info.openai.map(Arc::new),
         grpc_port: info.grpc_port,
         mm: info.mm.map(Arc::new),
+        answered: info.answered,
     };
     if let Err(e) = registry.add_with_cb(spec, cb, profile) {
         // Mixed PD + plain on the same model is rejected at registration
@@ -1435,6 +1440,91 @@ mod tests {
     }
 
     /// A worker that registers with empty `model_ids` because
+    /// A static worker (`--worker-urls`, its model from `--model-id`) routes
+    /// from the start, so it is never "unresolved"; its engine's OpenAI
+    /// settings (parsers, context length) still come only from
+    /// `/server_info`, which an engine still loading does not answer. The
+    /// reconcile loop must keep asking until it does, or the cell would report
+    /// no chat settings for the life of the router.
+    #[tokio::test]
+    async fn reconcile_re_introspects_worker_whose_engine_settings_are_missing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::time::timeout;
+
+        let ready = Arc::new(AtomicBool::new(false));
+        let (worker_url, _shutdown) = spawn_switchable_worker(
+            json!({"served_model_name": "m", "incremental_streaming_output": true,
+                   "reasoning_parser": "deepseek-v41", "tool_call_parser": "deepseekv41", "context_length": 1048576}),
+            ready.clone(),
+        )
+        .await;
+
+        let registry = Arc::new(WorkerRegistry::default());
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        let manager_handle = tokio::spawn(run_with_introspector_and_reconcile(
+            rx,
+            registry.clone(),
+            None,
+            None,
+            None,
+            fast_introspector(),
+            Duration::from_millis(150),
+        ));
+
+        let id = WorkerId("w-static".into());
+        let model = ModelId("m".into());
+        let spec = WorkerSpec {
+            id: id.clone(),
+            url: worker_url,
+            mode: WorkerMode::Plain,
+            model_ids: vec![model.clone()],
+            ..Default::default()
+        };
+        tx.send(DiscoveryEvent::Added(spec)).await.unwrap();
+
+        // Phase 1: the worker routes (its model is configured) but carries no
+        // engine settings while `/server_info` fails.
+        let routable = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(w) = registry.get(&id) {
+                    if !registry.workers_for(&model).is_empty() && w.openai_settings().is_none() {
+                        return true;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            routable.is_ok(),
+            "a static worker routes before its engine answers /server_info"
+        );
+
+        // The engine finishes coming up.
+        ready.store(true, Ordering::SeqCst);
+
+        // Phase 2: the reconcile loop re-introspects and the settings arrive.
+        let settled: Result<Option<String>, _> = timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(w) = registry.get(&id) {
+                    if let Some(openai) = w.openai_settings() {
+                        return openai.reasoning_parser.clone();
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert_eq!(
+            settled.ok().flatten().as_deref(),
+            Some("deepseek-v41"),
+            "reconcile loop must re-introspect a worker without engine settings once /server_info answers",
+        );
+
+        drop(tx);
+        let _ = manager_handle.await;
+    }
+
     /// `/server_info` was failing at `Added` time must be re-introspected
     /// by the periodic reconcile loop and join its model pool once
     /// `/server_info` recovers — with NO new discovery event. This is the

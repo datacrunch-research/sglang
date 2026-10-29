@@ -997,6 +997,7 @@ mod tests {
         ctx.config.model.tokenizer_path =
             Some(dir.join("tokenizer.json").to_string_lossy().into_owned());
         let profile = crate::workers::EngineProfile {
+            answered: true,
             protocol: crate::workers::WireProtocol::default(),
             dp_ranks: 1,
             openai: None,

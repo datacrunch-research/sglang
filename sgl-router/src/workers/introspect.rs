@@ -74,6 +74,9 @@ pub struct ServerInfo {
     pub openai: Option<OpenAiSettings>,
     /// The engine's native gRPC port (`--grpc-port`), served beside HTTP.
     pub grpc_port: Option<u16>,
+    /// Whether `/server_info` answered at all (false: the engine is not up
+    /// yet, or has no such route).
+    pub answered: bool,
     /// The engine's multimodal launch args; `None` when `/server_info` did
     /// not report `enable_multimodal`.
     pub mm: Option<EngineMm>,
@@ -198,6 +201,7 @@ impl WorkerIntrospector {
             Self::fetch_with_retry::<serde_json::Value>(&self.client, &server_info_url, worker_url),
             Self::fetch_with_retry::<ModelInfoBody>(&self.client, &model_info_url, worker_url),
         );
+        let answered = parsed.is_some();
         // A worker that answers one endpoint and not the other still gets
         // registered with whatever did answer.
         // Parsed apart, so an engine that reports them oddly loses only OpenAI lowering.
@@ -260,6 +264,7 @@ impl WorkerIntrospector {
             openai,
             grpc_port: parsed.grpc_port,
             mm,
+            answered,
             prefill_before_bootstrap: parsed.optimistic_prefill_attempts.map(|attempts| {
                 attempts > 0
                     || parsed.disaggregation_decode_allocation_policy.as_deref()
