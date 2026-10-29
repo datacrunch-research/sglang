@@ -343,6 +343,7 @@ mod tests {
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
+                multimodal: false,
                 metadata: CoreMetadata::from(server_args.as_ref()),
                 metrics: None,
             },

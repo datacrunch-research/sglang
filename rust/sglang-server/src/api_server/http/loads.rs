@@ -478,6 +478,7 @@ mod tests {
                     startup_ready: true,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
+                    multimodal: false,
                     metadata: crate::api_server::core::CoreMetadata::default(),
                     metrics: None,
                 },

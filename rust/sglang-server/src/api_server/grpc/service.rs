@@ -323,6 +323,7 @@ mod tests {
                     startup_ready,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
+                    multimodal: false,
                     metadata: CoreMetadata::from(&ServerArgs {
                         served_model_name: "test-model".into(),
                         model_config: ModelConfig {
@@ -674,6 +675,7 @@ mod tests {
                     startup_ready: true,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
+                    multimodal: false,
                     metadata: CoreMetadata::default(),
                     metrics: None,
                 },
@@ -735,6 +737,7 @@ mod tests {
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
+                multimodal: false,
                 metadata: CoreMetadata::default(),
                 metrics: None,
             },

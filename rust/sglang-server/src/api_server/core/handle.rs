@@ -5,13 +5,13 @@
 
 use std::collections::HashMap;
 use std::sync::{
-    Arc, Mutex, OnceLock,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
 
 use sglang_api_types::api::v1 as api;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{SetOnce, mpsc, oneshot};
 
 use crate::message::config::{DisaggregationMode, ServerArgs};
 use crate::message::ids::Rid;
@@ -42,6 +42,9 @@ pub(crate) struct CoreConfig {
     pub(crate) startup_ready: bool,
     pub(crate) is_disaggregation: bool,
     pub(crate) mm_limits: Vec<(String, usize)>,
+    /// A multimodal model admits no generation until its MM pool's processor
+    /// is installed ([`CoreHandle::set_mm_processor`]).
+    pub(crate) multimodal: bool,
     pub(crate) metadata: CoreMetadata,
     /// Request metrics, when `--enable-metrics` is on.
     pub(crate) metrics: Option<Arc<FrontendMetrics>>,
@@ -112,9 +115,11 @@ struct CoreInner {
     startup_ready: AtomicBool,
     is_disaggregation: bool,
     mm_limits: Vec<(String, usize)>,
+    multimodal: bool,
     /// The MM pool's processor, whose media hooks admission runs; set once
-    /// when the pool starts (after the listeners are up).
-    mm_processor: OnceLock<Arc<dyn MmProcessor>>,
+    /// when the pool starts (after the listeners are up), and awaited by a
+    /// multimodal model's admission.
+    mm_processor: SetOnce<Arc<dyn MmProcessor>>,
     metadata: CoreMetadata,
     generations: Generations,
     metrics: Option<Arc<FrontendMetrics>>,
@@ -135,7 +140,8 @@ impl CoreHandle {
                 startup_ready: AtomicBool::new(config.startup_ready),
                 is_disaggregation: config.is_disaggregation,
                 mm_limits: config.mm_limits,
-                mm_processor: OnceLock::new(),
+                multimodal: config.multimodal,
+                mm_processor: SetOnce::new(),
                 metadata: config.metadata,
                 generations: Generations::default(),
                 metrics: config.metrics,
@@ -151,6 +157,13 @@ impl CoreHandle {
 
     pub(crate) fn is_ready(&self) -> bool {
         self.inner.startup_ready.load(Ordering::Acquire)
+    }
+
+    /// Whether health may answer 200: startup warmup finished (or was
+    /// skipped) and, for a multimodal model, the MM pool's processor is
+    /// installed, so a generation would be admitted rather than wait.
+    pub(crate) fn is_serving(&self) -> bool {
+        self.is_ready() && (!self.inner.multimodal || self.inner.mm_processor.get().is_some())
     }
 
     /// Record successful completion of the startup warmup. The state is
@@ -290,13 +303,18 @@ impl CoreHandle {
     }
 
     async fn prepare_generations(&self, requests: &mut [GenerateRequest]) -> Result<(), CoreError> {
-        prefetch::prefetch_all(
-            requests,
-            &self.inner.mm_limits,
-            self.inner.mm_processor.get(),
-        )
-        .await
-        .map_err(CoreError::from)
+        // A multimodal model's requests wait here until the MM pool starts, so
+        // none is admitted without the processor's media hooks. The wait has
+        // no deadline: the pool starts during launch, and runtime shutdown
+        // cancels a waiting handler with the api runtime.
+        let processor = if self.inner.multimodal {
+            Some(self.inner.mm_processor.wait().await)
+        } else {
+            self.inner.mm_processor.get()
+        };
+        prefetch::prefetch_all(requests, &self.inner.mm_limits, processor)
+            .await
+            .map_err(CoreError::from)
     }
 
     /// Return static model metadata without exposing the full launch config.
@@ -487,7 +505,7 @@ impl CoreHandle {
     /// signal rather than this probe's own result, matching Python's
     /// `last_receive_tstamp` behavior on a busy server.
     pub(crate) async fn probe_health(&self, timeout: Duration) -> Result<HealthStatus, CoreError> {
-        if !self.is_ready() {
+        if !self.is_serving() {
             return Ok(HealthStatus::NotReady);
         }
 
@@ -1179,6 +1197,7 @@ mod tests {
                 startup_ready,
                 is_disaggregation,
                 mm_limits,
+                multimodal: false,
                 metadata: CoreMetadata::default(),
                 metrics: None,
             },
@@ -1213,6 +1232,7 @@ mod tests {
                 startup_ready: false,
                 is_disaggregation: false,
                 mm_limits: Vec::new(),
+                multimodal: false,
                 metrics: None,
                 metadata: CoreMetadata {
                     served_model_name: "served-model".into(),
