@@ -53,6 +53,9 @@ pub struct EngineProfile {
     pub grpc_port: Option<u16>,
     /// The engine's multimodal launch args; `None` if unread.
     pub mm: Option<Arc<crate::workers::introspect::EngineMm>>,
+    /// Whether the engine answered `/server_info` at all. False for an engine
+    /// still coming up: the reconcile loop asks again until it does.
+    pub answered: bool,
 }
 
 impl From<WireProtocol> for EngineProfile {
@@ -63,6 +66,7 @@ impl From<WireProtocol> for EngineProfile {
             openai: None,
             grpc_port: None,
             mm: None,
+            answered: false,
         }
     }
 }
@@ -260,6 +264,8 @@ pub struct Worker {
     dp_rank_turn: AtomicUsize,
     openai: Option<Arc<OpenAiSettings>>,
     mm: Option<Arc<crate::workers::introspect::EngineMm>>,
+    /// Whether the engine answered `/server_info` when this worker was built.
+    introspected: bool,
 }
 
 impl Worker {
@@ -281,6 +287,7 @@ impl Worker {
             openai,
             grpc_port,
             mm,
+            answered,
         } = profile.into();
         let breaker = match cb {
             Some(cfg) => Arc::new(CircuitBreaker::with_config(cfg)),
@@ -309,11 +316,18 @@ impl Worker {
             dp_rank_turn: AtomicUsize::new(0),
             openai,
             mm,
+            introspected: answered,
         }
     }
 
     pub fn openai_settings(&self) -> Option<&Arc<OpenAiSettings>> {
         self.openai.as_ref()
+    }
+
+    /// Whether the engine answered `/server_info`; false until it does, so
+    /// the reconcile loop keeps asking (an engine still loading at start).
+    pub fn introspected(&self) -> bool {
+        self.introspected
     }
 
     /// The engine's multimodal launch args, when `/server_info` reported them.
