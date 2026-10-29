@@ -154,6 +154,7 @@ mod tests {
             grpc_port: None,
             supports_inline_system: false,
             mm: None,
+            answered: true,
         };
         Worker::with_cb_config(spec, None, profile)
     }
