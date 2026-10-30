@@ -385,10 +385,57 @@ pub fn register_boundary_types(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+/// Parity hook: run one request's images through the built-in MM pipeline
+/// as an MM worker runs it -- the family `spec` names, built with the server
+/// tokenizer loaded from `tokenizer_path` as the server loads it; the
+/// admission check (`MmProcessor::check_media`); then the worker's own
+/// `process` (expansion, caller-hash rules, `finalize`, feature placement) --
+/// and return the expanded ids and the named buffers an [`IngressRequest`]
+/// carries, for `RustMmProcessor.wrap_encoded`. Sources must be inline
+/// (`data:` URLs or bare base64): the API layer's I/O prefetch is not on this
+/// path. No server is started.
+/// `(expanded input ids, [(buffer name, numpy array | ShmBuffer)])`.
+type MmParityOutput = (Vec<i64>, Vec<(String, Py<PyAny>)>);
+
+#[pyfunction]
+#[pyo3(signature = (spec, tokenizer_path, input_ids, image_data, mm_hashes = Vec::new()))]
+fn mm_process_for_parity(
+    py: Python<'_>,
+    spec: MmSpec,
+    tokenizer_path: Option<String>,
+    input_ids: Vec<i64>,
+    image_data: Vec<String>,
+    mm_hashes: Vec<String>,
+) -> PyResult<MmParityOutput> {
+    use multi_modality::worker::{MmContext, process};
+    let (ids, buffers) = py
+        .detach(move || -> Result<_, String> {
+            let tokenizer = tokenizer_path
+                .map(|path| sglang_processor::DynamoTokenizer::load(&path, None))
+                .transpose()?
+                .map(|t| Arc::new(t) as Arc<dyn sglang_processor::TextTokenizer>);
+            let ctx = MmContext::new(spec, tokenizer)?;
+            let mm = MmData {
+                image_data: image_data.into_iter().map(MmItem::Source).collect(),
+                mm_hashes,
+                ..Default::default()
+            };
+            ctx.processor.check_media(&mm)?;
+            process(&ctx, input_ids, mm)
+        })
+        .map_err(|e| value_error("mm parity", e))?;
+    let buffers = buffers
+        .into_iter()
+        .map(|buffer| buffer_to_py(py, buffer))
+        .collect::<PyResult<Vec<_>>>()?;
+    Ok((ids, buffers))
+}
+
 #[pymodule]
 fn _server(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Server>()?;
     register_boundary_types(m)?;
+    m.add_function(wrap_pyfunction!(mm_process_for_parity, m)?)?;
     Ok(())
 }
 

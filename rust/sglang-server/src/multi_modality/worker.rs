@@ -5,8 +5,9 @@
 use std::sync::Arc;
 
 use sglang_mm::driver::{self, Output};
-use sglang_mm::pipeline::{MmFamilyProcessor, PositionOutput, Tensor, TensorData};
-use sglang_mm::registry::build_pipeline;
+use sglang_mm::pipeline::{MmFamilyProcessor, PositionOutput, Tensor, TensorData, TextEncoder};
+use sglang_mm::registry::{PipelineSpec, build_pipeline_with_encoder};
+use sglang_processor::TextTokenizer;
 
 use super::encoded::{MRope, MmEncodedEntry, MmEncodedItem, MmMeta, MmMetaValue, MmModality};
 use crate::message::buffers::{Buffer, BufferData, BufferStore};
@@ -189,23 +190,73 @@ pub trait MmProcessor: Send + Sync {
     }
 }
 
-struct QwenMmProcessor {
-    family: Box<dyn MmFamilyProcessor>,
+/// The server tokenizer as the family pipeline's [`TextEncoder`]: specials in
+/// the text encode as special tokens and no BOS is added, as Python's
+/// `tokenizer.encode(text, allowed_special="all")` does for Kimi K3's framing.
+struct TokenizerEncoder(Arc<dyn TextTokenizer>);
+
+impl TextEncoder for TokenizerEncoder {
+    fn encode(&self, text: &str) -> Result<Vec<i64>, String> {
+        let segment = sglang_processor::dynamo_tokenizers::EncodeSegment::new(text, true);
+        self.0
+            .encode_segments(&[segment], false)
+            .map(|ids| ids.into_iter().map(i64::from).collect())
+            .map_err(|e| format!("mm framing encode: {e}"))
+    }
 }
 
-impl QwenMmProcessor {
-    fn new(spec: MmSpec) -> Result<Self, String> {
+/// A built-in `sglang_mm` family behind the worker contract.
+struct FamilyMmProcessor {
+    family: Box<dyn MmFamilyProcessor>,
+    /// Kimi K3: image identities come from the processor, never from callers
+    /// (Python's `KimiGridMMDataMixin.reject_caller_image_identity`).
+    processor_owned_identity: bool,
+}
+
+impl FamilyMmProcessor {
+    fn new(spec: MmSpec, tokenizer: Option<Arc<dyn TextTokenizer>>) -> Result<Self, String> {
+        let processor_owned_identity = matches!(spec.pipeline, PipelineSpec::KimiK3(_));
+        let encoder = tokenizer.map(|t| Arc::new(TokenizerEncoder(t)) as Arc<dyn TextEncoder>);
         Ok(Self {
-            family: build_pipeline(spec.pipeline)?,
+            family: build_pipeline_with_encoder(spec.pipeline, encoder)?,
+            processor_owned_identity,
         })
     }
 }
 
-impl MmProcessor for QwenMmProcessor {
+/// Python's message for a Kimi request carrying `mm_hashes` (`kimi_common.py`).
+const KIMI_CALLER_HASHES: &str = "Caller-supplied mm_hashes are not supported for Kimi.";
+
+impl MmProcessor for FamilyMmProcessor {
     fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, String> {
         let input = super::payload::to_mm_input(input_ids, mm)?;
         let output = driver::process(self.family.as_ref(), input)?;
         encode_driver_output(output)
+    }
+
+    /// A family that owns its identities refuses caller `mm_hashes` with a
+    /// 400 before any media is fetched, as Python's Kimi processor raises
+    /// `ValueError` for them.
+    fn check_media(&self, mm: &MmData) -> Result<(), String> {
+        if self.processor_owned_identity && !mm.mm_hashes.is_empty() {
+            return Err(KIMI_CALLER_HASHES.into());
+        }
+        Ok(())
+    }
+
+    /// Defence in depth for the same rule: whatever reached the item hashes,
+    /// an item with a processor identity keeps that identity's leading 64
+    /// bits, which is what Python's `set_identity` assigns.
+    fn finalize(&self, entry: &mut MmEncodedEntry) -> Result<(), String> {
+        if self.processor_owned_identity {
+            for item in &mut entry.items {
+                let identity = item
+                    .identity
+                    .ok_or("mm: a processor-identity item has no identity")?;
+                item.hash = u64::from_be_bytes(identity[..8].try_into().expect("8 bytes"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -235,7 +286,7 @@ fn encode_driver_output(output: Output) -> Result<MmProcessOutput, String> {
                 modality: MmModality::Image,
                 feature: item.feature,
                 hash: item.hash,
-                identity: None,
+                identity: item.identity,
                 offsets: vec![span],
                 model_specific_data: item
                     .aux
@@ -285,10 +336,12 @@ pub struct MmContext {
 }
 
 impl MmContext {
-    pub fn new(spec: MmSpec) -> Result<Self, String> {
+    /// `tokenizer` is the server's own, which a family that frames media with
+    /// text needs (Kimi K3); `None` only without one (`skip_tokenizer_init`).
+    pub fn new(spec: MmSpec, tokenizer: Option<Arc<dyn TextTokenizer>>) -> Result<Self, String> {
         let feature_shm = spec.feature_shm;
         Ok(Self {
-            processor: Arc::new(QwenMmProcessor::new(spec)?),
+            processor: Arc::new(FamilyMmProcessor::new(spec, tokenizer)?),
             feature_shm,
             caller_hashes: CallerHashes::Apply,
         })
@@ -316,6 +369,7 @@ fn tensor_data(data: TensorData) -> BufferData {
         TensorData::F32(v) => BufferData::F32(v),
         TensorData::I64(v) => BufferData::I64(v),
         TensorData::Bf16(v) => BufferData::U16(v),
+        TensorData::U8(v) => BufferData::U8(v),
     }
 }
 
@@ -387,7 +441,7 @@ fn make_buffers(entry: MmEncodedEntry, feature_shm: bool) -> Result<Vec<Buffer>,
 
 /// Run the processor for one request. `Ok` returns the final expanded ids and
 /// the buffers to ride the ring; `Err` rejects the request back to the client.
-fn process(
+pub(crate) fn process(
     ctx: &MmContext,
     input_ids: TokenIds,
     mut mm: MmData,
@@ -562,6 +616,7 @@ mod tests {
                 ),
             ],
             hash,
+            identity: None,
         };
         let output = Output {
             input_ids: vec![1, 2, 2, 3],
@@ -614,6 +669,7 @@ mod tests {
                     },
                 )],
                 hash: 1,
+                identity: None,
             }],
             offsets: vec![(0, 0)],
             positions: PositionOutput::Rope1D,
