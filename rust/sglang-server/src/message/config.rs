@@ -662,8 +662,7 @@ pub struct ModelConfig {
     /// they crash the scheduler's embedding lookup.
     pub vocab_size: u64,
     /// Whether the model accepts multimodal inputs. Gates the MM Encoding branch
-    /// in to-scheduler; `false` silently ignores mm fields, as the Python
-    /// `TokenizerManager` does with `mm_processor is None`.
+    /// in to-scheduler; with `false`, a request carrying media is a 400.
     pub is_multimodal: bool,
     /// Resolved default sampling parameters, from Python's
     /// `ModelConfig.get_default_sampling_params()`. Already gated on

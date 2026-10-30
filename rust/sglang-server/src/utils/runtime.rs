@@ -921,6 +921,81 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A text-only model refuses media on `/generate` and gRPC `Generate` with
+    /// a 400 instead of answering from the text alone; nothing reaches the
+    /// scheduler ring.
+    #[test]
+    fn text_only_model_refuses_media_on_generate() {
+        use std::io::{Read, Write};
+        use std::time::Duration;
+
+        let (http_addr, grpc_addr) = free_loopback_addrs();
+        let rt = start(test_config(http_addr, Some(grpc_addr)), None).expect("start runtime");
+
+        let body = r#"{"input_ids":[1,2,3],"image_data":"data:image/png;base64,AAAA","sampling_params":{"max_new_tokens":1}}"#;
+        let mut conn = std::net::TcpStream::connect(http_addr).expect("connect");
+        conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        write!(
+            conn,
+            "POST /generate HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut response = String::new();
+        conn.read_to_string(&mut response)
+            .expect("an answer, not a request left waiting on the ring");
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert!(
+            response.contains("without a multimodal processor"),
+            "{response}"
+        );
+
+        let client_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let item = client_runtime.block_on(async {
+            let mut client = connect_grpc(grpc_addr).await;
+            let request = proto::GenerateRequest {
+                image_data: Some(proto::MediaInput {
+                    value: Some(proto::media_input::Value::Item(proto::MediaItem {
+                        value: Some(proto::media_item::Value::Source(
+                            "data:image/png;base64,AAAA".into(),
+                        )),
+                    })),
+                }),
+                ..grpc_ids_request(&[1, 2, 3], "grpc-media")
+            };
+            let mut stream = tokio::time::timeout(Duration::from_secs(5), client.generate(request))
+                .await
+                .expect("timed out starting Generate RPC")
+                .expect("Generate RPC")
+                .into_inner();
+            tokio::time::timeout(Duration::from_secs(5), stream.message())
+                .await
+                .expect("an answer, not a request left waiting on the ring")
+                .expect("gRPC stream error")
+                .expect("gRPC stream ended without an item")
+        });
+        let Some(proto::generate_stream_item::Item::Error(error)) = item.item else {
+            panic!("expected an error item, got {item:?}");
+        };
+        let error = error.error.expect("error body");
+        assert_eq!(error.code, 400);
+        assert!(
+            error.message.contains("without a multimodal processor"),
+            "{}",
+            error.message
+        );
+        assert!(
+            !rt.to_scheduler_rx.wait(Duration::from_millis(200)),
+            "nothing reaches the scheduler ring"
+        );
+
+        rt.request_shutdown();
+    }
+
     /// An HTTP attach reaches the scheduler ring; after a successful reply,
     /// gRPC returns the updated HiCache configuration, verifying that both
     /// transports share the same state.
