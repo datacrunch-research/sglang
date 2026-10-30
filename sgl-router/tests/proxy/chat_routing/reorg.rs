@@ -653,7 +653,7 @@ async fn cache_aware_routes_tokenized_prompt_and_rechecks_the_next_bucket() {
         sgl_router::policies::request_tokens_for(&tokenizers, &ModelId("tiny".into()), &value)
             .unwrap()
             .ids;
-    let hashes = compute_block_hashes(&ids, 1);
+    let hashes = compute_block_hashes(&ids.iter().map(|&t| u64::from(t)).collect::<Vec<u64>>(), 1);
     let tree = Arc::new(HashTree::new());
     for worker in [&rejected, &owner] {
         tree.insert(&KvWorkerId::new(worker.url.clone(), 0), None, &hashes);

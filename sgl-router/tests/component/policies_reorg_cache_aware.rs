@@ -53,7 +53,7 @@ fn oracle() -> Arc<BlockSizeOracle> {
 
 fn local(entries: &[(&Arc<Worker>, usize)]) -> Arc<CacheSource> {
     let tree = Arc::new(HashTree::new());
-    let hashes = compute_block_hashes(&TOKENS, 1);
+    let hashes = compute_block_hashes(&TOKENS.iter().map(|&t| u64::from(t)).collect::<Vec<u64>>(), 1);
     for (worker, depth) in entries {
         tree.insert(
             &KvWorkerId::new(worker.url.clone(), 0),
@@ -369,7 +369,7 @@ async fn missing_tokens_or_block_size_skip_io_and_bigram_hashes_match_workers() 
     policy.pick(&engines, &request(&model)).await.unwrap();
     assert_eq!(
         index.hashes.lock().unwrap()[0],
-        compute_block_hashes_bigram(&TOKENS, 1)
+        compute_block_hashes_bigram(&TOKENS.iter().map(|&t| u64::from(t)).collect::<Vec<u64>>(), 1)
     );
 }
 

@@ -27,7 +27,7 @@ async fn radix_tree_routes_cache_aware_request_to_cached_worker() {
     });
     let tokens = request_tokens_for(&tokenizers, &ModelId(MODEL.into()), &body)
         .expect("test prompt tokenizes");
-    let hashes = compute_block_hashes(&tokens.ids, 1);
+    let hashes = compute_block_hashes(&tokens.ids.iter().map(|&t| u64::from(t)).collect::<Vec<u64>>(), 1);
     assert!(!hashes.is_empty());
 
     let tree = HashTree::new();
@@ -67,14 +67,14 @@ async fn lora_requests_match_only_their_adapter_blocks() {
     tree.insert(
         &KvWorkerId::new(base.url.clone(), 0),
         None,
-        &compute_block_hashes(&ids, 1),
+        &compute_block_hashes(&ids.iter().map(|&t| u64::from(t)).collect::<Vec<u64>>(), 1),
     );
     tree.store_event(
         &KvWorkerId::new(lora.url.clone(), 0),
         &BlockStored {
             block_hashes: (0..ids.len()).map(|i| 1000 + i as i64).collect(),
             parent_block_hash: None,
-            token_ids: ids.clone(),
+            token_ids: ids.iter().map(|&t| u64::from(t)).collect(),
             block_size: 1,
             lora_id: None,
             lora_name: Some("adapter-a".into()),
