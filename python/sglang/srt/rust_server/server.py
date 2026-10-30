@@ -16,7 +16,7 @@ import time
 from array import array
 from itertools import chain
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import msgspec
 import psutil
@@ -31,6 +31,7 @@ from sglang.srt.rust_server.config import _build_server_args, _partition_cores
 from sglang.srt.rust_server.multimodal import (
     MM_TRANSPORT_STATS,
     RUST_MM_FAMILIES,
+    RustKimiK3MmSpec,
     RustMmProcessor,
     RustMmSpec,
     settle_shm_buffers,
@@ -68,7 +69,7 @@ class RustServer:
         self,
         server: Server,
         http_port: int,
-        mm_spec: Optional[RustMmSpec] = None,
+        mm_spec: Optional[Union[RustMmSpec, RustKimiK3MmSpec]] = None,
         max_per_poll: int = 256,
     ):
         self.server = server
@@ -107,7 +108,9 @@ class RustServer:
         return load_rust_extension("sglang.srt.rust_extensions._server")
 
     @classmethod
-    def _resolve_multimodal(cls, scheduler: Scheduler) -> Optional[RustMmSpec]:
+    def _resolve_multimodal(
+        cls, scheduler: Scheduler
+    ) -> Optional[Union[RustMmSpec, RustKimiK3MmSpec]]:
         """Resolve the built-in Rust MM pipeline for a multimodal model, and
         refuse a model it cannot serve. ``launch`` calls this before the
         listener binds, so a refused model never accepts a connection. A
@@ -636,13 +639,25 @@ class RustServer:
             )
 
     @classmethod
-    def _build_mm_spec(cls, spec: RustMmSpec) -> MmSpec:
+    def _build_mm_spec(cls, spec: Union[RustMmSpec, RustKimiK3MmSpec]) -> MmSpec:
         """The typed MM configuration for ``Server.start_mm_workers``: the
         :class:`RustMmSpec` fields the Rust pipeline consumes, as the Rust
         extension's own ``MmSpec`` class (same required-keyword contract as
         :func:`_build_server_args`; ``family`` / ``resample`` become the
-        extension's ``MmFamily`` / ``MmResample`` enums)."""
+        extension's ``MmFamily`` / ``MmResample`` enums). Kimi K3 has its own
+        knobs and its own constructor, ``MmSpec.kimi_k3``."""
         ext = cls._load_extension()
+        if isinstance(spec, RustKimiK3MmSpec):
+            return ext.MmSpec.kimi_k3(
+                feature_shm=spec.feature_shm,
+                image_token_id=spec.image_token_id,
+                patch_size=spec.patch_size,
+                merge_kernel_size=spec.merge_kernel_size,
+                in_patch_limit=spec.in_patch_limit,
+                patch_limit_on_one_side=spec.patch_limit_on_one_side,
+                fixed_output_tokens=spec.fixed_output_tokens,
+                processor_fingerprint=spec.processor_fingerprint,
+            )
         family = {"qwen_vl": ext.MmFamily.QwenVl}[spec.family]
         resample = {"aten_u8": ext.MmResample.AtenU8, "pil": ext.MmResample.Pil}[
             spec.resample

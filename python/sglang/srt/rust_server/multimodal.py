@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 import importlib
 import logging
-from typing import TYPE_CHECKING, Any, Dict, FrozenSet, Optional, Tuple
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, Dict, FrozenSet, Optional, Tuple, Union
 
 import msgspec
 
@@ -56,6 +58,35 @@ class RustMmSpec(msgspec.Struct, frozen=True, kw_only=True):
         return msgspec.json.encode({f: getattr(self, f) for f in fields}).decode()
 
 
+class RustKimiK3MmSpec(msgspec.Struct, frozen=True, kw_only=True):
+    """Resolved parameters of the Kimi K3 Rust MM pipeline, read back from
+    the Python ``KimiK3ImageProcessor`` it replaces (see
+    :meth:`RustMmProcessor._resolve_kimi_k3_spec`): the NaViT fields of its
+    ``KimiK3PreprocessConfig``, the ``<|media_pad|>`` id and its processor
+    fingerprint go to Rust (``MmSpec.kimi_k3``); the normalization and
+    transparent-background settings stay here, for the drain adapter to
+    rebuild each item's ``KimiK3DeferredPreprocessing``."""
+
+    family: str
+    feature_shm: bool
+    image_token_id: int
+    patch_size: int
+    merge_kernel_size: int
+    in_patch_limit: int
+    patch_limit_on_one_side: int
+    fixed_output_tokens: Optional[int]
+    processor_fingerprint: str
+    image_mean: Tuple[float, ...]
+    image_std: Tuple[float, ...]
+    transparent_bg_config: Optional[Dict[str, Any]]
+
+
+# The sidecar key of a Kimi K3 item's NaViT resize config
+# (`sglang_mm::kimi_k3::RESIZE_CONFIG_KEY`), as
+# `[num_tokens, new_width, new_height, pad_width, pad_height]`.
+KIMI_K3_RESIZE_CONFIG_KEY = "kimi_k3_resize_config"
+
+
 class RustMmFamily(msgspec.Struct, frozen=True, kw_only=True):
     """The Python half of one Rust MM family (an arm of
     `sglang_mm::registry::pipeline_from_spec`): which models it serves.
@@ -74,9 +105,13 @@ class RustMmFamily(msgspec.Struct, frozen=True, kw_only=True):
     image_processors: Dict[str, str]
 
     def serves(self, mm_processor_cls: Any, model_type: Optional[str]) -> bool:
+        # The model type first: it spares importing another family's
+        # processor module (Kimi K3's pulls in its model code).
+        if model_type not in self.model_types:
+            return False
         module_name, _, class_name = self.mm_processor.partition(":")
         cls = getattr(importlib.import_module(module_name), class_name)
-        return mm_processor_cls is cls and model_type in self.model_types
+        return mm_processor_cls is cls
 
 
 RUST_MM_FAMILIES: Tuple[RustMmFamily, ...] = (
@@ -98,6 +133,14 @@ RUST_MM_FAMILIES: Tuple[RustMmFamily, ...] = (
             "Qwen2VLImageProcessorFast": "aten_u8",
             "Qwen2VLImageProcessorPil": "pil",
         },
+    ),
+    RustMmFamily(
+        name="kimi_k3",
+        mm_processor="sglang.srt.multimodal.processors.kimi_k3:KimiK3ImageProcessor",
+        model_types=frozenset(("kimi_k3",)),
+        # No HF resize to reproduce: K3 images reach the model as raw pixels
+        # and are resized on the GPU, as the Python processor defers them.
+        image_processors={},
     ),
 )
 
@@ -254,6 +297,8 @@ class RustMmProcessor:
         )
         if family is None:
             return None
+        if family.name == "kimi_k3":
+            return self._resolve_kimi_k3_spec(mm_processor_cls)
         image_processor = getattr(self._processor, "image_processor", None)
         resample = family.image_processors.get(type(image_processor).__name__)
         if resample is None:
@@ -304,6 +349,60 @@ class RustMmProcessor:
         logger.info("rust server: Rust MM pipeline enabled (family=%s)", family.name)
         return spec
 
+    def _resolve_kimi_k3_spec(self, mm_processor_cls) -> Optional[RustKimiK3MmSpec]:
+        """The Kimi K3 spec, read back from the Python processor itself: it is
+        built here as the TokenizerManager builds it (same configuration, no
+        worker pool), so its preprocess config, ``<|media_pad|>`` id and
+        processor fingerprint -- which every image identity covers -- are the
+        ones a Python server with these settings would use.
+
+        Conservative like the Qwen gate: a setting the Rust pipeline does not
+        reproduce disables it rather than being approximated."""
+        from sglang.srt.multimodal.transport import determine_tensor_transport_mode
+
+        if envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
+            # Python then gives items throwaway hashes instead of identities.
+            return None
+        media_processor = getattr(self._processor, "media_processor", None)
+        media_cfg = getattr(media_processor, "media_proc_cfg", None)
+        if not isinstance(media_cfg, Mapping):
+            return None
+        # The GPU path composites the background after the resize; a checkpoint
+        # asking for another stage is not what either path reproduces.
+        if media_cfg.get("transparent_bg_fill_stage", "after_resize") != "after_resize":
+            return None
+
+        processor = mm_processor_cls(
+            self.model_config.hf_config,
+            self.server_args,
+            self._processor,
+            determine_tensor_transport_mode(),
+            skip_mm_pool=True,
+        )
+        try:
+            config = processor._processor.preprocess_config
+            fingerprint = processor._kimi_config_fingerprint()
+            image_token_id = processor.mm_tokens.image_token_id
+        finally:
+            processor.shutdown()
+            processor.cpu_executor.shutdown(wait=False)
+        spec = RustKimiK3MmSpec(
+            family="kimi_k3",
+            feature_shm=self._use_feature_shm(),
+            image_token_id=int(image_token_id),
+            patch_size=config.patch_size,
+            merge_kernel_size=config.merge_kernel_size,
+            in_patch_limit=config.in_patch_limit,
+            patch_limit_on_one_side=config.patch_limit_on_one_side,
+            fixed_output_tokens=config.fixed_output_tokens,
+            processor_fingerprint=fingerprint,
+            image_mean=tuple(config.image_mean),
+            image_std=tuple(config.image_std),
+            transparent_bg_config=copy.deepcopy(config.transparent_bg_config),
+        )
+        logger.info("rust server: Rust MM pipeline enabled (family=kimi_k3)")
+        return spec
+
     def _use_feature_shm(self) -> bool:
         """Whether to park feature buffers in POSIX shm rather than inline.
 
@@ -329,7 +428,7 @@ class RustMmProcessor:
         )
 
     @staticmethod
-    def wrap_encoded(spec: RustMmSpec, buffers):
+    def wrap_encoded(spec: Union[RustMmSpec, RustKimiK3MmSpec], buffers):
         """Drain-time adapter: wrap one request's ``mm.*`` buffers (a
         ``{name: numpy array | ShmBuffer}`` mapping from ``recv_requests``) into
         the scheduler's ``MultimodalProcessorOutput``. Wrapping only -- load,
@@ -348,6 +447,9 @@ class RustMmProcessor:
         ``set_pad_value`` skips ``hash_feature``. Any per-byte work here — memcpy,
         sha256, tens of MB per image-heavy request — measurably inflates every
         running request's inter-token latency."""
+        if spec.family == "kimi_k3":
+            return RustMmProcessor._wrap_kimi_k3(spec, buffers)
+
         import msgspec
         import torch
 
@@ -391,35 +493,115 @@ class RustMmProcessor:
         return output
 
     @staticmethod
-    def _wrap_item(*, index: int, item: dict, buffers, stubs: list):
+    def _wrap_feature(feature, *, precomputed_hash: int, stubs: list):
+        """One ``mm.feature.{i}`` buffer as the item's feature: an inline
+        numpy array viewed by ``torch.from_numpy``, or a shm segment as its
+        ``ShmPointerMMData`` stub, in the buffer's own dtype."""
         import numpy as np
         import torch
 
         from sglang.srt.managers.mm_utils import ShmPointerMMData
-        from sglang.srt.managers.schedule_batch import MultimodalDataItem
 
-        feature = buffers[f"mm.feature.{index}"]
         if isinstance(feature, np.ndarray):
             array = feature
             feature = torch.from_numpy(array)
             MM_TRANSPORT_STATS.record_inline(array=array, tensor=feature)
-        else:
-            MM_TRANSPORT_STATS.record_shm(stub=feature)
-            # The worker placed this item's buffer in a named POSIX segment
-            # (see `_use_feature_shm`). Build the stub in its
-            # post-`__setstate__` form: rank 0 never pickle-roundtrips its
-            # own copy, and `materialize()` needs the mapped view.
-            stub = ShmPointerMMData.__new__(ShmPointerMMData)
-            stub.__setstate__(
-                {
-                    "shm_name": feature.name,
-                    "shape": tuple(feature.shape),
-                    "dtype": torch.float32,
-                    "precomputed_hash": item["hash"],
-                }
+            return feature
+        MM_TRANSPORT_STATS.record_shm(stub=feature)
+        # The worker placed this item's buffer in a named POSIX segment
+        # (see `_use_feature_shm`). Build the stub in its
+        # post-`__setstate__` form: rank 0 never pickle-roundtrips its
+        # own copy, and `materialize()` needs the mapped view.
+        stub = ShmPointerMMData.__new__(ShmPointerMMData)
+        stub.__setstate__(
+            {
+                "shm_name": feature.name,
+                "shape": tuple(feature.shape),
+                "dtype": torch.from_numpy(np.empty(0, dtype=feature.dtype)).dtype,
+                "precomputed_hash": precomputed_hash,
+            }
+        )
+        stubs.append(stub)
+        return stub
+
+    @staticmethod
+    def _wrap_kimi_k3(spec: RustKimiK3MmSpec, buffers):
+        """Drain-time adapter for Kimi K3. Each ``mm.feature.{i}`` is the
+        source image as ``[C, H, W]`` uint8 (alpha kept), and each sidecar item
+        carries its grid, its NaViT resize config and its 32-byte identity.
+        Builds the item the Python ``KimiK3ImageProcessor`` builds on its
+        deferred path (``compose_request`` over a deferred artifact): the raw
+        feature, ``image_grid_thw``, a ``KimiK3DeferredPreprocessing`` the
+        model finishes on the GPU, and ``set_identity``, which derives the
+        wide pad sentinels. No M-RoPE: K3 positions are 1-D."""
+        import msgspec
+        import torch
+
+        from sglang.srt.managers.schedule_batch import (
+            MultimodalDataItem,
+            MultimodalProcessorOutput,
+        )
+        from sglang.srt.multimodal.kimi_k3_image_processing import (
+            DEFERRED_PREPROCESSING_KEY,
+            KimiK3DeferredPreprocessing,
+        )
+
+        stubs: list = []
+        try:
+            meta = msgspec.msgpack.decode(memoryview(buffers["mm.meta"]))
+            items = []
+            for index, item in enumerate(meta["items"]):
+                data = item["model_specific_data"]
+                num_tokens, new_width, new_height, pad_width, pad_height = data[
+                    KIMI_K3_RESIZE_CONFIG_KEY
+                ]
+                mm_item = MultimodalDataItem(
+                    modality=_MODALITIES[item["modality"]],
+                    feature=RustMmProcessor._wrap_feature(
+                        buffers[f"mm.feature.{index}"],
+                        precomputed_hash=item["hash"],
+                        stubs=stubs,
+                    ),
+                    offsets=[tuple(span) for span in item["offsets"]],
+                    model_specific_data={
+                        "image_grid_thw": torch.tensor(
+                            [data["image_grid_thw"]], dtype=torch.int64
+                        ),
+                        DEFERRED_PREPROCESSING_KEY: KimiK3DeferredPreprocessing(
+                            backend="gpu",
+                            image_mean=list(spec.image_mean),
+                            image_std=list(spec.image_std),
+                            transparent_bg_config=spec.transparent_bg_config,
+                            resize_config={
+                                "num_tokens": num_tokens,
+                                "new_width": new_width,
+                                "new_height": new_height,
+                                "pad_width": pad_width,
+                                "pad_height": pad_height,
+                            },
+                        ),
+                    },
+                )
+                mm_item.set_identity(bytes(item["identity"]))
+                items.append(mm_item)
+            output = MultimodalProcessorOutput(
+                mm_items=items, im_token_id=spec.image_token_id
             )
-            stubs.append(stub)
-            feature = stub
+        except BaseException:
+            for stub in stubs:
+                stub.close_and_unlink()
+            raise
+        return output
+
+    @staticmethod
+    def _wrap_item(*, index: int, item: dict, buffers, stubs: list):
+        import torch
+
+        from sglang.srt.managers.schedule_batch import MultimodalDataItem
+
+        feature = RustMmProcessor._wrap_feature(
+            buffers[f"mm.feature.{index}"], precomputed_hash=item["hash"], stubs=stubs
+        )
         t, h, w = item["model_specific_data"]["image_grid_thw"]
         return MultimodalDataItem(
             modality=_MODALITIES[item["modality"]],
