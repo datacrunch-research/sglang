@@ -29,7 +29,7 @@ use crate::api_server::handlers::CoreCall;
 use crate::message::finish_reason::Matched;
 use crate::message::ids::Rid;
 use crate::message::request::{GenerateRequest, PromptTokenIdsSlot};
-use crate::message::response::ChunkExtras;
+use crate::message::response::{CachedTokensDetails, ChunkExtras};
 use crate::message::sampling::SamplingParams;
 use crate::message::types::{OneOrMany, TokenIds};
 use crate::utils::response::sse_response;
@@ -49,8 +49,21 @@ struct CompletionRequest {
     /// `token_ids` and, on its first chunk, the prompt's `prompt_token_ids`.
     #[serde(default)]
     return_token_ids: bool,
+    /// Python's `return_cached_tokens_details` request extension: the
+    /// response's `sglext.cached_tokens_details` (cached tokens by tier).
+    #[serde(default)]
+    return_cached_tokens_details: bool,
     #[serde(flatten)]
     routing: PDRoutingFields,
+}
+
+/// What a completion's usage reports beyond the token counts.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct UsageReport {
+    /// `--enable-cache-report`: `usage.prompt_tokens_details.cached_tokens`.
+    pub(super) cache_report: bool,
+    /// The request's `return_cached_tokens_details`: `sglext.cached_tokens_details`.
+    pub(super) tier_details: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -84,6 +97,7 @@ async fn completions(
         request,
         skip_special_tokens,
         return_token_ids,
+        return_cached_tokens_details,
         routing,
     } = match body {
         Ok(Json(request)) => request,
@@ -268,7 +282,10 @@ async fn completions(
             return_token_ids,
             include_usage,
             continuous_usage,
-            state.server_args.enable_cache_report,
+            UsageReport {
+                cache_report: state.server_args.enable_cache_report,
+                tier_details: return_cached_tokens_details,
+            },
         )
         .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
         sse_response(s)
@@ -281,7 +298,10 @@ async fn completions(
             echo,
             request.logprobs.is_some(),
             return_token_ids,
-            state.server_args.enable_cache_report,
+            UsageReport {
+                cache_report: state.server_args.enable_cache_report,
+                tier_details: return_cached_tokens_details,
+            },
         )
         .await
     }
@@ -419,7 +439,7 @@ pub(super) async fn unary_completion(
     echo: bool,
     want_logprobs: bool,
     return_token_ids: bool,
-    cache_report: bool,
+    report: UsageReport,
 ) -> Response {
     // Every request is already submitted, so draining in choice order does not
     // serialize generation. The non-streaming native path sends one terminal
@@ -428,6 +448,7 @@ pub(super) async fn unary_completion(
     let mut extensions = Vec::with_capacity(submitted.len());
     let mut prompt_tokens = BTreeMap::<usize, u32>::new();
     let mut cached_tokens = BTreeMap::<usize, u32>::new();
+    let mut tier_details = None;
     let mut completion_tokens = 0u64;
     let mut reasoning_tokens = 0u64;
 
@@ -447,6 +468,10 @@ pub(super) async fn unary_completion(
         cached_tokens
             .entry(choice.prompt_index)
             .or_insert(output.cached_tokens);
+        if tier_details.is_none() {
+            // Python reads them from the first choice's result.
+            tier_details = Some(cached_tokens_details_value(&output));
+        }
         completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
         reasoning_tokens = reasoning_tokens.saturating_add(output.reasoning_tokens);
         let (response_choice, extension) = completion_choice(
@@ -474,10 +499,12 @@ pub(super) async fn unary_completion(
         prompt_tokens,
         u32::try_from(completion_tokens).unwrap_or(u32::MAX),
         reasoning_tokens,
-        cache_report.then(|| cached_tokens.values().copied().fold(0, u32::saturating_add)),
+        report
+            .cache_report
+            .then(|| cached_tokens.values().copied().fold(0, u32::saturating_add)),
     );
 
-    Json(completion_response_value(
+    let mut value = completion_response_value(
         CreateCompletionResponse {
             id: response_id,
             choices,
@@ -488,8 +515,11 @@ pub(super) async fn unary_completion(
             usage: Some(usage),
         },
         &extensions,
-    ))
-    .into_response()
+    );
+    if let (true, Some(Some(details))) = (report.tier_details, tier_details) {
+        value["sglext"] = serde_json::json!({ "cached_tokens_details": details });
+    }
+    Json(value).into_response()
 }
 
 /// `first` marks a choice's first chunk (a unary choice's only one), which
@@ -554,6 +584,14 @@ pub(super) fn completion_response_value(
     };
     // Python's Completion response does not expose this OpenAI field.
     root.remove("system_fingerprint");
+    // Python's `PromptTokensDetails` leaves out the counts it does not have.
+    if let Some(details) = root
+        .get_mut("usage")
+        .and_then(|usage| usage.get_mut("prompt_tokens_details"))
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        details.retain(|_, value| !value.is_null());
+    }
     let Some(choices) = root
         .get_mut("choices")
         .and_then(serde_json::Value::as_array_mut)
@@ -605,7 +643,7 @@ pub(super) fn completion_event_stream(
     return_token_ids: bool,
     include_usage: bool,
     continuous_usage: bool,
-    cache_report: bool,
+    report: UsageReport,
 ) -> impl futures::Stream<Item = String> {
     async_stream::stream! {
         let count = submitted.len();
@@ -614,6 +652,10 @@ pub(super) fn completion_event_stream(
         let mut first_chunks = vec![true; count];
         let mut prompt_tokens_by_prompt = BTreeMap::<usize, u32>::new();
         let mut cached_tokens_by_prompt = BTreeMap::<usize, u32>::new();
+        // By choice: the split a chunk carried, else what `cached_tokens`
+        // alone says (all on device), as each chunk's meta_info would.
+        let mut tier_split = BTreeMap::<usize, serde_json::Value>::new();
+        let mut tier_on_device = BTreeMap::<usize, serde_json::Value>::new();
         let mut completion_tokens_by_choice = vec![0u64; count];
         let mut reasoning_tokens_by_choice = vec![0u64; count];
         let mut streams = Vec::with_capacity(count);
@@ -642,6 +684,17 @@ pub(super) fn completion_event_stream(
             // latest frame.
             if index == 0 || prompt_indexes[index - 1] != prompt_indexes[index] {
                 cached_tokens_by_prompt.insert(prompt_indexes[index], output.cached_tokens);
+            }
+            if report.tier_details {
+                let split = output
+                    .extras
+                    .as_deref()
+                    .and_then(|extras| extras.cached_tokens_details.clone());
+                if let Some(split) = split {
+                    tier_split.insert(index, details_json(&split));
+                } else if let Some(on_device) = CachedTokensDetails::on_device(output.cached_tokens) {
+                    tier_on_device.insert(index, details_json(&on_device));
+                }
             }
             completion_tokens_by_choice[index] = completion_tokens_by_choice[index]
                 .saturating_add(output.completion_tokens);
@@ -682,6 +735,29 @@ pub(super) fn completion_event_stream(
             yield completion_response_value(chunk, &[extension]).to_string();
         }
 
+        // Python's response-level sglext chunk, before the usage chunk: the
+        // first choice that has the details.
+        let first_details = (0..count).find_map(|index| {
+            tier_split
+                .get(&index)
+                .or_else(|| tier_on_device.get(&index))
+                .cloned()
+        });
+        if let (true, Some(details)) = (report.tier_details, first_details) {
+            let chunk = CreateCompletionResponse {
+                id: response_id.clone(),
+                choices: vec![],
+                created,
+                model: model.clone(),
+                system_fingerprint: None,
+                object: "text_completion".into(),
+                usage: None,
+            };
+            let mut value = completion_response_value(chunk, &[]);
+            value["sglext"] = serde_json::json!({ "cached_tokens_details": details });
+            yield value.to_string();
+        }
+
         if include_usage {
             let prompt_tokens = prompt_tokens_by_prompt
                 .values()
@@ -693,7 +769,7 @@ pub(super) fn completion_event_stream(
             let reasoning_tokens = reasoning_tokens_by_choice
                 .into_iter()
                 .fold(0u64, u64::saturating_add);
-            let cached_tokens = cache_report.then(|| {
+            let cached_tokens = report.cache_report.then(|| {
                 cached_tokens_by_prompt
                     .values()
                     .copied()
@@ -717,6 +793,30 @@ pub(super) fn completion_event_stream(
         }
         yield "[DONE]".to_string();
     }
+}
+
+/// A choice's cached tokens by tier as Python's `cached_tokens_details` reports
+/// them: the split its scheduler sent, else all on device; `None` without hits.
+fn cached_tokens_details_value(output: &CoreOutput) -> Option<serde_json::Value> {
+    output
+        .extras
+        .as_deref()
+        .and_then(|extras| extras.cached_tokens_details.clone())
+        .or_else(|| CachedTokensDetails::on_device(output.cached_tokens))
+        .map(|details| details_json(&details))
+}
+
+/// Python's `CachedTokensDetails` JSON: `device` and `host`, then `storage`
+/// and `storage_backend` only when set.
+fn details_json(details: &CachedTokensDetails) -> serde_json::Value {
+    let mut value = serde_json::json!({ "device": details.device, "host": details.host });
+    if let Some(storage) = details.storage {
+        value["storage"] = storage.into();
+    }
+    if let Some(backend) = &details.storage_backend {
+        value["storage_backend"] = backend.as_ref().into();
+    }
+    value
 }
 
 /// The usage of a response; `cached_tokens` is set under `--enable-cache-report`,
@@ -836,7 +936,7 @@ fn append_top_logprobs(
 mod tests {
     use super::super::test_utils::{chunk, submitted, with_cached_tokens};
     use super::{
-        ChoiceExtensions, PromptSpec, completion_event_stream, completion_logprobs,
+        ChoiceExtensions, PromptSpec, UsageReport, completion_event_stream, completion_logprobs,
         completion_prompt_specs, completion_response_value, unary_completion,
     };
     use crate::message::response::ChunkExtras;
@@ -940,7 +1040,10 @@ mod tests {
                 false,
                 false,
                 false,
-                cache_report,
+                UsageReport {
+                    cache_report,
+                    tier_details: false,
+                },
             )
             .await;
             assert_eq!(response.status(), StatusCode::OK);
@@ -966,6 +1069,99 @@ mod tests {
         }
     }
 
+    /// `return_cached_tokens_details` puts the first choice's cached tokens by
+    /// tier in the response-level `sglext` (Python's `SglExt`): the split the
+    /// scheduler sent, else all on device from `cached_tokens` alone; streamed
+    /// as a choice-less chunk before usage.
+    #[tokio::test]
+    async fn cached_tokens_details_reach_completions_sglext() {
+        use crate::message::response::{CachedTokensDetails, ResponseItem};
+        let split = |rid: &str| {
+            let mut item = chunk(rid, "a", true);
+            if let ResponseItem::Done(output) = &mut item {
+                output.cached_tokens = 12;
+                output.extras = Some(Box::new(ChunkExtras {
+                    cached_tokens_details: Some(CachedTokensDetails {
+                        device: 2,
+                        host: 0,
+                        storage: Some(10),
+                        storage_backend: None,
+                    }),
+                    ..Default::default()
+                }));
+            }
+            item
+        };
+        let unary = |rid: &'static str, item: ResponseItem, report: UsageReport| async move {
+            let (choice, tx) = submitted(0, 0, rid);
+            tx.send(item).await.unwrap();
+            let response = unary_completion(
+                vec![choice],
+                "cmpl".into(),
+                "m".into(),
+                1,
+                false,
+                false,
+                false,
+                report,
+            )
+            .await;
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        };
+        let report = UsageReport {
+            cache_report: true,
+            tier_details: true,
+        };
+        let expected = serde_json::json!({"device": 2, "host": 0, "storage": 10});
+
+        let value = unary("u0", split("u0"), report).await;
+        assert_eq!(
+            value["sglext"]["cached_tokens_details"], expected,
+            "{value}"
+        );
+        assert_eq!(value["usage"]["prompt_tokens_details"]["cached_tokens"], 12);
+
+        let (choice, tx) = submitted(0, 0, "s0");
+        tx.send(split("s0")).await.unwrap();
+        let stream = completion_event_stream(
+            vec![choice],
+            "cmpl".into(),
+            "m".into(),
+            1,
+            false,
+            false,
+            false,
+            true,
+            false,
+            report,
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<String> = stream.collect().await;
+        assert_eq!(frames.len(), 4, "{frames:?}");
+        let sglext: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
+        assert!(sglext["choices"].as_array().unwrap().is_empty());
+        assert_eq!(
+            sglext["sglext"]["cached_tokens_details"], expected,
+            "{sglext}"
+        );
+
+        // No split from the scheduler: all on device; not asked: no sglext.
+        let mut item = chunk("d0", "a", true);
+        if let ResponseItem::Done(output) = &mut item {
+            output.cached_tokens = 5;
+        }
+        let value = unary("d0", item, report).await;
+        assert_eq!(
+            value["sglext"]["cached_tokens_details"],
+            serde_json::json!({"device": 5, "host": 0})
+        );
+        let value = unary("n0", split("n0"), UsageReport::default()).await;
+        assert!(value.get("sglext").is_none(), "{value}");
+    }
+
     #[tokio::test]
     async fn stream_uses_deltas_then_usage_and_done() {
         for cache_report in [false, true] {
@@ -983,7 +1179,10 @@ mod tests {
                 false,
                 true,
                 cache_report,
-                cache_report,
+                UsageReport {
+                    cache_report,
+                    tier_details: false,
+                },
             );
             futures::pin_mut!(stream);
             let frames: Vec<String> = stream.collect().await;
