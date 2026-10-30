@@ -329,10 +329,13 @@ pub async fn cell_info(State(ctx): State<Arc<AppContext>>) -> Json<CellInfo> {
 /// to tokenize and render as the engines do, from the directory holding the
 /// tokenizer (`--tokenizer-path`, a file or a directory). Nothing else under
 /// that directory is served: the weights are not on this list.
+/// `tiktoken.model` is the tokenizer of models that ship no `tokenizer.json`
+/// (Kimi-K3).
 pub const CELL_FILES: &[&str] = &[
     "tokenizer.json",
     "tokenizer_config.json",
     "tokenizer.model",
+    "tiktoken.model",
     "special_tokens_map.json",
     "config.json",
     "generation_config.json",
@@ -900,6 +903,38 @@ mod tests {
         ctx.config.model.tokenizer_path = None;
         let (status, _) = get_json(Arc::new(ctx), "/internal/cell_files/tokenizer.json").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A model whose tokenizer is a tiktoken vocabulary (Kimi-K3: no
+    /// `tokenizer.json`) is loadable from the cell: `tiktoken.model` is
+    /// served byte for byte.
+    #[tokio::test]
+    async fn cell_files_serves_a_tiktoken_vocabulary() {
+        let dir =
+            std::env::temp_dir().join(format!("sgl-router-cell-tiktoken-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let vocab: &[u8] = b"IQ== 0\nIg== 1\nIw== 2\n";
+        std::fs::write(dir.join("tiktoken.model"), vocab).unwrap();
+        let mut ctx = AppContext::stub();
+        ctx.config.model.tokenizer_path = Some(dir.to_string_lossy().into_owned());
+        let app = crate::server::app::build_router(Arc::new(ctx));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/cell_files/tiktoken.model")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()[axum::http::header::CONTENT_TYPE],
+            "application/octet-stream"
+        );
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], vocab);
         std::fs::remove_dir_all(&dir).ok();
     }
 
