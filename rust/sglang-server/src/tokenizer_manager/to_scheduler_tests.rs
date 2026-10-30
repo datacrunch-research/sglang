@@ -1279,29 +1279,49 @@ fn mm_failure_rejects_returned_request() {
     assert!(consumer.drain(16).is_empty(), "nothing queued");
 }
 
-/// On a non-multimodal model (`MmDispatch::enabled == false`), image_data is silently
-/// ignored and the request tokenizes as plain text — the Python
-/// TokenizerManager behavior when `mm_processor is None`.
+/// On a non-multimodal model (`MmDispatch::enabled == false`), a request with
+/// image_data is a 400: it must not be answered from its text alone. (Python's
+/// `TokenizerManager` drops the media when `mm_processor is None`; the Rust
+/// server does not.)
 #[test]
-fn mm_fields_ignored_when_disabled() {
-    let (mut intake, tok_rx, mm_rx, _consumer, _detok_rx) = make_intake_with_tokenizer(false);
+fn mm_fields_are_a_400_when_disabled() {
+    let (mut intake, tok_rx, mm_rx, consumer, detok_rx) = make_intake_with_tokenizer(false);
 
-    intake.drive(mm_generate_req("mm-3"));
+    let (tx, mut rx) = mpsc::channel(8);
+    let mut req = mm_generate_req("mm-3");
+    req.sink = ResponseSink::Local(tx);
+    intake.drive(req);
+    let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
+        panic!("expected a terminal error frame");
+    };
+    assert!(matches!(err, Error::Validation(_)), "{err}");
+    assert!(
+        err.to_string().contains("without a multimodal processor"),
+        "{err}"
+    );
     assert!(
         mm_rx.try_recv().is_err(),
         "mm disabled: nothing submitted to the mm channel",
     );
-    let req = tok_rx
-        .try_recv()
-        .expect("request must fall through to plain tokenization");
+    assert!(tok_rx.try_recv().is_err(), "never tokenized as plain text");
+    assert!(consumer.drain(16).is_empty(), "never reaches the channel");
+    let detok: Vec<_> = detok_rx.try_iter().collect();
     assert!(
-        matches!(
-            req.state,
-            RequestState::Tokenizing {
-                then: AfterTokenize::PreSend
-            }
-        ),
-        "plain text: the pool return goes straight to the pre-send checks"
+        detok
+            .iter()
+            .any(|msg| matches!(msg, DetokMsg::Deregister { rid } if rid.as_str() == "mm-3")),
+        "a registered sink is released",
+    );
+
+    // Without media the same prompt is tokenized as before.
+    let mut req = mm_generate_req("text-only");
+    if let RequestKind::Generate(g) = &mut req.kind {
+        g.mm = None;
+    }
+    intake.drive(req);
+    assert!(
+        tok_rx.try_recv().is_ok(),
+        "plain text goes to the tokenizer pool"
     );
 }
 
