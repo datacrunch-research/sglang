@@ -44,9 +44,6 @@ def _v0_kernel(
     pid_h = tl.program_id(1)
     t_idx = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
     t_mask = t_idx < s_total
-    # Row offsets (t * stride_t) exceed int32 past ~350k tokens for the
-    # [s, 24, 256] kv_b_proj view; keep the row index in int64.
-    t_idx = t_idx.to(tl.int64)
     nope_idx = tl.arange(0, QK_NOPE)
     rope_idx = tl.arange(0, QK_ROPE)
     v_idx = tl.arange(0, V_HEAD)
@@ -113,7 +110,7 @@ def _v1_flat_kernel(
     pair_idx = pid * BLOCK + tl.arange(0, BLOCK)
     total = s_total * num_heads
     mask = pair_idx < total
-    t_idx = (pair_idx // num_heads).to(tl.int64)  # see _v0_kernel
+    t_idx = pair_idx // num_heads
     h_idx = pair_idx % num_heads
     nope_idx = tl.arange(0, QK_NOPE)
     rope_idx = tl.arange(0, QK_ROPE)

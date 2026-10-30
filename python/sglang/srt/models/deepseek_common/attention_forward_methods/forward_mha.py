@@ -290,17 +290,7 @@ class DeepseekMHAForwardMixin:
         k_nope = kv[..., : self.qk_nope_head_dim]
         v = kv[..., self.qk_nope_head_dim :]
 
-        pack_fn = (
-            getattr(resolve_attn_backend(forward_batch), "pack_prefix_chunk_kv", None)
-            if self.current_attention_backend == "trtllm_mla"
-            else None
-        )
-        if pack_fn is not None:
-            # One fused cat + fp8 quantize for K and V; the backend's fp8 cast
-            # then has nothing left to do.
-            k, v = pack_fn(k_nope, k_pe, v)
-        else:
-            k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
+        k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
         return q, k, v, forward_batch
 
     def forward_normal_core(

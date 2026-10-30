@@ -22,9 +22,6 @@ from sglang.kernels.ops.attention.kv_indices import (
     get_num_kv_index_blocks_flashmla,
     get_num_page_per_block_flashmla,
 )
-from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
-    mla_kv_pack_quantize_fp8,
-)
 from sglang.kernels.ops.attention.pad import (
     pad_draft_extend_query as pad_draft_extend_query_triton,
 )
@@ -137,11 +134,7 @@ def _quantize_fp8_qkv(q, k, v, layer):
     k_scale = getattr(layer, "k_scale_float", None)
     if k_scale is None:
         k_scale = 1.0
-    if k.dtype == torch.float8_e4m3fn:
-        # Already packed to unit-scale fp8 by pack_prefix_chunk_kv, so the
-        # checkpoint's k_scale must not reach BMM1.
-        k_scale = 1.0
-    elif k_scale != 1.0:
+    if k_scale != 1.0:
         assert hasattr(layer, "k_scale"), "k_scale is not set"
         k_2d, _ = scaled_fp8_quant(
             k.reshape(-1, k.shape[-1]).contiguous(), layer.k_scale
@@ -153,9 +146,7 @@ def _quantize_fp8_qkv(q, k, v, layer):
     v_scale = getattr(layer, "v_scale_float", None)
     if v_scale is None:
         v_scale = 1.0
-    if v.dtype == torch.float8_e4m3fn:
-        v_scale = 1.0
-    elif v_scale != 1.0:
+    if v_scale != 1.0:
         assert hasattr(layer, "v_scale"), "v_scale is not set"
         v_2d, _ = scaled_fp8_quant(
             v.reshape(-1, v.shape[-1]).contiguous(), layer.v_scale
@@ -261,16 +252,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.backend = backend
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
-        # Dense K/V for the chunked-prefix MHA path (forward_mha looks this
-        # attribute up; None selects its generic path). With an fp8 KV cache,
-        # pack the strided kv_b_proj output and k_pe straight into contiguous
-        # unit-scale fp8 K/V in one kernel instead of two strided copies and
-        # three casts per piece, whose cost grows with the prefix length.
-        self.pack_prefix_chunk_kv = (
-            self._pack_prefix_chunk_kv_fp8
-            if self.data_type == torch.float8_e4m3fn
-            else None
-        )
         # Prebuild: the first zero-KV prefix chunk otherwise JITs ~6s mid-serving.
         _jit_fixup_module(self.q_data_type)
         self.page_size = model_runner.page_size
@@ -355,16 +336,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             and self.kv_lora_rank == 512
             and self.qk_rope_head_dim == 64
             and can_use_set_mla_kv_concat_q_fp8()
-        )
-
-    def _pack_prefix_chunk_kv_fp8(
-        self, k_nope: torch.Tensor, k_pe: torch.Tensor, v: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """cat(k_nope, k_pe) + fp8 quantize for K and fp8 quantize for V in one
-        kernel. The result is unit-scale; _quantize_fp8_qkv leaves fp8 inputs
-        untouched."""
-        return mla_kv_pack_quantize_fp8(
-            k_nope, k_pe, v, fp8_dtype=torch.float8_e4m3fn, enable_pdl=_ENABLE_PDL
         )
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:

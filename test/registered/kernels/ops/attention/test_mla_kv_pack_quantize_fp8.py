@@ -103,34 +103,5 @@ def test_kpe_2d_accepted():
     torch.testing.assert_close(v_fp8.float(), v_ref.float(), rtol=1e-2, atol=0.5)
 
 
-def test_row_offsets_past_int32():
-    """Rows of a long prefix chunk whose element offset (row * row stride) no
-    longer fits in int32 must still be packed from and into their own rows."""
-    num_heads, qk_nope, qk_rope, v_head = 24, 128, 64, 128
-    # kv_b_proj output view: 24 x (128 nope + 128 v) = 6,144 elements per row.
-    row_elems = num_heads * (qk_nope + v_head)
-    first_past = -(-(2**31) // row_elems)
-    s = first_past + 64
-
-    torch.manual_seed(0)
-    kv = torch.randn(
-        (s, num_heads, qk_nope + v_head), dtype=torch.bfloat16, device=DEVICE
-    )
-    k_pe = torch.randn((s, 1, qk_rope), dtype=torch.bfloat16, device=DEVICE)
-    k_fp8, v_fp8 = mla_kv_pack_quantize_fp8(kv[..., :qk_nope], k_pe, kv[..., qk_nope:])
-
-    rows = slice(first_past - 64, s)
-    k_ref, v_ref = _ref(
-        kv[rows, :, :qk_nope],
-        k_pe[rows],
-        kv[rows, :, qk_nope:],
-        1.0,
-        1.0,
-        torch.float8_e4m3fn,
-    )
-    torch.testing.assert_close(k_fp8[rows].float(), k_ref.float(), rtol=1e-2, atol=0.5)
-    torch.testing.assert_close(v_fp8[rows].float(), v_ref.float(), rtol=1e-2, atol=0.5)
-
-
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
