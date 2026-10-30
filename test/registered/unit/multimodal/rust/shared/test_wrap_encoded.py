@@ -124,6 +124,30 @@ class TestWrapEncoded(CustomTestCase):
             self.assertEqual(item.padding_values(), expected.padding_values())
             self.assertEqual(len(item.padding_values()), 4)
 
+    def test_wide_caller_identity_sets_the_pad_sentinels(self):
+        """The worker sends a caller hash wider than 64 bits as a full
+        identity: the item adopts it (pads from all 32 bytes, hash = leading
+        64 bits); an item without one keeps its hash-derived pads."""
+        identity = bytes(range(32))
+        meta = msgspec.msgpack.decode(self.meta().tobytes())
+        meta["items"][0]["identity"] = identity  # msgpack bin; absent for item 1
+        buffers = {
+            "mm.mrope": np.arange(30, dtype=np.int64).reshape(3, 10),
+            "mm.meta": np.frombuffer(msgspec.msgpack.encode(meta), dtype=np.uint8),
+            **self.transport(np.arange(30, dtype=np.float32)),
+        }
+        output = RustMmProcessor.wrap_encoded(self.spec, buffers)
+        wide, narrow = output.mm_items
+        expected = MultimodalDataItem(modality=Modality.IMAGE)
+        expected.set_identity(identity)
+        self.assertEqual(wide.identity, identity)
+        self.assertEqual(wide.hash, int.from_bytes(identity[:8], "big"))
+        self.assertEqual(wide.padding_values(), expected.padding_values())
+        narrow.set_pad_value()
+        expected = MultimodalDataItem(modality=Modality.IMAGE, hash=self.HASHES[1])
+        expected.set_pad_value()
+        self.assertEqual(narrow.padding_values(), expected.padding_values())
+
 
 class FakeShmBuffer:
     """The Rust extension's ``ShmBuffer`` contract: it owns the unlink until

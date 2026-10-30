@@ -168,6 +168,7 @@ MM_PAD_SHIFT_VALUE = 1_000_000
 _MM_HASH_MASK = (1 << 64) - 1
 _MM_IDENTITY_BYTES = 32
 _MM_WIDE_PAD_TAG = b"sglang-mm-wide-pad-v1"
+_MM_CALLER_HASH_TAG = b"sglang-mm-caller-hash-v1"
 # Keep MM_PAD_SHIFT_VALUE + sentinel below 2**63 so it fits an int64 token ID.
 _MM_WIDE_PAD_MASK = (1 << 62) - 1
 
@@ -418,6 +419,30 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
         self.identity = None
         self.pad_values = _compute_pad_values(self.hash.to_bytes(8, byteorder="big"))
         self.pad_value = self.pad_values[0]
+
+    def set_caller_hash(self, value: int) -> None:
+        """Adopt a caller's ``mm_hashes`` entry, read as ``int(hex, 16)``.
+
+        A value below 2**64 is the item hash, as before. A wider one (a full
+        SHA-256, say) becomes a 32-byte identity instead of being cut to its
+        low 64 bits, so the pad sentinels that key the prefix cache keep all
+        of its bits and two hashes that share their low 64 bits no longer
+        share KV. Values wider than 256 bits are folded with SHA-256. The Rust
+        server's MM worker derives the same identity (``parse_caller_hash``).
+        """
+        if value < 0:
+            raise ValueError("mm_hashes entries must be non-negative")
+        if value <= _MM_HASH_MASK:
+            self.set_hash(value)
+            return
+        width = (value.bit_length() + 7) // 8
+        if width <= _MM_IDENTITY_BYTES:
+            identity = value.to_bytes(_MM_IDENTITY_BYTES, byteorder="big")
+        else:
+            identity = hashlib.sha256(
+                _MM_CALLER_HASH_TAG + value.to_bytes(width, byteorder="big")
+            ).digest()
+        self.set_identity(identity)
 
     def set_identity(self, identity: bytes) -> None:
         """Adopt a full 32-byte digest and derive four 62-bit pad sentinels.
