@@ -43,7 +43,7 @@ fn the_weight_override_steers_a_two_term_fusion_past_either_term_alone() {
     tree.insert(
         &KvWorkerId::new("hot".into(), 0),
         None,
-        &compute_block_hashes(&ids, BLOCK),
+        &compute_block_hashes(&ids.iter().map(|&t| u64::from(t)).collect::<Vec<u64>>(), BLOCK),
     );
     let oracle = BlockSizeOracle::new();
     oracle.try_set(BLOCK as u32).expect("fresh oracle");
