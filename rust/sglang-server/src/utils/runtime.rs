@@ -837,6 +837,90 @@ mod tests {
         assert!(std::net::TcpStream::connect(grpc_addr).is_err());
     }
 
+    /// `--grpc-port` with `--tokenizer-worker-num 8`: the tokenizer workers are
+    /// threads behind the one core both listeners share, so concurrent text
+    /// requests over gRPC are all tokenized by the pool and reach the ring.
+    #[test]
+    fn grpc_text_requests_use_a_multi_thread_tokenizer_pool() {
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!("grpc-tok-pool-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let vocab = serde_json::json!({"[UNK]": 0, "!": 1, "#": 2});
+        let tokenizer = serde_json::json!({
+            "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "[UNK]"},
+            "pre_tokenizer": {"type": "Whitespace"},
+        });
+        std::fs::write(dir.join("tokenizer.json"), tokenizer.to_string()).unwrap();
+
+        let (http_addr, grpc_addr) = free_loopback_addrs();
+        let mut cfg = test_config(http_addr, Some(grpc_addr));
+        cfg.server_args = Arc::new(ServerArgs {
+            skip_tokenizer_init: false,
+            tokenizer_path: dir.to_string_lossy().into_owned(),
+            tokenizer_worker_num: 8,
+            model_config: crate::message::config::ModelConfig {
+                vocab_size: 3,
+                context_len: 4096,
+                ..Default::default()
+            },
+            ..test_server_args()
+        });
+        let rt = start(cfg, None).expect("start runtime");
+
+        const REQUESTS: usize = 16;
+        let client_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _streams = client_runtime.block_on(async {
+            let client = connect_grpc(grpc_addr).await;
+            let calls = (0..REQUESTS).map(|i| {
+                let mut client = client.clone();
+                async move {
+                    let request = proto::GenerateRequest {
+                        text: Some(proto::StringOrList {
+                            value: Some(proto::string_or_list::Value::One("! #".into())),
+                        }),
+                        rid: Some(proto::StringOrList {
+                            value: Some(proto::string_or_list::Value::One(format!("tok-{i}"))),
+                        }),
+                        stream: Some(true),
+                        ..Default::default()
+                    };
+                    tokio::time::timeout(Duration::from_secs(5), client.generate(request))
+                        .await
+                        .expect("timed out starting Generate RPC")
+                        .expect("Generate RPC")
+                        .into_inner()
+                }
+            });
+            futures::future::join_all(calls).await
+        });
+
+        let mut requests = Vec::new();
+        while requests.len() < REQUESTS {
+            assert!(
+                rt.to_scheduler_rx.wait(Duration::from_secs(5)),
+                "only {} of {REQUESTS} gRPC text requests reached the ring",
+                requests.len()
+            );
+            requests.extend(rt.to_scheduler_rx.drain(REQUESTS));
+        }
+        assert_eq!(requests.len(), REQUESTS);
+        for request in &requests {
+            let input = request
+                .buffers
+                .iter()
+                .find(|buffer| buffer.name == "input_ids")
+                .expect("the tokenizer pool filled input_ids");
+            assert_eq!(input.shape, vec![2], "'! #' is two word-level tokens");
+        }
+
+        rt.request_shutdown();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// An HTTP attach reaches the scheduler ring; after a successful reply,
     /// gRPC returns the updated HiCache configuration, verifying that both
     /// transports share the same state.
