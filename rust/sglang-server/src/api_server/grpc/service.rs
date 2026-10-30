@@ -17,8 +17,6 @@ use crate::message::request::{GenerationPolicy, into_requests};
 use crate::message::wire::{ClientMaxNewTokens, fill_preferred_sampling};
 use crate::utils::environ;
 
-const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
-
 pub(super) type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
 /// Narrow snapshot of launch policy the adapter needs per call. It
@@ -29,7 +27,7 @@ struct AdapterConfig {
     preferred_sampling_params: Option<PreferredSamplingParams>,
     incremental_streaming_output: bool,
     /// Longest wait for the next event of any in-flight call before the RPC
-    /// ends with DEADLINE_EXCEEDED.
+    /// ends with DEADLINE_EXCEEDED (`--grpc-response-timeout-secs`).
     response_timeout: Duration,
     /// `/health_generate`'s heartbeat window (`SGLANG_HEALTH_CHECK_TIMEOUT`).
     health_timeout: Duration,
@@ -56,7 +54,7 @@ impl GrpcService {
             config: AdapterConfig {
                 preferred_sampling_params: server_args.preferred_sampling_params.clone(),
                 incremental_streaming_output: server_args.incremental_streaming_output,
-                response_timeout: DEFAULT_RESPONSE_TIMEOUT,
+                response_timeout: Duration::from_secs(server_args.grpc_response_timeout_secs),
                 health_timeout: Duration::from_secs(
                     environ::env_i64("SGLANG_HEALTH_CHECK_TIMEOUT", 20).max(0) as u64,
                 ),
@@ -650,6 +648,77 @@ mod tests {
         drop(stream);
         let abort = harness.abort_rx.recv_async().await.unwrap();
         assert_eq!(abort.rid().client_facing(), "too-slow");
+    }
+
+    /// The launch's `--grpc-response-timeout-secs` sets the per-event wait of
+    /// the service the listener serves (it was fixed at 300 s): 7,200 s is
+    /// kept as given, and a 1 s setting ends a stalled call after 1 s with
+    /// DEADLINE_EXCEEDED and aborts it.
+    #[tokio::test]
+    async fn response_timeout_comes_from_server_args() {
+        fn service_with(
+            grpc_response_timeout_secs: u64,
+        ) -> (
+            GrpcService,
+            flume::Receiver<TmEvent>,
+            flume::Receiver<AbortSource>,
+        ) {
+            let (intake_tx, intake_rx) = flume::unbounded();
+            let (abort_tx, abort_rx) = flume::unbounded();
+            let core = CoreHandle::new(
+                intake_tx,
+                abort_tx,
+                CoreConfig {
+                    response_capacity: 1,
+                    response_activity: Default::default(),
+                    startup_ready: true,
+                    is_disaggregation: false,
+                    mm_limits: Default::default(),
+                    metadata: CoreMetadata::default(),
+                    metrics: None,
+                },
+            );
+            let args = ServerArgs {
+                grpc_response_timeout_secs,
+                ..Default::default()
+            };
+            let hicache = std::sync::Arc::new(crate::api_server::core::HiCacheManager::new(
+                core.clone(),
+                &args,
+            ));
+            (GrpcService::new(core, &args, hicache), intake_rx, abort_rx)
+        }
+
+        let (service, _, _) = service_with(7200);
+        assert_eq!(service.config.response_timeout, Duration::from_secs(7200));
+
+        let (service, intake_rx, abort_rx) = service_with(1);
+        let mut stream = service
+            .generate(Request::new(ids_request(&[1], Some("stalled"))))
+            .await
+            .unwrap()
+            .into_inner();
+        // Hold the request (and its response sink) so only the timeout can end
+        // the call.
+        let TmEvent::Intake {
+            request: _held,
+            admission,
+        } = intake_rx.recv_async().await.unwrap()
+        else {
+            panic!("expected generation intake");
+        };
+        assert!(admission.try_accept());
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("the configured 1 s timeout must fire, not the old 300 s")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code(), Code::DeadlineExceeded);
+        assert!(started.elapsed() >= Duration::from_millis(900));
+        drop(stream);
+        let abort = abort_rx.recv_async().await.unwrap();
+        assert_eq!(abort.rid().client_facing(), "stalled");
     }
 
     #[tokio::test]

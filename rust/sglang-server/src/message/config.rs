@@ -129,6 +129,11 @@ pub struct ServerArgs {
     /// Optional gRPC base port. The same per-rank offset as HTTP is applied at
     /// the Python→Rust startup boundary; `None` keeps gRPC disabled.
     pub grpc_port: Option<u16>,
+    /// `--grpc-response-timeout-secs`: the longest wait for the next event of
+    /// an in-flight gRPC call, the first included, before the RPC ends with
+    /// DEADLINE_EXCEEDED and the request is aborted. Python's bridge honours
+    /// the same flag.
+    pub grpc_response_timeout_secs: u64,
     /// Log levels driving the access log — uvicorn runs at
     /// `log_level_http or log_level` (see [`Self::http_access_log_enabled`]).
     pub log_level: String,
@@ -245,6 +250,7 @@ impl ServerArgs {
         host,
         port,
         grpc_port,
+        grpc_response_timeout_secs,
         log_level,
         log_level_http,
         chat_template,
@@ -300,6 +306,7 @@ impl ServerArgs {
         host: String,
         port: u16,
         grpc_port: Option<u16>,
+        grpc_response_timeout_secs: u64,
         log_level: String,
         log_level_http: Option<String>,
         chat_template: Option<String>,
@@ -353,6 +360,7 @@ impl ServerArgs {
             host,
             port,
             grpc_port,
+            grpc_response_timeout_secs,
             log_level,
             log_level_http,
             chat_template,
@@ -415,6 +423,7 @@ impl Default for ServerArgs {
             host: "127.0.0.1".into(),
             port: 30000,
             grpc_port: None,
+            grpc_response_timeout_secs: 300,
             log_level: "info".into(),
             log_level_http: None,
             chat_template: None,
@@ -882,6 +891,9 @@ impl ServerArgs {
                 ));
             }
         }
+        if self.grpc_response_timeout_secs == 0 {
+            return Err("'grpc_response_timeout_secs' must be positive".into());
+        }
         if let Some(preferred) = &self.preferred_sampling_params {
             // The wire schema is the contract: a preferred value the decoder
             // rejects would 400 every request, so reject it at boot instead.
@@ -1029,6 +1041,34 @@ mod tests {
             .validate()
             .unwrap_err()
             .contains("must differ")
+        );
+    }
+
+    /// `--grpc-response-timeout-secs` arrives from Python; zero would end every
+    /// gRPC call at its first wait, so boot refuses it.
+    #[test]
+    fn grpc_response_timeout_defaults_to_300_and_rejects_zero() {
+        let base = ServerArgs {
+            served_model_name: "m".into(),
+            ..Default::default()
+        };
+        assert_eq!(base.grpc_response_timeout_secs, 300);
+        assert!(
+            ServerArgs {
+                grpc_response_timeout_secs: 7200,
+                ..base.clone()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            ServerArgs {
+                grpc_response_timeout_secs: 0,
+                ..base
+            }
+            .validate()
+            .unwrap_err()
+            .contains("grpc_response_timeout_secs")
         );
     }
 

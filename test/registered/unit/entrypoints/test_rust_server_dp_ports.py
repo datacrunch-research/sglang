@@ -51,6 +51,12 @@ def _scheduler_for_typed_config():
     "overrides,kwarg,expected",
     [
         ({}, "grpc_port", 50051),
+        ({}, "grpc_response_timeout_secs", 300),
+        (
+            {"grpc_response_timeout_secs": 7200},
+            "grpc_response_timeout_secs",
+            7200,
+        ),
         ({"hicache_storage_backend": "file"}, "hicache_storage_backend", "file"),
         (
             {"hicache_storage_backend_extra_config": "{}"},
@@ -84,6 +90,8 @@ def _scheduler_for_typed_config():
     ],
     ids=[
         "native-grpc",
+        "grpc-response-timeout-default",
+        "grpc-response-timeout-7200",
         "hicache_storage_backend",
         "hicache_storage_backend_extra_config",
         "hicache_storage_prefetch_policy",
