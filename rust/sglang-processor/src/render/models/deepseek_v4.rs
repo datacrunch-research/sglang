@@ -179,10 +179,10 @@ pub(crate) fn render(
             .with_special_tokens(tokens())
             .render_conversation(&converted.conversation)
     };
-    // The processor serves text only; SGLang rejects images on a text-only server.
-    if !rendered.image_sources.is_empty() {
-        return Err("image input is not supported for this model".into());
-    }
+    // Images render as recipe places them: one `IMAGE_TOKEN` per image, which
+    // the engine's processor expands (`prefer_tokenized_input`). The chat
+    // layer collects the sources into `image_data` and admits them only for a
+    // multimodal engine (`has_tools_or_media`).
     let mut segments = segments(&rendered.prompt, &rendered.special_ranges);
     if let Some(budget) = budget.filter(|_| thinking) {
         replace_effort_budget(&mut segments, budget)?;
@@ -484,4 +484,37 @@ fn attach_task(
     }
     segments.push(RenderedSegment::new(token, true));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An image part renders as one `IMAGE_TOKEN` in a special segment, which
+    /// the checkpoint tokenizer encodes to the image id the engine's processor
+    /// expands; the chat layer carries the source as `image_data`.
+    #[test]
+    fn an_image_part_renders_as_one_image_token() {
+        let formatter = crate::ChatFormatter::deepseek_v4(true, None).unwrap();
+        let request = json!({"model": "m", "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]}],
+            "chat_template_kwargs": {"thinking": false}});
+        let (prompt, _) = formatter
+            .render_request(request, &HashMap::new())
+            .expect("an image request renders");
+        assert_eq!(
+            prompt.as_str().matches(IMAGE_TOKEN).count(),
+            1,
+            "{}",
+            prompt.as_str()
+        );
+        let segments = prompt.encode_segments().expect("segmented");
+        assert!(
+            segments
+                .iter()
+                .any(|s| s.text == IMAGE_TOKEN && s.allow_special),
+            "{segments:?}"
+        );
+    }
 }
