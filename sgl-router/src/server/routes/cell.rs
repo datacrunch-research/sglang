@@ -241,9 +241,11 @@ pub struct CellMm {
     /// The smallest remote-media byte cap any engine sets.
     pub max_request_bytes: Option<u64>,
     /// The model's family with its processor spec, read from the model files
-    /// beside the tokenizer (`config.json`'s `model_type`,
-    /// `preprocessor_config.json`'s `media_proc_cfg`, or the whole file for a
-    /// model without one): `[{name, modalities, spec}]`. Empty when the files
+    /// beside the tokenizer (`config.json`'s `model_type`;
+    /// `preprocessor_config.json`'s `media_proc_cfg`, the whole file for a
+    /// model without one, or `config.json`'s `vision_config` plus
+    /// `image_token_id` for a checkpoint with no preprocessor config, as
+    /// DeepSeek V4.1): `[{name, modalities, spec}]`. Empty when the files
     /// are not there; an upstream without a planner for the family matches on
     /// the text prefix only.
     pub families: Vec<serde_json::Value>,
@@ -427,27 +429,47 @@ fn model_families(tokenizer_path: &str) -> Vec<serde_json::Value> {
 
 fn read_model_families(tokenizer_path: &str) -> Vec<serde_json::Value> {
     let files = crate::tokenizer::adapter::ModelFiles::open(tokenizer_path);
-    let Ok(Some(preprocessor)) = files.json("preprocessor_config.json") else {
+    let config = files.json("config.json").ok().flatten();
+    let preprocessor = files.json("preprocessor_config.json").ok().flatten();
+    let Some(spec) = family_spec(config.as_ref(), preprocessor) else {
         return Vec::new();
     };
-    let config = files.json("config.json").ok().flatten();
     let name = config
         .as_ref()
         .and_then(|c| c.get("model_type"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown")
         .to_owned();
-    // Kimi's processors nest their geometry under `media_proc_cfg`; others
-    // spell it at the top level.
-    let spec = preprocessor
-        .get("media_proc_cfg")
-        .cloned()
-        .unwrap_or(preprocessor);
     vec![serde_json::json!({
         "name": name,
         "modalities": ["image"],
         "spec": spec,
     })]
+}
+
+/// The processor spec of the model's image family. A preprocessor config is
+/// it: Kimi's processors nest their geometry under `media_proc_cfg`, others
+/// spell it at the top level. A checkpoint that ships none may configure its
+/// vision tower in `config.json` instead (DeepSeek V4.1: `vision_config` with
+/// the geometry, `image_token_id` beside it), which is the spec then.
+fn family_spec(
+    config: Option<&serde_json::Value>,
+    preprocessor: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    if let Some(preprocessor) = preprocessor {
+        return Some(
+            preprocessor
+                .get("media_proc_cfg")
+                .cloned()
+                .unwrap_or(preprocessor),
+        );
+    }
+    let config = config?;
+    let mut vision = config.get("vision_config")?.as_object()?.clone();
+    if let Some(id) = config.get("image_token_id") {
+        vision.insert("image_token_id".to_owned(), id.clone());
+    }
+    Some(serde_json::Value::Object(vision))
 }
 
 // --- The same signals as `sglang.runtime.v1` messages, for the gRPC ingress. ---
@@ -1033,6 +1055,25 @@ mod tests {
         assert_eq!(mm.families[0]["spec"]["patch_size"], 14);
         assert_eq!(mm.families[0]["spec"]["patch_limit_on_one_side"], 512);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// DeepSeek V4.1 ships no preprocessor config: its family spec is the
+    /// vision tower's geometry from `config.json`, with the image token id.
+    #[test]
+    fn a_vision_config_without_a_preprocessor_config_is_the_family_spec() {
+        let config: serde_json::Value = serde_json::json!({
+            "model_type": "deepseek_v41", "image_token_id": 129264,
+            "vision_config": {"model_type": "deepseek_v41_vision", "patch_size": 14, "downsample_ratio": 3,
+                "max_image_tokens": 1024, "min_pixels": 295936, "max_wh_ratio": null}});
+        let spec = family_spec(Some(&config), None).expect("a vision config is a spec");
+        assert_eq!(spec["patch_size"], 14);
+        assert_eq!(spec["downsample_ratio"], 3);
+        assert_eq!(spec["image_token_id"], 129264);
+        // A preprocessor config wins when both are there; a text checkpoint has neither.
+        let pre = serde_json::json!({"media_proc_cfg": {"patch_size": 16}});
+        assert_eq!(family_spec(Some(&config), Some(pre))["patch_size"], 16);
+        assert!(family_spec(Some(&serde_json::json!({"model_type": "llama"})), None).is_none());
+        assert!(family_spec(None, None).is_none());
     }
 
     #[test]

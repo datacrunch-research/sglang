@@ -570,3 +570,36 @@ fn attach_task(
     segments.push(RenderedSegment::new(token, true));
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An image part renders as one `IMAGE_TOKEN` in a special segment, which
+    /// the checkpoint tokenizer encodes to the image id the engine's processor
+    /// expands; the chat layer carries the source as `image_data`.
+    #[test]
+    fn an_image_part_renders_as_one_image_token() {
+        let formatter = crate::ChatFormatter::deepseek_v4(true, None).unwrap();
+        let request = json!({"model": "m", "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]}],
+            "chat_template_kwargs": {"thinking": false}});
+        let (prompt, _) = formatter
+            .render_request(request, &HashMap::new())
+            .expect("an image request renders");
+        assert_eq!(
+            prompt.as_str().matches(IMAGE_TOKEN).count(),
+            1,
+            "{}",
+            prompt.as_str()
+        );
+        let segments = prompt.encode_segments().expect("segmented");
+        assert!(
+            segments
+                .iter()
+                .any(|s| s.text == IMAGE_TOKEN && s.allow_special),
+            "{segments:?}"
+        );
+    }
+}
