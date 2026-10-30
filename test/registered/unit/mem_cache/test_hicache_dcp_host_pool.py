@@ -502,6 +502,9 @@ class TestDcpDecodeStorageAttach(CustomTestCase):
             host_memory_mode="cache",
             components={},
             tree_core=SimpleNamespace(is_write_through_compatible=lambda: True),
+            # A stock allocator: StorageAttachment checks page_interleave_shard_size
+            # on it since #42973 (KVShard), which is 1 for anything not widened.
+            token_to_kv_pool_allocator=SimpleNamespace(),
             _enable_metrics_flag=False,
             extra_metric_labels=None,
         )
