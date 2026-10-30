@@ -44,8 +44,9 @@ fn kimi_tokens_match_sglang() {
     // SGLang's `_validate_request` rejects a required tool_choice without tools.
     let request = json!({"messages":[{"role":"user","content":"hi"}], "tool_choice":"required"});
     assert!(formatter.encode(&tokenizer, &request).is_err());
-    // Media renders on the engine; the router never forwards ids for it.
+    // K3 image parts render to their placeholders in the processor
+    // (1482d201a8, "images on the token path: Kimi K3 renders them").
     let image = json!({"type":"image_url","image_url":{"url":"https://example.com/a.png"}});
     let request = json!({"messages":[{"role":"user","content":[image]}]});
-    assert!(formatter.encode(&tokenizer, &request).is_err());
+    assert!(formatter.encode(&tokenizer, &request).is_ok());
 }
