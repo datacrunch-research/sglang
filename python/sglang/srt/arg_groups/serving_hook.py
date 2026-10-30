@@ -425,10 +425,16 @@ def handle_deprecated_args(server_args: Any):
                 "--grpc-port is not supported with --encoder-only: "
                 "encoder disaggregation uses its own server."
             )
-        if cfg.tokenizer_worker_num > 1:
+        # The Python server runs one HTTP process per tokenizer worker, and
+        # only the single-tokenizer process starts the in-process gRPC bridge
+        # (http_server lifespan), so --grpc-port would silently serve nothing.
+        # The Rust server is one process: its tokenizer workers are a thread
+        # pool behind the one core that both its HTTP and gRPC listeners use.
+        if cfg.tokenizer_worker_num > 1 and not envs.SGLANG_RUST_SERVER.get():
             raise ValueError(
-                "Native gRPC does not yet support --tokenizer-worker-num > 1. "
-                "Unset --grpc-port or set --tokenizer-worker-num 1."
+                "Native gRPC does not yet support --tokenizer-worker-num > 1 "
+                "on the Python server. Unset --grpc-port, set "
+                "--tokenizer-worker-num 1, or use SGLANG_RUST_SERVER=1."
             )
         if cfg.api_key or cfg.admin_api_key:
             raise ValueError(

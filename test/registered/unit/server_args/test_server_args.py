@@ -3984,8 +3984,18 @@ class TestGrpcServerArgs(CustomTestCase):
 
     def test_native_grpc_rejects_multi_tokenizer(self):
         sa = self._args(grpc_port=40000, tokenizer_worker_num=2)
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "on the Python server"):
             handle_deprecated_args(sa)
+
+    def test_rust_server_grpc_allows_multi_tokenizer(self):
+        """The Rust server's tokenizer workers are threads in one process, and
+        its gRPC listener shares their core, so the Python-server refusal does
+        not apply."""
+        sa = self._args(grpc_port=40000, tokenizer_worker_num=8)
+        with envs.SGLANG_RUST_SERVER.override(True):
+            handle_deprecated_args(sa)
+        self.assertEqual(resolution_result(sa, "grpc_port"), 40000)
+        self.assertEqual(sa.tokenizer_worker_num, 8)
 
     def test_native_grpc_rejects_http_auth(self):
         sa = self._args(grpc_port=40000, api_key="secret")
