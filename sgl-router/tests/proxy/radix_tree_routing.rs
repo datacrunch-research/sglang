@@ -27,7 +27,14 @@ async fn radix_tree_routes_cache_aware_request_to_cached_worker() {
     });
     let tokens = request_tokens_for(&tokenizers, &ModelId(MODEL.into()), &body)
         .expect("test prompt tokenizes");
-    let hashes = compute_block_hashes(&tokens.ids.iter().map(|&t| u64::from(t)).collect::<Vec<u64>>(), 1);
+    let hashes = compute_block_hashes(
+        &tokens
+            .ids
+            .iter()
+            .map(|&t| u64::from(t))
+            .collect::<Vec<u64>>(),
+        1,
+    );
     assert!(!hashes.is_empty());
 
     let tree = HashTree::new();
