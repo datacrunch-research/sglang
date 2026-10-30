@@ -246,6 +246,18 @@ impl ChatFormatter {
         }
     }
 
+    /// Python's `chat_encoding_spec`: the model's own encoder, for the chat
+    /// layer's special cases (`kimi_k3`, `dsv4`, `dsv41`); `None` for a
+    /// template-rendered model.
+    pub fn chat_encoding_spec(&self) -> Option<&'static str> {
+        match self {
+            ChatFormatter::KimiK3 => Some("kimi_k3"),
+            ChatFormatter::DeepSeekV4(_) => Some("dsv4"),
+            ChatFormatter::DeepSeekV41(_) => Some("dsv41"),
+            _ => None,
+        }
+    }
+
     /// The template's reasoning toggle kwarg and its default, as
     /// `template_detection` resolves Qwen3.8's (`enable_thinking_default_true`)
     /// and the Jinja templates it detects.

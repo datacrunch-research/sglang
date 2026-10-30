@@ -66,14 +66,24 @@ impl ChatModel {
                     default_enabled: enabled,
                 }
             }),
-            chat_encoding_spec: matches!(formatter, crate::ChatFormatter::KimiK3)
-                .then(|| "kimi_k3".to_owned()),
+            chat_encoding_spec: formatter.chat_encoding_spec().map(str::to_owned),
             ..Self::default()
         }
     }
 
     fn is_kimi_k3(&self) -> bool {
         self.chat_encoding_spec.as_deref() == Some("kimi_k3")
+    }
+
+    /// Whether the renderer places image parts itself, one placeholder per
+    /// image, as Python's does for these encoders: Kimi K3 (`<|media_pad|>`)
+    /// and DeepSeek V4/V4.1 (`<｜deepseek_image｜>`). Images still need a
+    /// multimodal engine (`is_multimodal`).
+    fn renders_images(&self) -> bool {
+        matches!(
+            self.chat_encoding_spec.as_deref(),
+            Some("kimi_k3" | "dsv4" | "dsv41")
+        )
     }
 
     /// `_patch_reasoning_skip_special_tokens`: K3's markers are special
@@ -614,10 +624,10 @@ fn truthy(value: &Value) -> bool {
 
 /// Whether a message carries what this layer does not lower: per-message
 /// tools, video or audio, or images for a model whose renderer does not place
-/// them (Kimi K3's does, one `<|media_pad|>` per image, as Python's).
+/// them (Kimi K3's and DeepSeek's do, one placeholder per image, as Python's)
+/// or whose engine takes none.
 fn has_tools_or_media(message: &Value, model: &ChatModel) -> bool {
-    let images_render =
-        model.is_multimodal && model.chat_encoding_spec.as_deref() == Some("kimi_k3");
+    let images_render = model.is_multimodal && model.renders_images();
     let media = |part: &Value| match part["type"].as_str() {
         Some("video_url" | "audio_url" | "input_audio") => true,
         Some("image_url" | "input_image") => !images_render,
@@ -1468,6 +1478,54 @@ mod tests {
     }
 
     /// The reason `messages` is not lowered, with a renderer that accepts anything.
+    /// DeepSeek V4.1 renders one `<｜deepseek_image｜>` per image, so a
+    /// multimodal engine takes images with their sources as `image_data`; a
+    /// text-only launch still refuses them, as Python's chat layer does.
+    #[test]
+    fn deepseek_images_lower_only_for_a_multimodal_engine() {
+        let messages = json!([{"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]}]);
+        let body = serde_json::to_vec(&json!({"model": "m", "messages": messages})).unwrap();
+        let render = |_: &Value| Some(vec![1, 129264]);
+        for spec in ["dsv41", "dsv4"] {
+            let model = ChatModel {
+                chat_encoding_spec: Some(spec.into()),
+                is_multimodal: true,
+                ..ChatModel::default()
+            };
+            let (generate, _) = lower_chat(
+                &body,
+                &OpenAiHeaders::default(),
+                &OpenAiSettings::default(),
+                &model,
+                render,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{spec}: images lower: {e:?}"));
+            assert!(
+                generate.image_data.is_some(),
+                "{spec}: image_data carries the source"
+            );
+            let text_only = ChatModel {
+                is_multimodal: false,
+                ..model
+            };
+            assert!(
+                lower_chat(
+                    &body,
+                    &OpenAiHeaders::default(),
+                    &OpenAiSettings::default(),
+                    &text_only,
+                    render,
+                    None
+                )
+                .is_err(),
+                "{spec}: a text-only engine refuses images"
+            );
+        }
+    }
+
     fn unsupported(messages: Value) -> Option<&'static str> {
         let body = serde_json::to_vec(&json!({"model": "m", "messages": messages})).unwrap();
         let render = |_: &Value| Some(vec![1]);

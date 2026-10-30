@@ -180,9 +180,8 @@ impl TokenizerRegistry {
                             toggle_param: toggle_param.into(),
                             default_enabled,
                         });
-                if formatter.is_kimi_k3() {
-                    me.chat_model.chat_encoding_spec = Some("kimi_k3".into());
-                }
+                me.chat_model.chat_encoding_spec =
+                    formatter.chat_encoding_spec().map(str::to_owned);
                 me.formatters
                     .insert(m.id.clone(), Arc::new(ChatFormatterEntry::new(formatter)));
                 tracing::info!(model = %m.id, "dynamo-render chat rendering enabled");
