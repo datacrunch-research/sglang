@@ -1061,7 +1061,7 @@ mod tests {
     /// vision tower's geometry from `config.json`, with the image token id.
     #[test]
     fn a_vision_config_without_a_preprocessor_config_is_the_family_spec() {
-        let config: serde_json::Value = serde_json::json!({
+        let config = serde_json::json!({
             "model_type": "deepseek_v41", "image_token_id": 129264,
             "vision_config": {"model_type": "deepseek_v41_vision", "patch_size": 14, "downsample_ratio": 3,
                 "max_image_tokens": 1024, "min_pixels": 295936, "max_wh_ratio": null}});
@@ -1071,7 +1071,10 @@ mod tests {
         assert_eq!(spec["image_token_id"], 129264);
         // A preprocessor config wins when both are there; a text checkpoint has neither.
         let pre = serde_json::json!({"media_proc_cfg": {"patch_size": 16}});
-        assert_eq!(family_spec(Some(&config), Some(pre))["patch_size"], 16);
+        assert_eq!(
+            family_spec(Some(&config), Some(pre)).unwrap()["patch_size"],
+            16
+        );
         assert!(family_spec(Some(&serde_json::json!({"model_type": "llama"})), None).is_none());
         assert!(family_spec(None, None).is_none());
     }
