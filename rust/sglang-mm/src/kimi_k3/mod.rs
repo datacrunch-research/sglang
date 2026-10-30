@@ -25,8 +25,14 @@
 //!
 //! Parameters come from the runtime spec, resolved on the Python side from the
 //! checkpoint's `media_proc_cfg` and the Python processor's fingerprint.
+//!
+//! Decoded images can be kept in a per-process LRU keyed by the artifact key,
+//! as Python's `mm_preprocess_cache` keeps its artifacts (see
+//! [`CACHE_ENV`]), so a multi-turn session that re-sends an image decodes it
+//! once.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
 
@@ -112,7 +118,89 @@ pub fn navit_resize_config(width: u32, height: u32, spec: &KimiK3Spec) -> Resize
     }
 }
 
+/// `1` (or `true`/`yes`/`on`) keeps decoded images in a per-process LRU,
+/// shared by the MM pool's workers; off when unset.
+pub const CACHE_ENV: &str = "SGLANG_RUST_MM_PREPROCESS_CACHE";
+/// The cache's size in MiB (default [`DEFAULT_CACHE_MB`]).
+pub const CACHE_MB_ENV: &str = "SGLANG_RUST_MM_PREPROCESS_CACHE_MB";
+/// Python's default `--mm-preprocess-cache-size-mb` total.
+pub const DEFAULT_CACHE_MB: u64 = 256;
+/// Python's `MultimodalPreprocessCache(max_entries=8192)`: kept by charging
+/// every entry at least `capacity / MAX_CACHE_ENTRIES` bytes.
+const MAX_CACHE_ENTRIES: u64 = 8192;
+
+/// The cache size [`CACHE_ENV`] and [`CACHE_MB_ENV`] ask for, in bytes;
+/// `None` when the cache is off.
+pub fn cache_bytes_from_env() -> Result<Option<u64>, String> {
+    cache_bytes(|name| std::env::var(name).ok())
+}
+
+fn cache_bytes(var: impl Fn(&str) -> Option<String>) -> Result<Option<u64>, String> {
+    let on = var(CACHE_ENV).is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    });
+    if !on {
+        return Ok(None);
+    }
+    let mb = match var(CACHE_MB_ENV) {
+        Some(value) => value
+            .trim()
+            .parse::<u64>()
+            .map_err(|e| format!("{CACHE_MB_ENV}={value:?}: {e}"))?,
+        None => DEFAULT_CACHE_MB,
+    };
+    Ok((mb > 0).then(|| mb.saturating_mul(1024 * 1024)))
+}
+
+/// Decoded images by artifact key, least recently used out first, weighed by
+/// their bytes. The key carries the content digest, the processor
+/// fingerprint and the per-image preprocess options, so an entry is reused
+/// only where Python would reuse its artifact.
+struct DecodedCache {
+    images: moka::sync::Cache<String, Arc<ChwImage>>,
+    max_bytes: u64,
+    min_charge: u64,
+}
+
+impl DecodedCache {
+    fn new(max_bytes: u64) -> Self {
+        let min_charge = (max_bytes / MAX_CACHE_ENTRIES).max(1);
+        let images = moka::sync::Cache::builder()
+            .max_capacity(max_bytes)
+            .eviction_policy(moka::policy::EvictionPolicy::lru())
+            .weigher(move |key: &String, image: &Arc<ChwImage>| {
+                u32::try_from(Self::charge(key, image, min_charge)).unwrap_or(u32::MAX)
+            })
+            .build();
+        Self {
+            images,
+            max_bytes,
+            min_charge,
+        }
+    }
+
+    fn charge(key: &str, image: &ChwImage, min_charge: u64) -> u64 {
+        ((key.len() + image.data.len()) as u64).max(min_charge)
+    }
+
+    fn get(&self, key: &str) -> Option<ChwImage> {
+        self.images.get(key).map(|image| ChwImage::clone(&image))
+    }
+
+    /// Keep `image` unless it alone outweighs the cache (Python's `put`
+    /// refuses those too).
+    fn insert(&self, key: String, image: &ChwImage) {
+        if Self::charge(&key, image, self.min_charge) <= self.max_bytes {
+            self.images.insert(key, Arc::new(image.clone()));
+        }
+    }
+}
+
 /// A decoded source image as `to_chw_uint8` lays it out.
+#[derive(Clone)]
 pub struct ChwImage {
     /// `[channels, height, width]` row-major.
     pub data: Vec<u8>,
@@ -323,10 +411,26 @@ pub struct KimiK3Processor {
     encoder: Arc<dyn TextEncoder>,
     /// `<|media_end|>`, encoded once.
     media_end: Vec<i64>,
+    /// Decoded images, when [`CACHE_ENV`] turns the cache on.
+    cache: Option<DecodedCache>,
+    /// Images decoded so far (cache misses and uncached requests).
+    decodes: AtomicU64,
+    /// Requests served from the cache.
+    hits: AtomicU64,
 }
 
 impl KimiK3Processor {
+    /// The processor, with the decoded-image cache [`CACHE_ENV`] asks for.
     pub fn new(spec: KimiK3Spec, encoder: Arc<dyn TextEncoder>) -> Result<Self, String> {
+        Self::with_cache_bytes(spec, encoder, cache_bytes_from_env()?)
+    }
+
+    /// The processor with a decoded-image cache of `cache_bytes` (`None`: off).
+    pub fn with_cache_bytes(
+        spec: KimiK3Spec,
+        encoder: Arc<dyn TextEncoder>,
+        cache_bytes: Option<u64>,
+    ) -> Result<Self, String> {
         if spec.patch_size == 0 || spec.merge_kernel_size == 0 || spec.patch_limit_on_one_side == 0
         {
             return Err("kimi_k3 spec: sizes must be positive".into());
@@ -334,11 +438,40 @@ impl KimiK3Processor {
         parse_content_hash(&spec.processor_fingerprint)
             .map_err(|e| format!("kimi_k3 spec: processor_fingerprint: {e}"))?;
         let media_end = encoder.encode("<|media_end|>")?;
+        if let Some(bytes) = cache_bytes {
+            tracing::info!(mib = bytes >> 20, "kimi_k3: decoded-image cache on");
+        }
         Ok(Self {
             spec,
             encoder,
             media_end,
+            cache: cache_bytes.map(DecodedCache::new),
+            decodes: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
         })
+    }
+
+    /// How many images this processor has decoded.
+    pub fn decodes(&self) -> u64 {
+        self.decodes.load(Ordering::Relaxed)
+    }
+
+    /// The decoded image for `bytes`, from the cache when it holds `key`.
+    fn decode(&self, key: &str, bytes: &[u8]) -> Result<ChwImage, String> {
+        if let Some(image) = self.cache.as_ref().and_then(|cache| cache.get(key)) {
+            let hits = self.hits.fetch_add(1, Ordering::Relaxed) + 1;
+            if hits.is_power_of_two() {
+                let decodes = self.decodes();
+                tracing::info!(hits, decodes, "kimi_k3: decoded-image cache hits");
+            }
+            return Ok(image);
+        }
+        self.decodes.fetch_add(1, Ordering::Relaxed);
+        let image = decode_chw(bytes)?;
+        if let Some(cache) = &self.cache {
+            cache.insert(key.to_owned(), &image);
+        }
+        Ok(image)
     }
 
     pub fn spec(&self) -> &KimiK3Spec {
@@ -421,8 +554,8 @@ impl MmFamilyProcessor for KimiK3Processor {
 
     fn process_encoded(&self, bytes: &[u8]) -> Result<(ProcessedItem, ItemIdentity), String> {
         let digest = content_digest(bytes);
-        let (item, grid) = self.item(decode_chw(bytes)?)?;
         let key = artifact_key(&digest, &self.spec.processor_fingerprint)?;
+        let (item, grid) = self.item(self.decode(&key, bytes)?)?;
         let identity = kimi_image_identity(&key, grid)?;
         let hash = u64::from_be_bytes(identity[..8].try_into().expect("8 bytes"));
         Ok((
@@ -729,6 +862,165 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    fn cached_processor(cache_bytes: u64) -> KimiK3Processor {
+        KimiK3Processor::with_cache_bytes(spec(), Arc::new(FakeEncoder), Some(cache_bytes)).unwrap()
+    }
+
+    /// Everything an item hands the scheduler, comparable.
+    type ItemDump = (
+        Vec<usize>,
+        Vec<u8>,
+        Vec<(String, Vec<usize>, Vec<i64>)>,
+        String,
+    );
+
+    fn dump(item: &ProcessedItem) -> ItemDump {
+        let TensorData::U8(pixels) = &item.feature.data else {
+            panic!("kimi_k3 features are u8");
+        };
+        let aux = item
+            .aux
+            .iter()
+            .map(|(name, tensor)| {
+                let TensorData::I64(values) = &tensor.data else {
+                    panic!("kimi_k3 aux tensors are i64");
+                };
+                (name.clone(), tensor.shape.clone(), values.clone())
+            })
+            .collect();
+        (
+            item.feature.shape.clone(),
+            pixels.clone(),
+            aux,
+            format!("{:?}", item.geometry),
+        )
+    }
+
+    fn gradient(width: u32, height: u32, seed: u8) -> Vec<u8> {
+        png(
+            image::RgbImage::from_fn(width, height, |x, y| image::Rgb([x as u8, y as u8, seed]))
+                .into(),
+        )
+    }
+
+    /// With the cache on, a second request with the same image is served from
+    /// it: one decode for two requests. A different image still decodes.
+    #[test]
+    fn a_second_request_with_the_same_image_does_not_decode() {
+        let proc = cached_processor(DEFAULT_CACHE_MB * 1024 * 1024);
+        let bytes = gradient(30, 20, 1);
+        proc.process_encoded(&bytes).unwrap();
+        proc.process_encoded(&bytes).unwrap();
+        assert_eq!(proc.decodes(), 1);
+        proc.process_encoded(&gradient(30, 20, 2)).unwrap();
+        assert_eq!(proc.decodes(), 2);
+    }
+
+    /// A cache hit hands the scheduler exactly what a decode does: the same
+    /// pixels, aux tensors, geometry and identity, and through the driver the
+    /// same expanded ids and offsets, with and without the cache.
+    #[test]
+    fn cached_and_uncached_requests_give_identical_items_and_ids() {
+        let cached = cached_processor(DEFAULT_CACHE_MB * 1024 * 1024);
+        let uncached =
+            KimiK3Processor::with_cache_bytes(spec(), Arc::new(FakeEncoder), None).unwrap();
+        let rgba = png(image::RgbaImage::from_fn(30, 20, |x, y| {
+            image::Rgba([x as u8, y as u8, 3, (x * y) as u8])
+        })
+        .into());
+        for bytes in [gradient(30, 20, 1), rgba] {
+            let (first, first_id) = cached.process_encoded(&bytes).unwrap();
+            let (hit, hit_id) = cached.process_encoded(&bytes).unwrap();
+            let (plain, plain_id) = uncached.process_encoded(&bytes).unwrap();
+            assert_eq!(dump(&hit), dump(&plain));
+            assert_eq!(dump(&first), dump(&plain));
+            assert_eq!(hit_id, plain_id);
+            assert_eq!(first_id, plain_id);
+
+            let run = |proc: &KimiK3Processor| {
+                crate::driver::process(
+                    proc,
+                    crate::driver::MmInput {
+                        input_ids: vec![5, 7, 6, 7],
+                        images: vec![
+                            crate::driver::ImageSource::Bytes(bytes.clone()),
+                            crate::driver::ImageSource::Bytes(bytes.clone()),
+                        ],
+                    },
+                )
+                .unwrap()
+            };
+            let (from_cache, decoded) = (run(&cached), run(&uncached));
+            assert_eq!(from_cache.input_ids, decoded.input_ids);
+            assert_eq!(from_cache.offsets, decoded.offsets);
+            for (a, b) in from_cache.items.iter().zip(&decoded.items) {
+                assert_eq!((a.hash, a.identity), (b.hash, b.identity));
+                assert_eq!(a.feature.shape, b.feature.shape);
+                let (TensorData::U8(x), TensorData::U8(y)) = (&a.feature.data, &b.feature.data)
+                else {
+                    panic!("kimi_k3 features are u8");
+                };
+                assert_eq!(x, y);
+            }
+        }
+        assert_eq!(cached.decodes(), 2);
+        assert_eq!(uncached.decodes(), 6);
+    }
+
+    /// The cache holds what its byte budget allows and drops the least
+    /// recently used image first; an image larger than the whole cache is
+    /// never kept.
+    #[test]
+    fn the_least_recently_used_image_is_evicted_first() {
+        let (a, b, c) = (
+            gradient(30, 20, 1),
+            gradient(30, 20, 2),
+            gradient(30, 20, 3),
+        );
+        // 30 x 20 RGB = 1,800 bytes plus a 71-byte key: room for two.
+        let proc = cached_processor(2 * (1800 + 71) + 100);
+        let sync = |proc: &KimiK3Processor| proc.cache.as_ref().unwrap().images.run_pending_tasks();
+        let decodes_after = |bytes: &[u8]| {
+            proc.process_encoded(bytes).unwrap();
+            sync(&proc);
+            proc.decodes()
+        };
+        assert_eq!(decodes_after(&a), 1);
+        assert_eq!(decodes_after(&b), 2);
+        assert_eq!(decodes_after(&a), 2, "a is cached");
+        assert_eq!(decodes_after(&c), 3, "c evicts b, the least recently used");
+        assert_eq!(decodes_after(&a), 3, "a stays");
+        assert_eq!(decodes_after(&c), 3, "c stays");
+        assert_eq!(decodes_after(&b), 4, "b was evicted");
+
+        let big = gradient(40, 40, 4);
+        assert_eq!(decodes_after(&big), 5);
+        assert_eq!(decodes_after(&big), 6, "larger than the cache: not kept");
+    }
+
+    /// Off unless enabled; 256 MiB when enabled without a size; a size of 0
+    /// is off; a size that is not a number fails the processor's start.
+    #[test]
+    fn the_cache_is_off_unless_enabled() {
+        let env = |on: Option<&str>, mb: Option<&str>| {
+            cache_bytes(|name| match name {
+                CACHE_ENV => on.map(str::to_owned),
+                CACHE_MB_ENV => mb.map(str::to_owned),
+                _ => None,
+            })
+        };
+        assert_eq!(env(None, None), Ok(None));
+        assert_eq!(env(None, Some("64")), Ok(None));
+        assert_eq!(env(Some("0"), None), Ok(None));
+        assert_eq!(env(Some("1"), None), Ok(Some(256 << 20)));
+        assert_eq!(env(Some("true"), Some("64")), Ok(Some(64 << 20)));
+        assert_eq!(env(Some("1"), Some("0")), Ok(None));
+        assert!(env(Some("1"), Some("lots")).is_err());
+        if std::env::var(CACHE_ENV).is_err() {
+            assert!(processor().cache.is_none());
+        }
     }
 
     /// Through the shared driver: the request's ids are framed and expanded,

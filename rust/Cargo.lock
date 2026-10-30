@@ -4014,12 +4014,14 @@ dependencies = [
  "blake3",
  "half",
  "image",
+ "moka",
  "numpy",
  "pyo3",
  "rayon",
  "serde",
  "serde_json",
  "sha2",
+ "tracing",
  "ureq",
 ]
 
