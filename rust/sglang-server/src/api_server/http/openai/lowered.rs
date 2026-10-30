@@ -114,6 +114,10 @@ impl OpenAiChat {
             model: ChatModel {
                 context_length: Some(server_args.model_config.context_len),
                 generation_config,
+                // A model whose renderer places image parts (Kimi K3) lowers
+                // them to `image_data` for the MM pipeline; for any other
+                // model images still leave this path (`has_tools_or_media`).
+                is_multimodal: server_args.model_is_multimodal(),
                 ..ChatModel::for_formatter(formatter)
             },
             tokenizer,

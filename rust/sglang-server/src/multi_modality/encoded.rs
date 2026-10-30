@@ -49,6 +49,11 @@ pub struct MmEncodedItem {
     /// Content hash of the raw source bytes, or the caller's `mm_hashes`
     /// override; precomputed so draining never hashes.
     pub hash: u64,
+    /// The processor's full 32-byte identity, when it has one (Kimi K3):
+    /// Python adopts it with `MultimodalDataItem.set_identity`, which derives
+    /// the item's wide pad sentinels from it and sets `hash` to its leading
+    /// 64 bits. `None` leaves the sentinels to `hash`.
+    pub identity: Option<[u8; 32]>,
     /// Inclusive token spans in the expanded prompt.
     pub offsets: Vec<(u32, u32)>,
     pub model_specific_data: BTreeMap<String, MmMetaValue>,
@@ -120,6 +125,18 @@ pub(super) struct MmItemMeta<'a> {
     pub hash: u64,
     pub offsets: &'a [(u32, u32)],
     pub model_specific_data: &'a BTreeMap<String, MmMetaValue>,
+    /// msgpack `bin` (Python `bytes`); absent when the item has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<MsgpackBin<'a>>,
+}
+
+/// Bytes serialized as msgpack `bin` rather than an array of integers.
+pub(super) struct MsgpackBin<'a>(pub &'a [u8]);
+
+impl Serialize for MsgpackBin<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(self.0)
+    }
 }
 
 impl<'a> MmMeta<'a> {
@@ -133,6 +150,7 @@ impl<'a> MmMeta<'a> {
                     hash: item.hash,
                     offsets: &item.offsets,
                     model_specific_data: &item.model_specific_data,
+                    identity: item.identity.as_ref().map(|id| MsgpackBin(id)),
                 })
                 .collect(),
             token_ids: entry.token_ids.as_ref(),

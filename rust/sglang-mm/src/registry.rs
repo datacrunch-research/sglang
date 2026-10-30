@@ -75,15 +75,34 @@ pub fn default_registry() -> ProcessorRegistry {
 #[serde(tag = "family", rename_all = "snake_case")]
 pub enum PipelineSpec {
     QwenVl(crate::qwen_vl::QwenVlSpec),
+    KimiK3(crate::kimi_k3::KimiK3Spec),
 }
 
 /// Build a family processor from a typed spec. `Err` when the family
-/// rejects its parameters (e.g. a zero patch size).
+/// rejects its parameters (e.g. a zero patch size), or needs a tokenizer
+/// (see [`build_pipeline_with_encoder`]).
 pub fn build_pipeline(
     spec: PipelineSpec,
 ) -> Result<Box<dyn crate::pipeline::MmFamilyProcessor>, String> {
+    build_pipeline_with_encoder(spec, None)
+}
+
+/// [`build_pipeline`] with the server's tokenizer, which a family whose
+/// expansion inserts text needs (Kimi K3 frames each image with
+/// `<|media_begin|>image WxH<|media_content|>` and `<|media_end|>`).
+pub fn build_pipeline_with_encoder(
+    spec: PipelineSpec,
+    encoder: Option<std::sync::Arc<dyn crate::pipeline::TextEncoder>>,
+) -> Result<Box<dyn crate::pipeline::MmFamilyProcessor>, String> {
     match spec {
         PipelineSpec::QwenVl(spec) => Ok(Box::new(crate::qwen_vl::QwenVlProcessor::new(spec)?)),
+        PipelineSpec::KimiK3(spec) => {
+            let encoder = encoder
+                .ok_or("kimi_k3: the pipeline needs the server tokenizer to frame each image")?;
+            Ok(Box::new(crate::kimi_k3::KimiK3Processor::new(
+                spec, encoder,
+            )?))
+        }
     }
 }
 

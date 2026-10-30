@@ -793,7 +793,7 @@ impl MmSpec {
         image_mean: [f32; 3],
         image_std: [f32; 3],
         resample: MmResample,
-    ) -> Self {
+    ) -> pyo3::PyResult<Self> {
         use sglang_mm::registry::PipelineSpec;
         let pipeline = match family {
             MmFamily::QwenVl => PipelineSpec::QwenVl(sglang_mm::qwen_vl::QwenVlSpec {
@@ -807,10 +807,54 @@ impl MmSpec {
                 image_std,
                 resample: resample.into(),
             }),
+            MmFamily::KimiK3 => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "MmSpec: build the kimi_k3 family with MmSpec.kimi_k3(...)",
+                ));
+            }
         };
-        Self {
+        Ok(Self {
             feature_shm,
             pipeline,
+        })
+    }
+
+    /// The Kimi K3 family (its knobs differ from the Qwen-VL geometry):
+    /// `KimiK3PreprocessConfig`'s NaViT fields, the `<|media_pad|>` id, and
+    /// the Python processor's fingerprint, which every image identity covers.
+    #[staticmethod]
+    #[pyo3(signature = (*,
+        feature_shm,
+        image_token_id,
+        patch_size,
+        merge_kernel_size,
+        in_patch_limit,
+        patch_limit_on_one_side,
+        fixed_output_tokens,
+        processor_fingerprint,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn kimi_k3(
+        feature_shm: bool,
+        image_token_id: i64,
+        patch_size: u32,
+        merge_kernel_size: u32,
+        in_patch_limit: u32,
+        patch_limit_on_one_side: u32,
+        fixed_output_tokens: Option<u32>,
+        processor_fingerprint: String,
+    ) -> Self {
+        Self {
+            feature_shm,
+            pipeline: sglang_mm::registry::PipelineSpec::KimiK3(sglang_mm::kimi_k3::KimiK3Spec {
+                image_token_id,
+                patch_size,
+                merge_kernel_size,
+                in_patch_limit,
+                patch_limit_on_one_side,
+                fixed_output_tokens,
+                processor_fingerprint,
+            }),
         }
     }
 }
@@ -827,6 +871,8 @@ impl MmSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MmFamily {
     QwenVl,
+    /// Built with `MmSpec.kimi_k3`, not the Qwen-VL keyword set.
+    KimiK3,
 }
 
 /// The HF image processor the Rust resize must reproduce bit-exactly (see
