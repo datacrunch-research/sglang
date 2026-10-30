@@ -245,6 +245,8 @@ fn router_ctx_with(
             dp_ranks: 1,
             grpc_port,
             supports_inline_system: false,
+            mm: None,
+            answered: true,
         };
         registry
             .add_with_cb(spec, Some(Default::default()), profile)

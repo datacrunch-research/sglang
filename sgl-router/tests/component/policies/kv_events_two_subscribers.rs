@@ -58,7 +58,7 @@ async fn two_independent_subscribers_converge_to_same_tree_state() {
 
     // 3. Build a deterministic, multi-block event chain.
     let tokens: Vec<u32> = (0..16).collect();
-    let hashes = compute_block_hashes(&tokens, block_size as usize);
+    let hashes = compute_block_hashes(&tokens.iter().map(|&t| u64::from(t)).collect::<Vec<u64>>(), block_size as usize);
     assert!(
         hashes.len() >= 3,
         "test needs ≥3 blocks; got {}",
@@ -208,8 +208,8 @@ async fn two_subscribers_merge_events_from_two_publishers() {
     // hash collision.
     let tokens_x: Vec<u32> = (0..16).collect();
     let tokens_y: Vec<u32> = (1000..1016).collect();
-    let hashes_x = compute_block_hashes(&tokens_x, block_size as usize);
-    let hashes_y = compute_block_hashes(&tokens_y, block_size as usize);
+    let hashes_x = compute_block_hashes(&tokens_x.iter().map(|&t| u64::from(t)).collect::<Vec<u64>>(), block_size as usize);
+    let hashes_y = compute_block_hashes(&tokens_y.iter().map(|&t| u64::from(t)).collect::<Vec<u64>>(), block_size as usize);
     assert!(hashes_x.len() >= 3 && hashes_y.len() >= 3);
 
     let payload_x = encode_event_batch(
