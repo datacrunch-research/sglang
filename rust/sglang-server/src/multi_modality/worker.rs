@@ -19,34 +19,6 @@ use crate::utils::error::Error;
 use crate::utils::fsm::Event;
 use crate::utils::runtime::Runnable;
 
-/// Whether a request's `mm_hashes` may replace the item identities the
-/// processor computed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CallerHashes {
-    /// Caller hashes override the computed ones so an external router's keys
-    /// align with the prefix cache (Python `TokenizerManager` parity).
-    Apply,
-    /// The model's image identity covers the processor configuration as well
-    /// as the content (Kimi's wide identity), so it must come from the
-    /// processor: a caller hash could otherwise make one image reuse
-    /// another's cached KV. Caller hashes are ignored and the computed
-    /// identity is kept; Python's Kimi processors refuse them
-    /// (`KimiGridMMDataMixin.reject_caller_image_identity`).
-    Ignore,
-}
-
-impl CallerHashes {
-    /// The policy for an HF `model_type`: the Kimi families whose Python
-    /// processors refuse caller hashes ignore them here, whichever Rust
-    /// processor serves the model; every other model applies them.
-    pub fn for_model_type(model_type: Option<&str>) -> Self {
-        match model_type {
-            Some("kimi_k25" | "kimi_k3") => Self::Ignore,
-            _ => Self::Apply,
-        }
-    }
-}
-
 /// One parsed `mm_hashes` entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CallerHash {
@@ -62,7 +34,9 @@ enum CallerHash {
 const CALLER_HASH_TAG: &[u8] = b"sglang-mm-caller-hash-v1";
 
 /// Caller hashes override the computed ones; a length mismatch or malformed
-/// entry warns and keeps the computed hash — never blocks the request.
+/// entry warns and keeps the computed hash — never blocks the request. A
+/// family that owns its identities (Kimi K3) never gets here with caller
+/// hashes: `FamilyMmProcessor::check_media` refuses them at admission.
 fn apply_caller_hashes(items: &mut [MmEncodedItem], caller: &[String]) {
     if caller.is_empty() {
         return;
@@ -330,9 +304,6 @@ pub struct MmContext {
     /// (`RustMmProcessor._use_feature_shm`) exactly when the scheduler broadcasts
     /// across TP ranks and will unwrap `ShmPointerMMData`.
     pub feature_shm: bool,
-    /// Whether requests' `mm_hashes` replace the computed identities (see
-    /// [`CallerHashes`]); `Apply` unless the runtime sets the model's policy.
-    pub caller_hashes: CallerHashes,
 }
 
 impl MmContext {
@@ -343,7 +314,6 @@ impl MmContext {
         Ok(Self {
             processor: Arc::new(FamilyMmProcessor::new(spec, tokenizer)?),
             feature_shm,
-            caller_hashes: CallerHashes::Apply,
         })
     }
 
@@ -351,15 +321,6 @@ impl MmContext {
         Self {
             processor,
             feature_shm,
-            caller_hashes: CallerHashes::Apply,
-        }
-    }
-
-    /// The same context under the served model's caller-hash policy.
-    pub fn with_caller_hashes(self, caller_hashes: CallerHashes) -> Self {
-        Self {
-            caller_hashes,
-            ..self
         }
     }
 }
@@ -449,19 +410,7 @@ pub(crate) fn process(
     let caller_hashes = std::mem::take(&mut mm.mm_hashes);
     let mut output = ctx.processor.process(input_ids, mm)?;
     output.result.validate(output.input_ids.len())?;
-    match ctx.caller_hashes {
-        CallerHashes::Apply => apply_caller_hashes(&mut output.result.items, &caller_hashes),
-        CallerHashes::Ignore if !caller_hashes.is_empty() => {
-            static NOTED: std::sync::Once = std::sync::Once::new();
-            NOTED.call_once(|| {
-                tracing::info!(
-                    "mm_hashes are ignored for this model: its image identities \
-                     come from the multimodal processor"
-                )
-            });
-        }
-        CallerHashes::Ignore => {}
-    }
+    apply_caller_hashes(&mut output.result.items, &caller_hashes);
     ctx.processor.finalize(&mut output.result)?;
     output.result.validate(output.input_ids.len())?;
     let buffers = make_buffers(output.result, ctx.feature_shm)?;
@@ -477,9 +426,6 @@ pub struct MmWiring {
     pub mm_rx: flume::Receiver<Request>,
     /// Back-channel for the workers' `Encoded` into the to-scheduler loop.
     pub tm_tx: flume::Sender<TmEvent>,
-    /// The served model's caller-hash policy, applied to whichever processor
-    /// the pool is started with.
-    pub caller_hashes: CallerHashes,
 }
 
 /// One MM worker, spawned via `Runtime::start_mm_workers` (which owns the
@@ -1253,58 +1199,6 @@ mod tests {
             };
             let (_, buffers) = process(&ctx, vec![1, 2], mm).unwrap();
             assert_eq!(first_item_identity(&buffers), (Some(hash), identity));
-        }
-    }
-
-    /// Kimi's identity covers the processor configuration, so on a Kimi model
-    /// a caller hash never replaces it, whichever processor runs: the request
-    /// is served with the computed identity (Python's Kimi processors refuse
-    /// caller hashes). Other models keep applying them.
-    #[test]
-    fn kimi_models_ignore_caller_hashes() {
-        for model_type in ["kimi_k3", "kimi_k25"] {
-            assert_eq!(
-                CallerHashes::for_model_type(Some(model_type)),
-                CallerHashes::Ignore
-            );
-        }
-        for model_type in [Some("qwen3_vl"), Some("kimi_vl"), None] {
-            assert_eq!(
-                CallerHashes::for_model_type(model_type),
-                CallerHashes::Apply
-            );
-        }
-
-        let sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        let sha256_bytes: Vec<u8> = (0..32)
-            .map(|i| u8::from_str_radix(&sha256[2 * i..2 * i + 2], 16).unwrap())
-            .collect();
-        for (policy, hash, identity) in [
-            (CallerHashes::Ignore, 7, None),
-            (
-                CallerHashes::Apply,
-                0xe3b0c44298fc1c14_u64,
-                Some(sha256_bytes),
-            ),
-        ] {
-            let ctx = MmContext::with_processor(
-                Arc::new(ExternalProcessor {
-                    shape: vec![1],
-                    offsets: vec![(1, 1)],
-                }),
-                false,
-            )
-            .with_caller_hashes(policy);
-            let mm = MmData {
-                mm_hashes: vec![sha256.to_owned()],
-                ..Default::default()
-            };
-            let (_, buffers) = process(&ctx, vec![1, 2], mm).unwrap();
-            assert_eq!(
-                first_item_identity(&buffers),
-                (Some(hash), identity),
-                "{policy:?}"
-            );
         }
     }
 }

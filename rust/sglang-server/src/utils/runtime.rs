@@ -74,10 +74,10 @@ impl Runtime {
         spec: crate::message::config::MmSpec,
         workers: usize,
     ) -> Result<(), String> {
-        let ctx = Arc::new(
-            crate::multi_modality::worker::MmContext::new(spec, self.mm_tokenizer.clone())?
-                .with_caller_hashes(self.mm_wiring.caller_hashes),
-        );
+        let ctx = Arc::new(crate::multi_modality::worker::MmContext::new(
+            spec,
+            self.mm_tokenizer.clone(),
+        )?);
         self.spawn_mm_pool(workers, ctx);
         Ok(())
     }
@@ -91,10 +91,10 @@ impl Runtime {
         workers: usize,
         feature_shm: bool,
     ) {
-        let ctx = Arc::new(
-            crate::multi_modality::worker::MmContext::with_processor(processor, feature_shm)
-                .with_caller_hashes(self.mm_wiring.caller_hashes),
-        );
+        let ctx = Arc::new(crate::multi_modality::worker::MmContext::with_processor(
+            processor,
+            feature_shm,
+        ));
         self.spawn_mm_pool(workers, ctx);
     }
 
@@ -293,12 +293,6 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         });
     }
 
-    // Whether the MM pool applies requests' `mm_hashes`: decided by the served
-    // model, whichever processor the pool is started with.
-    let caller_hashes = crate::multi_modality::worker::CallerHashes::for_model_type(
-        cfg.server_args.model_config.model_type.as_deref(),
-    );
-
     // --- TokenizerManager to_scheduler loop ---
     {
         // Second TM core when present, else share the first (1-core / API-set
@@ -411,7 +405,6 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         mm_wiring: crate::multi_modality::worker::MmWiring {
             mm_rx: mm_worker_rx,
             tm_tx: tok_manager_tx,
-            caller_hashes,
         },
         mm_tokenizer,
         core,
