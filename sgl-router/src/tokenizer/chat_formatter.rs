@@ -279,6 +279,14 @@ impl ChatFormatter {
         matches!(self.processor, Some(ProcessorFormatter::KimiK3))
     }
 
+    /// Python's `chat_encoding_spec`: the native encoder the model renders
+    /// with (`kimi_k3`, `dsv4`, `dsv41`), `None` for a template.
+    pub fn chat_encoding_spec(&self) -> Option<&'static str> {
+        self.processor
+            .as_ref()
+            .and_then(ProcessorFormatter::chat_encoding_spec)
+    }
+
     /// Apply the workers' `--default-chat-template-kwargs`; they fill keys the
     /// request leaves unset, and a default `reasoning_effort` acts as the request's.
     pub fn with_defaults(mut self, defaults: &ChatTemplateKwargs) -> Self {
