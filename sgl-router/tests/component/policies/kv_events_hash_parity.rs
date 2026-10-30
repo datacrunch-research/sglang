@@ -74,7 +74,15 @@ fn rust_block_hashes_match_python_radix_cache() {
             lora_name: case.lora_name,
             ambiguous: false,
         };
-        let got = namespace.block_hashes(&case.tokens.iter().map(|&t| u64::from(t)).collect::<Vec<u64>>(), block_size.get(), false);
+        let got = namespace.block_hashes(
+            &case
+                .tokens
+                .iter()
+                .map(|&t| u64::from(t))
+                .collect::<Vec<u64>>(),
+            block_size.get(),
+            false,
+        );
         assert_eq!(
             got, case.expected_i64_hashes,
             "case {}: tokens={:?} block_size={} — Rust produced {:?}, fixture says {:?}",

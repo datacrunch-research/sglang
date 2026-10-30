@@ -13,7 +13,10 @@ use sgl_router::state::kv_events::{
 #[test]
 fn radix_tree_reports_contiguous_prefix_depth_per_worker() {
     let tokens = [11_u32, 12, 13, 14];
-    let hashes = compute_block_hashes(&tokens.iter().map(|&t| u64::from(t)).collect::<Vec<u64>>(), 1);
+    let hashes = compute_block_hashes(
+        &tokens.iter().map(|&t| u64::from(t)).collect::<Vec<u64>>(),
+        1,
+    );
     let tree = Arc::new(HashTree::new());
     let oracle = BlockSizeOracle::new();
     oracle.try_set(1).unwrap();
@@ -31,7 +34,10 @@ fn radix_tree_reports_contiguous_prefix_depth_per_worker() {
     );
 
     let signal = RadixTreePrefixProvider::new(tree, oracle)
-        .match_request_tokens(&tokens.iter().map(|&t| u64::from(t)).collect::<Vec<u64>>(), CacheNamespace::NONE)
+        .match_request_tokens(
+            &tokens.iter().map(|&t| u64::from(t)).collect::<Vec<u64>>(),
+            CacheNamespace::NONE,
+        )
         .expect("established local tree must produce a prefix signal");
     let PrefixOutcome::Matched {
         matches,
