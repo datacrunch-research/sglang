@@ -6,9 +6,8 @@ use crate::message::request::Request;
 /// Dispatches multimodal requests onto the MM worker channel.
 #[derive(Clone)]
 pub struct MmDispatch {
-    /// Whether the model is multimodal. When false, mm fields are silently
-    /// ignored, as the Python `TokenizerManager` does with `mm_processor is
-    /// None`.
+    /// Whether the model is multimodal. When false, a request with media is
+    /// refused with a 400 instead of being answered from its text alone.
     pub enabled: bool,
     /// -> MM worker pool (spawned via `Server.start_mm_workers`); carries the
     /// whole request, like the tokenizer pool's edge.

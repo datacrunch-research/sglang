@@ -26,6 +26,11 @@ use crate::utils::{
 /// can exceed a UUID; keep their per-step wire and detokenizer-table cost bounded.
 pub(super) const MAX_RID_LEN: usize = 256;
 
+/// The 400 for media sent to a model served without a multimodal processor
+/// (`/generate` and gRPC `Generate`; the chat route refuses media itself).
+pub(super) const TEXT_ONLY_MEDIA: &str = "image_data, video_data and audio_data are not \
+     supported: this model is served without a multimodal processor";
+
 /// Intake FSM dispatcher stage. Owns its inbox + downstream handles, so the
 /// runtime spawns it as a [`Runnable`] rather than calling a free `run_*` fn
 /// with positional arguments.
@@ -255,6 +260,11 @@ impl Intake {
                             // already has ids skips the pool hop, not the state.
                             Ok(()) if self.mm.enabled && g.has_multimodal() => {
                                 Ok(ValidationOutcome::HasMultimodal)
+                            }
+                            // A text-only model has no processor for the
+                            // media: a 400, never an answer to the text alone.
+                            Ok(()) if g.has_multimodal() => {
+                                Err(Error::Validation(TEXT_ONLY_MEDIA.into()))
                             }
                             // Client ids skip the pool; text goes to the tokenizer.
                             Ok(()) if g.already_tokenized() => {
