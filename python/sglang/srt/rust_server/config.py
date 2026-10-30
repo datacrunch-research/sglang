@@ -129,6 +129,9 @@ def _build_server_args(
         # The shared field is also populated for legacy SMG mode; only forward
         # it when it selects SGLang's native gRPC transport.
         grpc_port=grpc_port,
+        # The per-event wait of the gRPC listener, as the Python bridge
+        # applies it; a cold prefill behind a queue can exceed the default.
+        grpc_response_timeout_secs=get_serving().grpc_response_timeout_secs,
         log_level=get_observability().log_level,
         log_level_http=get_observability().log_level_http,
         chat_template=get_serving().chat_template,
