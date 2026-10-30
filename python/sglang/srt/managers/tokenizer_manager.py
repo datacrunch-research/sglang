@@ -1252,7 +1252,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         if not isinstance(item, MultimodalDataItem):
                             continue
                         try:
-                            item.set_hash(int(hex_hash, 16))
+                            item.set_caller_hash(int(hex_hash, 16))
                         except (TypeError, ValueError):
                             logger.warning(
                                 "Ignoring malformed mm_hashes entry %r; "

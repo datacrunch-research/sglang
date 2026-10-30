@@ -437,7 +437,7 @@ class RustMmProcessor:
         The buffers are ``mm.feature.{i}`` per item (shaped ``[rows,
         feature_dim]`` f32, inline or shm), ``mm.mrope`` (``[3, seq_len]``
         int64), and ``mm.meta``, a msgpack sidecar decoding to ``{"items":
-        [{"modality", "hash", "offsets", "model_specific_data"}, ...],
+        [{"modality", "hash", "identity", "offsets", "model_specific_data"}, ...],
         "token_ids", "mrope_delta"}`` with the items in buffer order. External
         model packages receive the same layout and wrap it their own way.
 
@@ -603,7 +603,7 @@ class RustMmProcessor:
             buffers[f"mm.feature.{index}"], precomputed_hash=item["hash"], stubs=stubs
         )
         t, h, w = item["model_specific_data"]["image_grid_thw"]
-        return MultimodalDataItem(
+        data_item = MultimodalDataItem(
             modality=_MODALITIES[item["modality"]],
             feature=feature,
             hash=item["hash"],
@@ -612,3 +612,10 @@ class RustMmProcessor:
                 "image_grid_thw": torch.tensor([[t, h, w]], dtype=torch.long)
             },
         )
+        # A caller hash wider than 64 bits arrives as a full 32-byte identity
+        # (msgpack bin, absent otherwise); its pad sentinels must derive from
+        # all of it, not from `hash`.
+        identity = item.get("identity")
+        if identity is not None:
+            data_item.set_identity(bytes(identity))
+        return data_item

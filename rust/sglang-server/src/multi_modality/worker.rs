@@ -19,38 +19,92 @@ use crate::utils::error::Error;
 use crate::utils::fsm::Event;
 use crate::utils::runtime::Runnable;
 
-/// Python parity: caller hashes override the computed ones so an external
-/// router's keys align with the prefix cache. A length mismatch or malformed
-/// entry warns and keeps the computed hash — never blocks the request.
-fn apply_caller_hashes<'a>(hashes: impl ExactSizeIterator<Item = &'a mut u64>, caller: &[String]) {
+/// One parsed `mm_hashes` entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CallerHash {
+    /// A value below 2^64: the item hash, as before.
+    Narrow(u64),
+    /// A wider value (a full SHA-256, say): a 32-byte identity, so the wide pad
+    /// sentinels that key the prefix cache keep all of its bits.
+    Wide([u8; 32]),
+}
+
+/// Domain tag for folding a caller value wider than 256 bits into an identity
+/// (Python `MultimodalDataItem.set_caller_hash`).
+const CALLER_HASH_TAG: &[u8] = b"sglang-mm-caller-hash-v1";
+
+/// Caller hashes override the computed ones; a length mismatch or malformed
+/// entry warns and keeps the computed hash — never blocks the request. A
+/// family that owns its identities (Kimi K3) never gets here with caller
+/// hashes: `FamilyMmProcessor::check_media` refuses them at admission.
+fn apply_caller_hashes(items: &mut [MmEncodedItem], caller: &[String]) {
     if caller.is_empty() {
         return;
     }
-    if caller.len() != hashes.len() {
+    if caller.len() != items.len() {
         tracing::warn!(
             caller = caller.len(),
-            items = hashes.len(),
+            items = items.len(),
             "mm_hashes length != mm item count; ignoring caller hashes"
         );
         return;
     }
-    for (hash, entry) in hashes.zip(caller) {
+    for (item, entry) in items.iter_mut().zip(caller) {
         match parse_caller_hash(entry) {
-            Some(v) => *hash = v,
+            Some(CallerHash::Narrow(hash)) => {
+                item.hash = hash;
+                item.identity = None;
+            }
+            Some(CallerHash::Wide(identity)) => {
+                // Python `set_identity`: the hash keeps the leading 64 bits for
+                // scalar consumers; the pad sentinels use the whole identity.
+                item.hash = u64::from_be_bytes(identity[..8].try_into().expect("8 bytes"));
+                item.identity = Some(identity);
+            }
             None => tracing::warn!(%entry, "malformed mm_hashes entry; keeping computed hash"),
         }
     }
 }
 
-/// Hex of any width, as Python's `int(hex_hash, 16)` takes it (a full SHA-256
-/// being the common case), keeping the low 64 bits — only the low 30 are
-/// observable, through `_compute_pad_value`.
-fn parse_caller_hash(entry: &str) -> Option<u64> {
+/// Hex of any width, read as Python's `int(hex_hash, 16)` reads it. A value
+/// below 2^64 is the item hash. A wider value used to keep only its low 64
+/// bits, so two hashes sharing those bits shared prefix-cache keys; it is now
+/// a 32-byte identity (the value itself up to 256 bits, a SHA-256 fold above),
+/// as Python's `MultimodalDataItem.set_caller_hash` derives it.
+fn parse_caller_hash(entry: &str) -> Option<CallerHash> {
     let hex = entry.strip_prefix("0x").unwrap_or(entry);
     if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    u64::from_str_radix(&hex[hex.len().saturating_sub(16)..], 16).ok()
+    let digits = hex.trim_start_matches('0');
+    if digits.len() <= 16 {
+        return u64::from_str_radix(if digits.is_empty() { "0" } else { digits }, 16)
+            .ok()
+            .map(CallerHash::Narrow);
+    }
+    // Big-endian bytes of the value without leading zero bytes (Python
+    // `value.to_bytes((value.bit_length() + 7) // 8, "big")`).
+    let padded = if digits.len() % 2 == 1 {
+        format!("0{digits}")
+    } else {
+        digits.to_owned()
+    };
+    let bytes: Vec<u8> = (0..padded.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&padded[i..i + 2], 16))
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let mut identity = [0u8; 32];
+    if bytes.len() <= identity.len() {
+        identity[32 - bytes.len()..].copy_from_slice(&bytes);
+    } else {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(CALLER_HASH_TAG);
+        hasher.update(&bytes);
+        identity = hasher.finalize().into();
+    }
+    Some(CallerHash::Wide(identity))
 }
 
 /// Complete result of one multimodal processor invocation.
@@ -356,10 +410,7 @@ pub(crate) fn process(
     let caller_hashes = std::mem::take(&mut mm.mm_hashes);
     let mut output = ctx.processor.process(input_ids, mm)?;
     output.result.validate(output.input_ids.len())?;
-    apply_caller_hashes(
-        output.result.items.iter_mut().map(|item| &mut item.hash),
-        &caller_hashes,
-    );
+    apply_caller_hashes(&mut output.result.items, &caller_hashes);
     ctx.processor.finalize(&mut output.result)?;
     output.result.validate(output.input_ids.len())?;
     let buffers = make_buffers(output.result, ctx.feature_shm)?;
@@ -1009,37 +1060,145 @@ mod tests {
         );
     }
 
+    fn hashed_items(hashes: &[u64]) -> Vec<MmEncodedItem> {
+        hashes
+            .iter()
+            .map(|&hash| MmEncodedItem {
+                modality: MmModality::Image,
+                feature: Tensor {
+                    shape: vec![1],
+                    data: TensorData::F32(vec![1.0]),
+                },
+                hash,
+                identity: None,
+                offsets: vec![(0, 0)],
+                model_specific_data: BTreeMap::new(),
+            })
+            .collect()
+    }
+
+    fn hashes_of(items: &[MmEncodedItem]) -> Vec<u64> {
+        items.iter().map(|item| item.hash).collect()
+    }
+
+    /// The first sidecar item's hash and identity (msgpack `bin`, omitted
+    /// when the item has none).
+    fn first_item_identity(buffers: &[Buffer]) -> (Option<u64>, Option<Vec<u8>>) {
+        let meta = decoded_meta(buffers);
+        let field = |map: &rmpv::Value, key: &str| {
+            map.as_map()
+                .unwrap()
+                .iter()
+                .find(|(k, _)| k.as_str() == Some(key))
+                .map(|(_, v)| v.clone())
+        };
+        let items = field(&meta, "items").unwrap();
+        let item = &items.as_array().unwrap()[0];
+        (
+            field(item, "hash").and_then(|hash| hash.as_u64()),
+            field(item, "identity").map(|identity| identity.as_slice().unwrap().to_vec()),
+        )
+    }
+
     /// Caller hashes override computed ones; mismatched lengths and malformed
     /// entries fall back per item, never reject (Python parity).
     #[test]
     fn caller_hashes_override_with_fallback() {
-        let mut hashes = vec![1, 2, 3];
-        apply_caller_hashes(hashes.iter_mut(), &[]);
-        assert_eq!(hashes, [1, 2, 3]);
+        let mut items = hashed_items(&[1, 2, 3]);
+        apply_caller_hashes(&mut items, &[]);
+        assert_eq!(hashes_of(&items), [1, 2, 3]);
 
-        apply_caller_hashes(hashes.iter_mut(), &["ff".into()]); // length mismatch
-        assert_eq!(hashes, [1, 2, 3]);
+        apply_caller_hashes(&mut items, &["ff".into()]); // length mismatch
+        assert_eq!(hashes_of(&items), [1, 2, 3]);
 
-        apply_caller_hashes(
-            hashes.iter_mut(),
-            &["ff".into(), "not-hex".into(), "0x10".into()],
-        );
-        assert_eq!(hashes, [0xff, 2, 0x10]);
+        apply_caller_hashes(&mut items, &["ff".into(), "not-hex".into(), "0x10".into()]);
+        assert_eq!(hashes_of(&items), [0xff, 2, 0x10]);
+        assert!(items.iter().all(|item| item.identity.is_none()));
     }
 
-    /// A full SHA-256 (what routers send) keeps its low 64 bits rather than
-    /// falling back, so the pad value matches Python's wide `int`.
+    /// A caller value below 2^64 stays the item hash, leading zeros or not. A
+    /// wider one (a full SHA-256, what routers send) becomes a 32-byte
+    /// identity instead of its low 64 bits, so two hashes that share those
+    /// bits no longer share prefix-cache keys.
     #[test]
-    fn caller_hashes_accept_arbitrary_width() {
-        let sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        let mut hashes = vec![1];
-        apply_caller_hashes(hashes.iter_mut(), &[sha256.into()]);
-        assert_eq!(hashes, [0xa495991b7852b855]);
-        assert_eq!(hashes[0] % (1 << 30), 944_945_237); // int(sha256, 16) % (1 << 30)
-
-        // Width alone is never malformed; a non-hex digit still is.
-        assert_eq!(parse_caller_hash(&"f".repeat(64)), Some(u64::MAX));
+    fn wide_caller_hashes_keep_every_bit() {
+        assert_eq!(parse_caller_hash("0x2a"), Some(CallerHash::Narrow(42)));
+        assert_eq!(
+            parse_caller_hash(&format!("{}2a", "0".repeat(62))),
+            Some(CallerHash::Narrow(42))
+        );
+        assert_eq!(
+            parse_caller_hash(&"f".repeat(16)),
+            Some(CallerHash::Narrow(u64::MAX))
+        );
         assert_eq!(parse_caller_hash("0x"), None);
         assert_eq!(parse_caller_hash(""), None);
+        assert_eq!(parse_caller_hash("sha256:ab"), None);
+
+        let sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let mut same_low_bits = "0".repeat(48);
+        same_low_bits.push_str(&sha256[48..]);
+        same_low_bits.replace_range(0..1, "1");
+        let mut items = hashed_items(&[1, 2]);
+        apply_caller_hashes(&mut items, &[sha256.into(), same_low_bits.clone()]);
+        let Some(CallerHash::Wide(expected)) = parse_caller_hash(sha256) else {
+            panic!("a 256-bit value is wide");
+        };
+        let mut want = [0u8; 32];
+        for (i, byte) in want.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&sha256[2 * i..2 * i + 2], 16).unwrap();
+        }
+        assert_eq!(expected, want, "up to 256 bits, the identity is the value");
+        assert_eq!(items[0].identity, Some(want));
+        assert_eq!(items[0].hash, 0xe3b0c44298fc1c14, "the leading 64 bits");
+        assert_ne!(
+            items[0].identity, items[1].identity,
+            "the same low 64 bits no longer collide"
+        );
+
+        // Wider than 256 bits (a SHA-512): folded with SHA-256, still distinct.
+        // The fold matches Python's `set_caller_hash` for 2**512 - 1.
+        let sha512 = "f".repeat(128);
+        let mut other = sha512.clone();
+        other.replace_range(0..1, "e");
+        let (Some(CallerHash::Wide(a)), Some(CallerHash::Wide(b))) =
+            (parse_caller_hash(&sha512), parse_caller_hash(&other))
+        else {
+            panic!("a 512-bit value is wide");
+        };
+        assert_ne!(a, b);
+        let hex: String = a.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(
+            hex,
+            "430b77ed09f1b8422b83a4e390dee6efedf6c1308740b746cf8ae7cd4363e50e"
+        );
+    }
+
+    /// A wide caller identity reaches Python through the sidecar beside the
+    /// hash it implies; a narrow one sends none.
+    #[test]
+    fn wide_caller_identity_rides_the_meta_sidecar() {
+        let ctx = MmContext::with_processor(
+            Arc::new(ExternalProcessor {
+                shape: vec![1],
+                offsets: vec![(1, 1)],
+            }),
+            false,
+        );
+        let sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let sha256_bytes: Vec<u8> = (0..32)
+            .map(|i| u8::from_str_radix(&sha256[2 * i..2 * i + 2], 16).unwrap())
+            .collect();
+        for (entry, identity, hash) in [
+            (sha256, Some(sha256_bytes), 0xe3b0c44298fc1c14_u64),
+            ("2a", None, 42),
+        ] {
+            let mm = MmData {
+                mm_hashes: vec![entry.to_owned()],
+                ..Default::default()
+            };
+            let (_, buffers) = process(&ctx, vec![1, 2], mm).unwrap();
+            assert_eq!(first_item_identity(&buffers), (Some(hash), identity));
+        }
     }
 }

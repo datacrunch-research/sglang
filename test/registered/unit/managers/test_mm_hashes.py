@@ -112,6 +112,39 @@ class TestMmHashesContract(CustomTestCase):
                 self.assertEqual(a.hash, b.hash)
                 self.assertEqual(a.padding_values(), b.padding_values())
 
+    def test_caller_hash_keeps_every_bit_of_a_wide_value(self):
+        """A caller hash below 2**64 is the item hash, as before; a wider one
+        is a 32-byte identity, so two SHA-256 values that share their low 64
+        bits no longer share pad sentinels (prefix-cache keys)."""
+        narrow = MultimodalDataItem(modality=Modality.IMAGE)
+        narrow.set_caller_hash(0x2A)
+        expected = MultimodalDataItem(modality=Modality.IMAGE)
+        expected.set_hash(0x2A)
+        self.assertEqual(narrow.padding_values(), expected.padding_values())
+        self.assertIsNone(narrow.identity)
+
+        sha256 = int(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 16
+        )
+        same_low_bits = (1 << 255) | (sha256 & ((1 << 64) - 1))
+        a = MultimodalDataItem(modality=Modality.IMAGE)
+        b = MultimodalDataItem(modality=Modality.IMAGE)
+        a.set_caller_hash(sha256)
+        b.set_caller_hash(same_low_bits)
+        self.assertEqual(a.identity, sha256.to_bytes(32, "big"))
+        self.assertEqual(a.hash, 0xE3B0C44298FC1C14)
+        self.assertNotEqual(a.padding_values(), b.padding_values())
+
+        wide = MultimodalDataItem(modality=Modality.IMAGE)
+        wide.set_caller_hash((1 << 512) - 1)
+        # The SHA-256 fold the Rust MM worker computes for the same value.
+        self.assertEqual(
+            wide.identity.hex(),
+            "430b77ed09f1b8422b83a4e390dee6efedf6c1308740b746cf8ae7cd4363e50e",
+        )
+        with self.assertRaises(ValueError):
+            MultimodalDataItem(modality=Modality.IMAGE).set_caller_hash(-1)
+
 
 class TestMultimodalHashExecutor(unittest.IsolatedAsyncioTestCase, CustomTestCase):
     def setUp(self):
