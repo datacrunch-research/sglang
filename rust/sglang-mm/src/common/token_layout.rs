@@ -50,6 +50,7 @@ pub fn apply_layout(
                 consumed = range.end;
                 out.extend_from_slice(text);
             }
+            Segment::Literal(ids) => out.extend_from_slice(ids),
             Segment::Media { item, pattern } => {
                 if consumed >= src.len() {
                     return Err(format!(

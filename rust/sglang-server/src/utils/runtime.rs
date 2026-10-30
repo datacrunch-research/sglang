@@ -44,6 +44,9 @@ pub struct Runtime {
     pub from_scheduler_tx: FromSchedulerTx,
     /// Wiring for the late-spawned MM pool ([`Runtime::start_mm_workers`]).
     mm_wiring: crate::multi_modality::worker::MmWiring,
+    /// The server tokenizer, for MM families that frame media with text
+    /// (Kimi K3); `None` under `skip_tokenizer_init`.
+    mm_tokenizer: Option<Arc<dyn sglang_processor::TextTokenizer>>,
     /// The shared core, which runs the MM pool processor's media hooks.
     core: crate::api_server::core::CoreHandle,
     /// Worker join handles, joined by `request_shutdown` / `Drop`.
@@ -71,7 +74,10 @@ impl Runtime {
         spec: crate::message::config::MmSpec,
         workers: usize,
     ) -> Result<(), String> {
-        let ctx = Arc::new(crate::multi_modality::worker::MmContext::new(spec)?);
+        let ctx = Arc::new(crate::multi_modality::worker::MmContext::new(
+            spec,
+            self.mm_tokenizer.clone(),
+        )?);
         self.spawn_mm_pool(workers, ctx);
         Ok(())
     }
@@ -192,6 +198,10 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
     )?
     .map(Arc::new);
     let dyn_tokenizer = tokenizer.as_ref().map(|t| t.tokenizer().clone());
+    // Kept for the late MM pool spawn (`Runtime::start_mm_workers`).
+    let mm_tokenizer = tokenizer
+        .clone()
+        .map(|t| t as Arc<dyn sglang_processor::TextTokenizer>);
 
     // The potentially slow/fallible tokenizer load above happens before the
     // ports become visible. Own both sockets before starting any worker or
@@ -396,6 +406,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
             mm_rx: mm_worker_rx,
             tm_tx: tok_manager_tx,
         },
+        mm_tokenizer,
         core,
         threads: Mutex::new(threads),
         shutdown_tx: Mutex::new(Some(shutdown_tx)),

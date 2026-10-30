@@ -204,8 +204,8 @@ impl MmFamilyProcessor for QwenVlProcessor {
     fn layout(&self, input_ids: &[i64], items: &[Geometry]) -> Result<TokenLayout, String> {
         let counts = items
             .iter()
-            .map(|Geometry::Grid(grid)| self.tokens_per_image(grid))
-            .collect::<Vec<_>>();
+            .map(|geometry| grid_of(geometry).map(|grid| self.tokens_per_image(grid)))
+            .collect::<Result<Vec<_>, _>>()?;
         token_layout::layout_by_placeholder(input_ids, self.spec.image_token_id, &counts)
     }
 
@@ -218,14 +218,25 @@ impl MmFamilyProcessor for QwenVlProcessor {
         let mrope_items = offsets
             .iter()
             .zip(items)
-            .map(|(&(start, end), Geometry::Grid(grid))| MropeItem {
-                start,
-                end,
-                grid: *grid,
+            .map(|(&(start, end), geometry)| {
+                grid_of(geometry).map(|grid| MropeItem {
+                    start,
+                    end,
+                    grid: *grid,
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         let (positions, delta) = mrope_image_only(input_len, &mrope_items, self.spec.merge_size)?;
         Ok(PositionOutput::MRope { positions, delta })
+    }
+}
+
+/// The patch grid of an item this family processed; any other geometry is a
+/// pipeline bug, reported rather than panicked on.
+fn grid_of(geometry: &Geometry) -> Result<&[u32; 3], String> {
+    match geometry {
+        Geometry::Grid(grid) => Ok(grid),
+        other => Err(format!("qwen_vl: unexpected item geometry {other:?}")),
     }
 }
 
@@ -441,7 +452,7 @@ mod python {
                 proc.process_item(&DecodedMedia::Image { rgb, height, width })
             })
             .map_err(PyValueError::new_err)?;
-        let Geometry::Grid([t, h, w]) = out.geometry;
+        let [t, h, w] = *grid_of(&out.geometry).map_err(PyValueError::new_err)?;
         let TensorData::F32(pixel_values) = out.feature.data else {
             return Err(PyValueError::new_err("qwen_vl: expected f32 feature"));
         };

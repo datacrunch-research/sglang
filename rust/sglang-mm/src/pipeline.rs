@@ -15,6 +15,9 @@ pub enum TensorData {
     I64(Vec<i64>),
     /// Raw BF16 bits, exposed to numpy as u16 without copying the allocation.
     Bf16(Vec<u16>),
+    /// Raw u8 pixels: Kimi K3's `[C, H, W]` source image, which the model
+    /// resizes and normalizes on the GPU (Python's deferred preprocessing).
+    U8(Vec<u8>),
 }
 
 impl TensorData {
@@ -23,6 +26,7 @@ impl TensorData {
             Self::F32(data) => data.len(),
             Self::I64(data) => data.len(),
             Self::Bf16(data) => data.len(),
+            Self::U8(data) => data.len(),
         }
     }
 
@@ -59,6 +63,15 @@ pub enum DecodedMedia {
 pub enum Geometry {
     /// `[t, h, w]` patch grid (`t` = 1 for still images).
     Grid([u32; 3]),
+    /// A `[t, h, w]` patch grid plus the source image's size and the item's
+    /// token count, for families whose prompt framing names the source size
+    /// (Kimi K3: `<|media_begin|>image {width}x{height}<|media_content|>`).
+    SizedGrid {
+        grid: [u32; 3],
+        width: u32,
+        height: u32,
+        tokens: usize,
+    },
 }
 
 /// One processed media item, mirroring Python's `MultimodalDataItem`: the
@@ -84,6 +97,11 @@ pub enum TokenPattern {
 pub enum Segment {
     /// Copy `src` (a range into the original ids) verbatim.
     Text(std::ops::Range<usize>),
+    /// Ids the family inserts that are neither source text nor media: framing
+    /// tokens around a media span (Kimi K3's `<|media_begin|>image WxH
+    /// <|media_content|>` and `<|media_end|>`). They consume no source token
+    /// and belong to no item's span.
+    Literal(Vec<i64>),
     /// Media item `item`'s token span.
     Media { item: usize, pattern: TokenPattern },
 }
@@ -94,6 +112,25 @@ pub enum Segment {
 /// once.
 pub struct TokenLayout {
     pub segments: Vec<Segment>,
+}
+
+/// The cache identity of one processed media item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ItemIdentity {
+    /// The 64-bit item hash (`MultimodalDataItem.hash`).
+    pub hash: u64,
+    /// A full 32-byte identity (`MultimodalDataItem.set_identity`): the
+    /// scheduler derives the item's four wide pad sentinels from it. `None`
+    /// leaves the sentinels to `hash`.
+    pub identity: Option<[u8; 32]>,
+}
+
+/// Text-to-ids access for a family whose expansion inserts text around media
+/// (Kimi K3's framing). Specials in `text` are encoded as special tokens, as
+/// Python's `tokenizer.encode(text, allowed_special="all")` does; no BOS is
+/// added. The server backs it with its own tokenizer.
+pub trait TextEncoder: Send + Sync {
+    fn encode(&self, text: &str) -> Result<Vec<i64>, String>;
 }
 
 /// Modalities a family accepts; the server's message layer rejects anything
@@ -128,6 +165,26 @@ pub trait MmFamilyProcessor: Send + Sync {
     /// equivalent (resize/tile/normalize/patchify → named tensors) plus the
     /// geometry `layout`/`positions` will need.
     fn process_item(&self, media: &DecodedMedia) -> Result<ProcessedItem, String>;
+
+    /// Turn one item's encoded source bytes into the processed item and its
+    /// cache identity. The default decodes to RGB ([`crate::common::decode_rgb`];
+    /// inputs PIL accepts but it refuses, e.g. 16-bit PNG, reject the request),
+    /// runs [`Self::process_item`], and identifies the item by
+    /// [`crate::common::content_hash_u64`] of the bytes. A family whose decode
+    /// or identity differs (Kimi K3 keeps alpha and derives a full identity
+    /// from content, config and grid) overrides this.
+    fn process_encoded(&self, bytes: &[u8]) -> Result<(ProcessedItem, ItemIdentity), String> {
+        let hash = crate::common::content_hash_u64(bytes);
+        let (rgb, height, width) = crate::common::decode_rgb(bytes)?;
+        let item = self.process_item(&DecodedMedia::Image { rgb, height, width })?;
+        Ok((
+            item,
+            ItemIdentity {
+                hash,
+                identity: None,
+            },
+        ))
+    }
 
     /// Describe how the prompt expands around the processed items (in
     /// prompt order). Sees the full original prompt and all items, so

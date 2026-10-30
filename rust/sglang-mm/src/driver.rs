@@ -5,8 +5,8 @@
 //! [`MmFamilyProcessor`] (see `pipeline.rs`). Families produce data; they
 //! cannot alter orchestration.
 
-use crate::common::{self, fetch, par, token_layout};
-use crate::pipeline::{DecodedMedia, MmFamilyProcessor, PositionOutput, ProcessedItem};
+use crate::common::{fetch, par, token_layout};
+use crate::pipeline::{ItemIdentity, MmFamilyProcessor, PositionOutput, ProcessedItem};
 
 /// Per-request media byte bound. Every source consumes this aggregate budget;
 /// [`fetch::MAX_FETCH_BYTES`] additionally caps each remote I/O stream. There
@@ -38,11 +38,16 @@ pub struct MmInput {
 pub struct OutputItem {
     pub feature: crate::pipeline::Tensor,
     pub aux: crate::pipeline::NamedTensors,
-    /// [`common::content_hash_u64`] of the raw encoded source bytes — the same
-    /// identity role as the Python path's `hash_feature`, but a different
-    /// algorithm, so hashes are consistent within the server pipeline and
-    /// never comparable across the two paths.
+    /// The family's item hash: by default [`crate::common::content_hash_u64`]
+    /// of the raw encoded source bytes — the same identity role as the Python
+    /// path's `hash_feature`, but a different algorithm, so hashes are
+    /// consistent within the server pipeline and never comparable across the
+    /// two paths. A family with a full identity (Kimi K3) sets its leading 64
+    /// bits, as Python's `set_identity` does.
     pub hash: u64,
+    /// The family's full 32-byte identity, when it has one (Kimi K3: the same
+    /// digest as Python's `kimi_image_identity`).
+    pub identity: Option<[u8; 32]>,
 }
 
 /// The per-request result parked for the scheduler drain.
@@ -96,15 +101,10 @@ pub fn process(family: &dyn MmFamilyProcessor, input: MmInput) -> Result<Output,
         total = add_media_bytes(total, bytes.len())?;
         fetched.push(bytes);
     }
-    let processed: Vec<(ProcessedItem, u64)> =
-        par::try_map(&fetched, |bytes| -> Result<(ProcessedItem, u64), String> {
-            let hash = common::content_hash_u64(bytes);
-            // Inputs PIL accepts but decode_rgb refuses (e.g. 16-bit PNG)
-            // error here and reject the request.
-            let (rgb, height, width) = common::decode_rgb(bytes)?;
-            let item = family.process_item(&DecodedMedia::Image { rgb, height, width })?;
-            Ok((item, hash))
-        })?;
+    // Decode, preprocess and identify each item; the family owns all three
+    // (`MmFamilyProcessor::process_encoded`).
+    let processed: Vec<(ProcessedItem, ItemIdentity)> =
+        par::try_map(&fetched, |bytes| family.process_encoded(bytes))?;
 
     let input_ids = input.input_ids;
     let geometries = processed
@@ -119,10 +119,11 @@ pub fn process(family: &dyn MmFamilyProcessor, input: MmInput) -> Result<Output,
         input_ids: expanded.input_ids,
         items: processed
             .into_iter()
-            .map(|(item, hash)| OutputItem {
+            .map(|(item, identity)| OutputItem {
                 feature: item.feature,
                 aux: item.aux,
-                hash,
+                hash: identity.hash,
+                identity: identity.identity,
             })
             .collect(),
         offsets: expanded.offsets,
