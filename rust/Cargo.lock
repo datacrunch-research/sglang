@@ -1091,7 +1091,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "dynamo-protocols",
- "dynamo-tokenizers",
+ "dynamo-tokenizers 3.1.0",
  "either",
  "minijinja",
  "minijinja-contrib",
@@ -1120,6 +1120,29 @@ dependencies = [
  "strum 0.27.2",
  "tiktoken-rs",
  "tokenizers 0.21.4",
+ "tracing",
+]
+
+[[package]]
+name = "dynamo-tokenizers"
+version = "4.0.0"
+source = "git+https://github.com/Venkat2811/frontend-crates.git?rev=9e52e51443351bdd6769fd5fe3388a124ba0de34#9e52e51443351bdd6769fd5fe3388a124ba0de34"
+dependencies = [
+ "aho-corasick",
+ "anyhow",
+ "base64 0.22.1",
+ "basetenkenizer",
+ "blake3",
+ "fancy-regex 0.13.0",
+ "fastokens",
+ "moka",
+ "rayon",
+ "rustc-hash 1.1.0",
+ "serde",
+ "serde_json",
+ "strum 0.27.2",
+ "tiktoken-rs",
+ "tokenizers 0.23.2",
  "tracing",
 ]
 
@@ -1244,12 +1267,14 @@ dependencies = [
 
 [[package]]
 name = "fastokens"
-version = "0.3.1"
+version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35ff8cf975d8f772e7d4c3be439659b0b23b1ae1086ebee7204573807053ff7f"
+checksum = "84024abb104481ef6b9c55df497f941f92f49515c428afd78b990efc906f1aa6"
 dependencies = [
+ "aho-corasick",
  "daachorse 1.0.1",
  "fancy-regex 0.17.0",
+ "fastrand",
  "hf-hub",
  "icu_normalizer",
  "libc",
@@ -1261,6 +1286,7 @@ dependencies = [
  "serde_json",
  "strum 0.27.2",
  "thiserror",
+ "unicode-normalization-alignments",
  "ureq",
 ]
 
@@ -4036,7 +4062,7 @@ dependencies = [
  "dynamo-parsers",
  "dynamo-protocols",
  "dynamo-renderer",
- "dynamo-tokenizers",
+ "dynamo-tokenizers 4.0.0",
  "futures",
  "hf-hub",
  "minijinja",

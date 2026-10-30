@@ -9,7 +9,7 @@ use std::path::Path;
 
 use serde_json::Value;
 use sglang_processor::dynamo_renderer::RenderedPrompt;
-use sglang_processor::dynamo_tokenizers::Tokenizer;
+use sglang_processor::dynamo_tokenizers::{EncodeSegment, Tokenizer};
 use sglang_processor::{
     ChatFormatter, ChatFormatterOptions, load_tokenizer, resolve_tokenizer_file,
     select_chat_formatter,
@@ -150,7 +150,12 @@ fn encode(tokenizer: &Tokenizer, prompt: &RenderedPrompt, prefix: &str, bos: &Va
     let ids = |text: &str| tokenizer.encode(text).unwrap().token_ids().to_vec();
     let mut out = match prompt.encode_segments() {
         Some(segments) => tokenizer
-            .encode_segments(&segments)
+            .encode_segments(
+                &segments
+                    .iter()
+                    .map(|segment| EncodeSegment::new(segment.text, segment.allow_special))
+                    .collect::<Vec<_>>(),
+            )
             .unwrap()
             .token_ids()
             .to_vec(),

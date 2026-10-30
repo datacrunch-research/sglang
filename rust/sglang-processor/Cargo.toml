@@ -47,7 +47,11 @@ uuid = { workspace = true, optional = true }
 minijinja = { version = "2.24.0", features = ["unstable_machinery"], optional = true }
 
 # Keep this paired with the server until Dynamo exposes a smaller tokenizer API.
-dynamo-tokenizers = { version = "3.1.0", optional = true }
+# dynamo-tokenizers 4.0.0 (upstream frontend-crates main) with the Kimi reference cuts in tiktoken
+# encodes and the heap merge path, from Venkat2811/frontend-crates `kimi-k3-latest-20261030`.
+# dynamo-renderer 7.1.1 still links 3.1.x: its encode segments are converted where they meet this
+# tokenizer (sglang-server message/request.rs, tests/parity.rs).
+dynamo-tokenizers = { git = "https://github.com/Venkat2811/frontend-crates.git", rev = "9e52e51443351bdd6769fd5fe3388a124ba0de34", optional = true }
 
 [dev-dependencies]
 sha2 = "0.10"

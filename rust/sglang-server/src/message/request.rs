@@ -568,12 +568,16 @@ impl RenderedChat {
         if let Some(ids) = &self.ids {
             return Ok(ids.iter().map(|&id| id as i32).collect());
         }
-        let segments = self.prompt.encode_segments().unwrap_or_else(|| {
-            vec![sglang_processor::dynamo_tokenizers::EncodeSegment::new(
-                self.prompt.as_str(),
-                true,
-            )]
-        });
+        use sglang_processor::dynamo_tokenizers::EncodeSegment;
+        // The renderer's segments come from its own dynamo-tokenizers; rebuild them
+        // as the processor tokenizer's type.
+        let segments = match self.prompt.encode_segments() {
+            Some(segments) => segments
+                .iter()
+                .map(|segment| EncodeSegment::new(segment.text, segment.allow_special))
+                .collect(),
+            None => vec![EncodeSegment::new(self.prompt.as_str(), true)],
+        };
         tokenizer.encode_chat(&segments, &self.continuation)
     }
 
