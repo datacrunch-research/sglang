@@ -300,7 +300,14 @@ async fn any_policy_picks_the_rank_with_the_deepest_prefix() {
     cfg.model.disable_input_ids_forwarding = true;
     let tokenizers = TokenizerRegistry::load_from_config(&cfg).unwrap();
     let tokens = request_tokens_for(&tokenizers, &ModelId(MODEL.into()), &body()).unwrap();
-    let hashes = compute_block_hashes(&tokens.ids.iter().map(|&t| u64::from(t)).collect::<Vec<u64>>(), 1);
+    let hashes = compute_block_hashes(
+        &tokens
+            .ids
+            .iter()
+            .map(|&t| u64::from(t))
+            .collect::<Vec<u64>>(),
+        1,
+    );
     let tree = Arc::new(HashTree::new());
     tree.insert(&KvWorkerId::new(worker.url.clone(), 1), None, &hashes[..1]);
     tree.insert(&KvWorkerId::new(worker.url.clone(), 3), None, &hashes);

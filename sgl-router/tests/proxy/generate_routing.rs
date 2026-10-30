@@ -103,7 +103,13 @@ async fn generate_routes_text_to_the_worker_caching_its_prefix() {
         MockWorker::start(vec![]).await,
     );
     let tree = HashTree::new();
-    let hashes = compute_block_hashes(&prompt_ids("local radix cache hit").iter().map(|&t| u64::from(t)).collect::<Vec<u64>>(), 1);
+    let hashes = compute_block_hashes(
+        &prompt_ids("local radix cache hit")
+            .iter()
+            .map(|&t| u64::from(t))
+            .collect::<Vec<u64>>(),
+        1,
+    );
     tree.insert(&KvWorkerId::new(cached.url.clone(), 0), None, &hashes);
     let workers = [(&uncached, WorkerMode::Plain), (&cached, WorkerMode::Plain)];
     let app = radix_router(&workers, tree);
