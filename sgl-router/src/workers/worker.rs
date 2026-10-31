@@ -274,6 +274,9 @@ pub struct Worker {
     mm: Option<Arc<crate::workers::introspect::EngineMm>>,
     /// Whether the engine answered `/server_info` when this worker was built.
     introspected: bool,
+    /// Carried from [`crate::discovery::WorkerSpec::role_unknown`]: the role is
+    /// not known yet, so the worker is in no model pool.
+    role_unknown: bool,
 }
 
 impl Worker {
@@ -330,6 +333,7 @@ impl Worker {
             supports_inline_system,
             mm,
             introspected: answered,
+            role_unknown: spec.role_unknown,
         }
     }
 
@@ -345,6 +349,12 @@ impl Worker {
     /// the reconcile loop keeps asking (an engine still loading at start).
     pub fn introspected(&self) -> bool {
         self.introspected
+    }
+
+    /// Whether the worker's PD role is still unknown: the backend could not
+    /// know it, and the engine has not answered `/server_info` yet.
+    pub fn role_unknown(&self) -> bool {
+        self.role_unknown
     }
 
     /// The engine's multimodal launch args, when `/server_info` reported them.

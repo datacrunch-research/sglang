@@ -27,6 +27,8 @@ async fn emits_one_added_per_url_with_plain_seed() {
             DiscoveryEvent::Added(spec) => {
                 // mode / model_ids / bootstrap_port are seeded as Plain/empty/None;
                 // the worker manager fills them from /server_info post-discovery.
+                // A URL carries no role, so the Plain mode is only a placeholder.
+                assert!(spec.role_unknown);
                 assert_eq!(spec.mode, WorkerMode::Plain);
                 assert!(spec.model_ids.is_empty());
                 assert_eq!(spec.bootstrap_port, None);

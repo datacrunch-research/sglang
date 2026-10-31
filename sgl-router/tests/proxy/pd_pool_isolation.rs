@@ -554,6 +554,7 @@ fn pd_spec(
         bootstrap_port: port,
         version_group: group.map(str::to_owned),
         services: Default::default(),
+        role_unknown: false,
     }
 }
 

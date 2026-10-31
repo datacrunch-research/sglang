@@ -7,19 +7,20 @@
 //! per entry. After the initial fan-out the task exits — there is no
 //! hot-reload; topology changes require a restart.
 //!
-//! Each emitted [`WorkerSpec`] uses the URL itself as the `WorkerId` and
-//! seeds `mode = Plain` with empty `model_ids` and `bootstrap_port = None`.
-//! The worker manager fills those in from each worker's `/server_info`
-//! response (see [`crate::workers::introspect`]) and overrides the seeded
-//! mode/bootstrap when the worker self-discloses a PD role — so prefill,
-//! decode, and plain workers can all appear in the same `urls` list and
-//! end up classified correctly.
+//! Each emitted [`WorkerSpec`] uses the URL itself as the `WorkerId`, with
+//! empty `model_ids` and `bootstrap_port = None`. A URL carries no PD role,
+//! so the spec is marked `role_unknown` (its `mode = Plain` is a
+//! placeholder): the worker stays out of every model pool until its
+//! engine answers `/server_info`, and the worker manager takes the role and
+//! bootstrap port from that answer (see [`crate::workers::introspect`]) —
+//! so prefill, decode, and plain workers can all appear in the same `urls`
+//! list and end up classified correctly, whichever answers first.
 //!
 //! Requires modern SGLang that exposes `disaggregation_mode` in
-//! `/server_info`. Workers on older SGLang versions that predate that
-//! field stay seeded as `Plain` because the manager has no signal to
-//! override with — operators running PD with such a worker should use
-//! the K8s backend (which can still classify via pod labels).
+//! `/server_info`. A worker whose `/server_info` answers without that field
+//! registers as `Plain`, because the manager has no signal to override
+//! with — operators running PD with such a worker should use the K8s
+//! backend (which can still classify via pod labels).
 
 use crate::config::StaticUrlsDiscoveryConfig;
 use crate::discovery::{DiscoveryEvent, WorkerId, WorkerMode, WorkerSpec};
@@ -42,6 +43,7 @@ pub async fn spawn(
                 url,
                 mode: WorkerMode::Plain,
                 model_ids: Vec::new(),
+                role_unknown: true,
                 ..Default::default()
             };
             if tx.send(DiscoveryEvent::Added(spec)).await.is_err() {
