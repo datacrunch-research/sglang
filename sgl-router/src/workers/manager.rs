@@ -417,11 +417,11 @@ async fn handle_discovery_event(
 ///
 /// A worker that answers but never advertises a `served_model_name` (or,
 /// for a prefill, its bootstrap port), or whose `/server_info` has not yet
-/// yielded its OpenAI settings (an engine still loading when the router
-/// started: the static `--model-id` resolves its model, but the parsers,
-/// context length and media capability the cell reports come only from the
-/// engine), also stays in this set and is re-introspected every interval — a
-/// benign, bounded poll, not a leak.
+/// yielded its OpenAI settings (an engine still loading whose backend
+/// classified its role: `/model_info` resolves its model, but the parsers,
+/// context length and media capability the cell reports come only from
+/// `/server_info`), also stays in this set and is re-introspected every
+/// interval — a benign, bounded poll, not a leak.
 /// It is never escalated, so the per-attempt logging stays at `debug!`;
 /// the introspector emits the `warn!` that surfaces a persistently failing
 /// worker.
@@ -456,6 +456,7 @@ fn reconcile_unresolved_workers(
             bootstrap_port: worker.bootstrap_port(),
             version_group: worker.version_group().map(str::to_owned),
             services: worker.services(),
+            role_unknown: worker.role_unknown(),
         };
         // `debug!` not `info!`: this fires every interval for each
         // still-unresolved worker, so info-level would spam for one that is
@@ -568,6 +569,21 @@ async fn register_one(
             spec.mode = new_mode;
             spec.bootstrap_port = new_port;
         }
+    }
+    // A role the backend could not know (static URLs) is settled once the
+    // engine answers `/server_info`: the role it reports, or Plain for an
+    // engine that predates `disaggregation_mode`. A model alone settles
+    // nothing — an engine still loading answers `/model_info` from its launch
+    // config before `/server_info`. Until then the registry keeps the worker
+    // out of every pool, and the reconcile loop asks again (`!introspected`).
+    if info.answered {
+        spec.role_unknown = false;
+    } else if spec.role_unknown && registry.get(&spec.id).is_none() {
+        tracing::info!(
+            worker_url = %worker_url,
+            "worker manager: /server_info has not answered, so the worker's PD role is unknown; \
+             holding it out of its model pool until it does",
+        );
     }
     // `--decode-dispatch-limit` sends a request to decode only once earlier
     // KV has arrived, and a default prefill engine computes only once decode
@@ -1409,6 +1425,7 @@ mod tests {
             bootstrap_port: None,
             version_group: Some("v1".into()),
             services: ["ns/prefill".into()].into(),
+            role_unknown: false,
         }))
         .await
         .unwrap();
@@ -1439,10 +1456,9 @@ mod tests {
         manager.await.unwrap();
     }
 
-    /// A worker that registers with empty `model_ids` because
-    /// A static worker (`--worker-urls`, its model from `--model-id`) routes
-    /// from the start, so it is never "unresolved"; its engine's OpenAI
-    /// settings (parsers, context length) still come only from
+    /// A worker whose backend classified its role (K8s) routes once
+    /// `/model_info` resolves its model, so it is never "unresolved"; its
+    /// engine's OpenAI settings (parsers, context length) still come only from
     /// `/server_info`, which an engine still loading does not answer. The
     /// reconcile loop must keep asking until it does, or the cell would report
     /// no chat settings for the life of the router.
@@ -1525,6 +1541,7 @@ mod tests {
         let _ = manager_handle.await;
     }
 
+    /// A worker that registers with empty `model_ids` because
     /// `/server_info` was failing at `Added` time must be re-introspected
     /// by the periodic reconcile loop and join its model pool once
     /// `/server_info` recovers — with NO new discovery event. This is the
@@ -2003,5 +2020,294 @@ mod tests {
         drop(tx);
         let _ = manager_handle.await;
         let _ = shutdown_tx.send(());
+    }
+
+    /// Fake engine still loading its weights behind a frontend that is
+    /// already up: `/model_info` answers from the launch config at once, while
+    /// `/server_info` (a scheduler round-trip) 503s until `ready` flips.
+    async fn spawn_loading_worker(
+        body: Value,
+        ready: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (String, oneshot::Sender<()>) {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        let body = Arc::new(body);
+        let model_info = {
+            let body = body.clone();
+            move || {
+                let body = body.clone();
+                async move { Json((*body).clone()) }
+            }
+        };
+        let server_info = move || {
+            let body = body.clone();
+            let ready = ready.clone();
+            async move {
+                if ready.load(std::sync::atomic::Ordering::SeqCst) {
+                    Json((*body).clone()).into_response()
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE.into_response()
+                }
+            }
+        };
+        serve(
+            Router::new()
+                .route("/model_info", get(model_info))
+                .route("/server_info", get(server_info)),
+        )
+        .await
+    }
+
+    /// The manager behind the static-URL backend, as `--worker-urls` runs it.
+    /// Returns the discovery and manager tasks; abort the first to stop both.
+    async fn spawn_static_router(
+        urls: Vec<String>,
+        registry: Arc<WorkerRegistry>,
+    ) -> (JoinHandle<()>, JoinHandle<()>) {
+        let (tx, rx) = mpsc::channel(8);
+        let discovery =
+            crate::discovery::static_urls::spawn(StaticUrlsDiscoveryConfig { urls }, tx)
+                .await
+                .unwrap();
+        let manager = tokio::spawn(run_with_introspector_and_reconcile(
+            rx,
+            registry,
+            None,
+            None,
+            None,
+            fast_introspector(),
+            Duration::from_millis(100),
+        ));
+        (discovery, manager)
+    }
+
+    /// Model `m`'s pool as sorted (url, mode, bootstrap port) rows.
+    fn pool_of_m(registry: &WorkerRegistry) -> Vec<(String, WorkerMode, Option<u16>)> {
+        let mut rows: Vec<_> = registry
+            .workers_for(&ModelId("m".into()))
+            .iter()
+            .map(|w| (w.url.clone(), w.mode(), w.bootstrap_port()))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+
+    /// Model `m`'s pool must never mix Plain with Prefill/Decode workers.
+    fn assert_unmixed(registry: &WorkerRegistry) {
+        let pool = pool_of_m(registry);
+        let plain = pool.iter().filter(|r| r.1 == WorkerMode::Plain).count();
+        assert!(
+            plain == 0 || plain == pool.len(),
+            "model pool mixes Plain with PD workers: {pool:?}"
+        );
+    }
+
+    /// Poll until `done` holds (true) or 5 s pass (false), checking
+    /// [`assert_unmixed`] on every look.
+    async fn settle(registry: &WorkerRegistry, done: impl Fn(&WorkerRegistry) -> bool) -> bool {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                assert_unmixed(registry);
+                if done(registry) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// Whether `invariant` holds on every look for `period` (several reconcile
+    /// ticks), checking [`assert_unmixed`] too.
+    async fn holds_for(
+        registry: &WorkerRegistry,
+        period: Duration,
+        invariant: impl Fn(&WorkerRegistry) -> bool,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + period;
+        while tokio::time::Instant::now() < deadline {
+            assert_unmixed(registry);
+            if !invariant(registry) {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        true
+    }
+
+    /// Registered (by id) but in no model pool: the hold for a worker whose
+    /// role is not known yet.
+    fn held(registry: &WorkerRegistry, url: &str) -> bool {
+        registry
+            .get(&WorkerId(url.into()))
+            .is_some_and(|w| w.model_ids.is_empty())
+    }
+
+    fn prefill_body() -> Value {
+        json!({"served_model_name": "m", "disaggregation_mode": "prefill",
+               "disaggregation_bootstrap_port": 8998})
+    }
+
+    fn decode_body() -> Value {
+        json!({"served_model_name": "m", "disaggregation_mode": "decode"})
+    }
+
+    /// A static 1 prefill + 2 decode set whose prefill is still loading when
+    /// the router starts: the decodes answer `/server_info` and register as
+    /// Decode, while the prefill resolves its model from `/model_info` but not
+    /// its role. It must stay registered outside the pool, not be refused for
+    /// good beside the decodes, and once its `/server_info` answers it must
+    /// join as Prefill with its bootstrap port, with no new discovery event —
+    /// and without any write to the decodes' entries.
+    #[tokio::test]
+    async fn static_prefill_loading_at_start_joins_as_prefill_once_it_answers() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let prefill_ready = Arc::new(AtomicBool::new(false));
+        let (prefill, _p) = spawn_loading_worker(prefill_body(), prefill_ready.clone()).await;
+        let (decode0, _d0) =
+            spawn_loading_worker(decode_body(), Arc::new(AtomicBool::new(true))).await;
+        let (decode1, _d1) =
+            spawn_loading_worker(decode_body(), Arc::new(AtomicBool::new(true))).await;
+        let registry = Arc::new(WorkerRegistry::default());
+        let (discovery, manager) = spawn_static_router(
+            vec![prefill.clone(), decode0.clone(), decode1.clone()],
+            registry.clone(),
+        )
+        .await;
+
+        let decodes = {
+            let mut rows = vec![
+                (decode0.clone(), WorkerMode::Decode, None),
+                (decode1.clone(), WorkerMode::Decode, None),
+            ];
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            rows
+        };
+        assert!(
+            settle(&registry, |r| pool_of_m(r) == decodes && held(r, &prefill)).await,
+            "the decodes must route while the prefill loads, and the prefill must \
+             stay registered outside the pool; pool: {:?}",
+            pool_of_m(&registry),
+        );
+        let entries = |r: &WorkerRegistry| {
+            [&decode0, &decode1].map(|url| r.get(&WorkerId(url.clone())).unwrap())
+        };
+        let before = entries(&registry);
+        // Several reconcile ticks pass with the prefill still loading.
+        assert!(
+            holds_for(&registry, Duration::from_millis(800), |r| {
+                pool_of_m(r) == decodes && held(r, &prefill)
+            })
+            .await,
+            "a prefill whose role is unknown must stay held; pool: {:?}",
+            pool_of_m(&registry),
+        );
+        prefill_ready.store(true, Ordering::SeqCst);
+
+        let mut want = decodes;
+        want.push((prefill, WorkerMode::Prefill, Some(8998)));
+        want.sort_by(|a, b| a.0.cmp(&b.0));
+        assert!(
+            settle(&registry, |r| pool_of_m(r) == want).await,
+            "the prefill must end registered as Prefill with its bootstrap port; pool: {:?}",
+            pool_of_m(&registry),
+        );
+        for (was, is) in before.iter().zip(entries(&registry)) {
+            assert!(
+                Arc::ptr_eq(was, &is),
+                "registering the prefill must not rewrite a decode's entry",
+            );
+        }
+
+        discovery.abort();
+        manager.await.unwrap();
+    }
+
+    /// A static set that is entirely down when the router starts: each engine
+    /// resolves its model from `/model_info` but none answers `/server_info`,
+    /// so no role is known and none may enter the pool — not on the Plain
+    /// placeholder, which would block the roles they report later — however
+    /// many reconcile ticks pass. As the engines come up, in either order,
+    /// each joins in the role it reports, and a plain set ends plain.
+    #[tokio::test]
+    async fn static_set_loading_at_start_settles_in_reported_roles_in_either_order() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let plain = json!({"served_model_name": "m", "disaggregation_mode": "null"});
+        let pd = [prefill_body(), decode_body(), decode_body()];
+        for (case, bodies, up_order) in [
+            ("prefill first", pd.clone(), [0, 1, 2]),
+            ("prefill last", pd, [1, 2, 0]),
+            (
+                "plain set",
+                [plain.clone(), plain.clone(), plain],
+                [2, 0, 1],
+            ),
+        ] {
+            let mut urls = Vec::new();
+            let mut ready = Vec::new();
+            let mut shutdowns = Vec::new();
+            let mut want = Vec::new();
+            for body in bodies {
+                let flag = Arc::new(AtomicBool::new(false));
+                let (url, shutdown) = spawn_loading_worker(body.clone(), flag.clone()).await;
+                let role = match body["disaggregation_mode"].as_str() {
+                    Some("prefill") => (WorkerMode::Prefill, Some(8998)),
+                    Some("decode") => (WorkerMode::Decode, None),
+                    _ => (WorkerMode::Plain, None),
+                };
+                want.push((url.clone(), role.0, role.1));
+                urls.push(url);
+                ready.push(flag);
+                shutdowns.push(shutdown);
+            }
+            want.sort_by(|a, b| a.0.cmp(&b.0));
+            let registry = Arc::new(WorkerRegistry::default());
+            let (discovery, manager) = spawn_static_router(urls.clone(), registry.clone()).await;
+
+            let all_held = |r: &WorkerRegistry| urls.iter().all(|url| held(r, url));
+            assert!(
+                settle(&registry, all_held).await,
+                "{case}: all three must register while loading; pool: {:?}",
+                pool_of_m(&registry),
+            );
+            assert!(
+                holds_for(&registry, Duration::from_millis(800), all_held).await,
+                "{case}: no engine may enter the pool before it reports its role; pool: {:?}",
+                pool_of_m(&registry),
+            );
+            for i in up_order {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                ready[i].store(true, Ordering::SeqCst);
+            }
+            assert!(
+                settle(&registry, |r| pool_of_m(r) == want).await,
+                "{case}: every engine must end in the role it reports; pool: {:?}",
+                pool_of_m(&registry),
+            );
+
+            discovery.abort();
+            manager.await.unwrap();
+        }
+    }
+
+    /// An engine whose `/server_info` answers without `disaggregation_mode`
+    /// (one that predates the field) settles the role as Plain, exactly as
+    /// before: it joins the pool on its first introspection.
+    #[tokio::test]
+    async fn static_worker_whose_server_info_predates_the_role_field_joins_as_plain() {
+        let (url, _w) = spawn_fake_server_info_worker(json!({"served_model_name": "m"})).await;
+        let registry = Arc::new(WorkerRegistry::default());
+        let (discovery, manager) = spawn_static_router(vec![url.clone()], registry.clone()).await;
+        let want = [(url, WorkerMode::Plain, None)];
+        assert!(
+            settle(&registry, |r| pool_of_m(r) == want).await,
+            "an answered /server_info without a role must register Plain; pool: {:?}",
+            pool_of_m(&registry),
+        );
+        discovery.abort();
+        manager.await.unwrap();
     }
 }

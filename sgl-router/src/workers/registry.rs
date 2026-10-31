@@ -80,12 +80,21 @@ impl WorkerRegistry {
     /// in `KvEventIndex` / `RouterInflightLoadRegistry` if so). Doing that
     /// cleanup here would leak orphan state into those sidecars when
     /// a caller actually wanted to keep the prior entry.
+    ///
+    /// A spec whose role is unknown ([`WorkerSpec::role_unknown`]) is
+    /// registered with no model: its mode is only a placeholder, so it can
+    /// neither mix with nor block the roles other workers report. It stays in
+    /// `by_id`, where the manager's reconcile loop finds it, until a spec with
+    /// a known role replaces it.
     pub fn add_with_cb(
         &self,
-        spec: WorkerSpec,
+        mut spec: WorkerSpec,
         cb: Option<CircuitBreakerConfig>,
         profile: impl Into<EngineProfile>,
     ) -> Result<(), AddWorkerError> {
+        if spec.role_unknown {
+            spec.model_ids.clear();
+        }
         let incoming_mode = spec.mode;
         // Hold the write lock for the entire validate→insert sequence.
         // Without it, two concurrent callers for conflicting modes on
@@ -545,6 +554,47 @@ mod tests {
             r.workers_for_mode(&ModelId("m".into()), WorkerMode::Decode)
                 .len(),
             1,
+        );
+    }
+
+    /// A spec whose role is unknown registers with no model: it joins no
+    /// pool, PD or plain, so it neither mixes with nor blocks the roles other
+    /// workers report. Once its role is known it joins the pool, and no other
+    /// worker's entry is touched.
+    #[test]
+    fn worker_of_unknown_role_joins_no_pool_until_its_role_is_known() {
+        let unknown = |id: &str| WorkerSpec {
+            role_unknown: true,
+            ..spec(id, WorkerMode::Plain, &["m"])
+        };
+        let m = ModelId("m".into());
+        let pool = |r: &WorkerRegistry| {
+            let mut ids: Vec<_> = r.workers_for(&m).iter().map(|w| w.id.0.clone()).collect();
+            ids.sort();
+            ids
+        };
+
+        let r = WorkerRegistry::default();
+        r.add(unknown("p")).unwrap();
+        r.add(spec("d", WorkerMode::Decode, &["m"]))
+            .expect("an unknown role must not block a PD worker");
+        let held = r.get(&WorkerId("p".into())).expect("still registered");
+        assert!(held.model_ids.is_empty() && held.role_unknown());
+        r.add(unknown("p"))
+            .expect("nor be refused beside one, and stays registered");
+        assert_eq!(pool(&r), ["d"]);
+        let d = r.get(&WorkerId("d".into())).unwrap();
+        r.add(spec("p", WorkerMode::Prefill, &["m"])).unwrap();
+        assert_eq!(pool(&r), ["d", "p"]);
+        assert!(Arc::ptr_eq(&d, &r.get(&WorkerId("d".into())).unwrap()));
+
+        let r = WorkerRegistry::default();
+        r.add(spec("a", WorkerMode::Plain, &["m"])).unwrap();
+        r.add(unknown("b")).unwrap();
+        assert_eq!(
+            pool(&r),
+            ["a"],
+            "not even a plain pool takes an unknown role"
         );
     }
 

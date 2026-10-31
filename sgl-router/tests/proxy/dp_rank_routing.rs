@@ -62,6 +62,7 @@ fn router(
             bootstrap_port: (mode == WorkerMode::Prefill).then_some(8998),
             version_group: None,
             services: Default::default(),
+            role_unknown: false,
         };
         let profile = EngineProfile {
             protocol: WireProtocol::default(),
