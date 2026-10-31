@@ -80,12 +80,21 @@ impl WorkerRegistry {
     /// in `KvEventIndex` / `RouterInflightLoadRegistry` if so). Doing that
     /// cleanup here would leak orphan state into those sidecars when
     /// a caller actually wanted to keep the prior entry.
+    ///
+    /// One conflict is not a rejection: a Prefill/Decode worker whose engine
+    /// answered `/server_info` outranks Plain workers whose engine has not.
+    /// Their Plain role is only the discovery seed (static URLs seed every
+    /// worker Plain), so they move out of the model pool and stay registered
+    /// with no model, which the manager's reconcile loop re-introspects until
+    /// their engine reports its role. Otherwise a static PD set that started
+    /// before its engines could answer would refuse every reported role.
     pub fn add_with_cb(
         &self,
         spec: WorkerSpec,
         cb: Option<CircuitBreakerConfig>,
         profile: impl Into<EngineProfile>,
     ) -> Result<(), AddWorkerError> {
+        let profile = profile.into();
         let incoming_mode = spec.mode;
         // Hold the write lock for the entire validate→insert sequence.
         // Without it, two concurrent callers for conflicting modes on
@@ -109,12 +118,20 @@ impl WorkerRegistry {
         // the purposes of the check (otherwise an upsert of an unmixed
         // worker would self-conflict if its current entry already
         // serves the model).
+        let mut unconfirmed = Vec::new();
         for model in &spec.model_ids {
             for existing in self.workers_for(model) {
                 if existing.id == spec.id {
                     continue;
                 }
                 if modes_are_mixed(incoming_mode, existing.mode()) {
+                    if profile.answered
+                        && existing.mode() == WorkerMode::Plain
+                        && !existing.introspected()
+                    {
+                        unconfirmed.push(existing);
+                        continue;
+                    }
                     return Err(AddWorkerError::MixedPdAndPlain {
                         worker: spec.id,
                         model: model.clone(),
@@ -122,6 +139,38 @@ impl WorkerRegistry {
                     });
                 }
             }
+        }
+        for seed in unconfirmed {
+            // Listed once per shared model; move it out once.
+            if !self
+                .by_id
+                .get(&seed.id)
+                .is_some_and(|w| Arc::ptr_eq(&w, &seed))
+            {
+                continue;
+            }
+            tracing::info!(
+                worker_id = %seed.id,
+                displaced_by = %spec.id,
+                "registry: moved a worker whose engine has not reported its role out of \
+                 the model pool for a worker that reported a PD role",
+            );
+            let held_spec = WorkerSpec {
+                id: seed.id.clone(),
+                url: seed.url.clone(),
+                mode: seed.mode(),
+                model_ids: Vec::new(),
+                bootstrap_port: seed.bootstrap_port(),
+                version_group: seed.version_group().map(str::to_owned),
+                services: seed.services(),
+            };
+            // An engine that never answered reported nothing beyond the
+            // protocol default, so the rebuild drops no profile it had.
+            let seed_cb = seed.breaker.config().cloned();
+            let mut held = Worker::with_cb_config(held_spec, seed_cb, seed.protocol());
+            held.inherit(&seed);
+            self.remove_locked(&seed.id);
+            self.by_id.insert(seed.id.clone(), Arc::new(held));
         }
         let mut w = Worker::with_cb_config(spec, cb, profile);
         // An upsert (e.g. bootstrap repair racing the grace expiry) must not reset
@@ -546,6 +595,46 @@ mod tests {
                 .len(),
             1,
         );
+    }
+
+    /// A role the engine reported outranks a Plain role it has not confirmed:
+    /// a PD worker whose `/server_info` answered moves the unconfirmed Plain
+    /// workers on its model out of the pool (still registered, model-less, for
+    /// the reconcile loop to re-introspect). A Plain worker whose engine
+    /// answered still refuses it.
+    #[test]
+    fn reported_pd_role_displaces_only_unconfirmed_plain_workers() {
+        let answered = EngineProfile {
+            answered: true,
+            ..EngineProfile::from(WireProtocol::default())
+        };
+        let m = ModelId("m".into());
+        let r = WorkerRegistry::default();
+        r.add(spec("seed", WorkerMode::Plain, &["m"])).unwrap();
+        r.add_with_cb(
+            spec("d", WorkerMode::Decode, &["m"]),
+            None,
+            answered.clone(),
+        )
+        .expect("a reported PD role must not be refused by an unconfirmed Plain seed");
+        let seed = r
+            .get(&WorkerId("seed".into()))
+            .expect("the displaced worker stays registered for re-introspection");
+        assert!(seed.model_ids.is_empty());
+        assert_eq!(seed.mode(), WorkerMode::Plain);
+        let pool: Vec<_> = r.workers_for(&m).iter().map(|w| w.id.0.clone()).collect();
+        assert_eq!(pool, ["d"]);
+
+        let r = WorkerRegistry::default();
+        r.add_with_cb(
+            spec("plain", WorkerMode::Plain, &["m"]),
+            None,
+            answered.clone(),
+        )
+        .unwrap();
+        r.add_with_cb(spec("d", WorkerMode::Decode, &["m"]), None, answered)
+            .expect_err("a confirmed Plain worker still refuses a PD worker");
+        assert_eq!(r.workers_for(&m).len(), 1);
     }
 
     /// A *new* (not-yet-registered) worker rejected with `MixedPdAndPlain`

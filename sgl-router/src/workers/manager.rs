@@ -398,7 +398,9 @@ async fn handle_discovery_event(
 /// A worker lands in the registry with empty `model_ids` when its
 /// introspection failed at `Added` time (e.g. the EndpointSlice flips
 /// `ready=true` before the engine's HTTP server can answer, and the
-/// introspector's bounded retry budget is exhausted). Such a worker is
+/// introspector's bounded retry budget is exhausted), or when its
+/// unconfirmed Plain seed would mix with PD workers on its model (see
+/// `register_one` and [`WorkerRegistry::add_with_cb`]). Such a worker is
 /// present in `by_id` but absent from every `by_model` pool, so it gets zero
 /// traffic — and it never recovers on its own: discovery re-lists carry the
 /// same empty `model_ids` the backend always emits, so they produce no new
@@ -604,7 +606,8 @@ async fn register_one(
     // so logging unconditionally would repeat the same line for the life of the
     // process. Logging only a new or changed resolution keeps the reconcile
     // path quiet, matching why its own progress message stays at `debug!`.
-    let previous_protocol = registry.get(&spec.id).map(|w| w.protocol());
+    let previous = registry.get(&spec.id);
+    let previous_protocol = previous.as_ref().map(|w| w.protocol());
     let cb = cfg.as_ref().and_then(|c| cb_config_for_spec(&spec, c));
     // The profile rides beside the spec rather than on it: `WorkerSpec` is the
     // serde wire type for `DiscoveryEvent`, and no discovery backend can know it.
@@ -616,7 +619,25 @@ async fn register_one(
         mm: info.mm.map(Arc::new),
         answered: info.answered,
     };
-    if let Err(e) = registry.add_with_cb(spec, cb, profile) {
+    let mut added = registry.add_with_cb(spec.clone(), cb.clone(), profile.clone());
+    // A Plain role the engine has not confirmed is only the discovery seed
+    // (static URLs seed every worker Plain): an engine still loading answers
+    // `/model_info` before `/server_info`. Refusing it here would drop it for
+    // good, so register it with no model instead — outside every pool, where
+    // the reconcile loop re-introspects it until its engine reports its role.
+    if added.is_err() && !info.answered && spec.mode == WorkerMode::Plain {
+        // Once per hold: the reconcile retries find it already held.
+        if previous.is_none_or(|w| !w.model_ids.is_empty()) {
+            tracing::info!(
+                worker_url = %worker_url,
+                "worker manager: holding a worker out of its model pool until /server_info \
+                 reports its role; its Plain seed would mix with PD workers",
+            );
+        }
+        spec.model_ids.clear();
+        added = registry.add_with_cb(spec, cb, profile);
+    }
+    if let Err(e) = added {
         // Mixed PD + plain on the same model is rejected at registration
         // time. Log loudly so the operator notices the conflicting
         // worker — the alternative (silently dropping into either pool)
@@ -2003,5 +2024,224 @@ mod tests {
         drop(tx);
         let _ = manager_handle.await;
         let _ = shutdown_tx.send(());
+    }
+
+    /// Fake engine still loading its weights behind a frontend that is
+    /// already up: `/model_info` answers from the launch config at once, while
+    /// `/server_info` (a scheduler round-trip) 503s until `ready` flips.
+    async fn spawn_loading_worker(
+        body: Value,
+        ready: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (String, oneshot::Sender<()>) {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        let body = Arc::new(body);
+        let model_info = {
+            let body = body.clone();
+            move || {
+                let body = body.clone();
+                async move { Json((*body).clone()) }
+            }
+        };
+        let server_info = move || {
+            let body = body.clone();
+            let ready = ready.clone();
+            async move {
+                if ready.load(std::sync::atomic::Ordering::SeqCst) {
+                    Json((*body).clone()).into_response()
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE.into_response()
+                }
+            }
+        };
+        serve(
+            Router::new()
+                .route("/model_info", get(model_info))
+                .route("/server_info", get(server_info)),
+        )
+        .await
+    }
+
+    /// The manager behind the static-URL backend, as `--worker-urls` runs it.
+    /// Returns the discovery and manager tasks; abort the first to stop both.
+    async fn spawn_static_router(
+        urls: Vec<String>,
+        registry: Arc<WorkerRegistry>,
+    ) -> (JoinHandle<()>, JoinHandle<()>) {
+        let (tx, rx) = mpsc::channel(8);
+        let discovery =
+            crate::discovery::static_urls::spawn(StaticUrlsDiscoveryConfig { urls }, tx)
+                .await
+                .unwrap();
+        let manager = tokio::spawn(run_with_introspector_and_reconcile(
+            rx,
+            registry,
+            None,
+            None,
+            None,
+            fast_introspector(),
+            Duration::from_millis(100),
+        ));
+        (discovery, manager)
+    }
+
+    /// Model `m`'s pool as sorted (url, mode, bootstrap port) rows.
+    fn pool_of_m(registry: &WorkerRegistry) -> Vec<(String, WorkerMode, Option<u16>)> {
+        let mut rows: Vec<_> = registry
+            .workers_for(&ModelId("m".into()))
+            .iter()
+            .map(|w| (w.url.clone(), w.mode(), w.bootstrap_port()))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+
+    /// Poll until `done` holds (true) or 5 s pass (false), asserting on every
+    /// look that model `m`'s pool never mixes Plain with Prefill/Decode.
+    async fn settle(registry: &WorkerRegistry, done: impl Fn(&WorkerRegistry) -> bool) -> bool {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let pool = pool_of_m(registry);
+                let plain = pool.iter().filter(|r| r.1 == WorkerMode::Plain).count();
+                assert!(
+                    plain == 0 || plain == pool.len(),
+                    "model pool mixes Plain with PD workers: {pool:?}"
+                );
+                if done(registry) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    fn prefill_body() -> Value {
+        json!({"served_model_name": "m", "disaggregation_mode": "prefill",
+               "disaggregation_bootstrap_port": 8998})
+    }
+
+    fn decode_body() -> Value {
+        json!({"served_model_name": "m", "disaggregation_mode": "decode"})
+    }
+
+    /// A static 1 prefill + 2 decode set whose prefill is still loading when
+    /// the router starts: the decodes answer `/server_info` and register as
+    /// Decode, while the prefill resolves its model from `/model_info` but not
+    /// its role. Its seeded Plain role must not get it refused for good beside
+    /// the decodes: once its `/server_info` answers, it must join the pool as
+    /// Prefill with its bootstrap port, with no new discovery event.
+    #[tokio::test]
+    async fn static_prefill_loading_at_start_joins_as_prefill_once_it_answers() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let prefill_ready = Arc::new(AtomicBool::new(false));
+        let (prefill, _p) = spawn_loading_worker(prefill_body(), prefill_ready.clone()).await;
+        let (decode0, _d0) =
+            spawn_loading_worker(decode_body(), Arc::new(AtomicBool::new(true))).await;
+        let (decode1, _d1) =
+            spawn_loading_worker(decode_body(), Arc::new(AtomicBool::new(true))).await;
+        let registry = Arc::new(WorkerRegistry::default());
+        let (discovery, manager) = spawn_static_router(
+            vec![prefill.clone(), decode0.clone(), decode1.clone()],
+            registry.clone(),
+        )
+        .await;
+
+        let decodes = {
+            let mut rows = vec![
+                (decode0, WorkerMode::Decode, None),
+                (decode1, WorkerMode::Decode, None),
+            ];
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            rows
+        };
+        assert!(
+            settle(&registry, |r| pool_of_m(r) == decodes).await,
+            "the decodes must route while the prefill loads; pool: {:?}",
+            pool_of_m(&registry),
+        );
+        // Several reconcile ticks pass with the prefill still loading.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        prefill_ready.store(true, Ordering::SeqCst);
+
+        let mut want = decodes;
+        want.push((prefill, WorkerMode::Prefill, Some(8998)));
+        want.sort_by(|a, b| a.0.cmp(&b.0));
+        assert!(
+            settle(&registry, |r| pool_of_m(r) == want).await,
+            "the prefill must end registered as Prefill with its bootstrap port; pool: {:?}",
+            pool_of_m(&registry),
+        );
+
+        discovery.abort();
+        manager.await.unwrap();
+    }
+
+    /// A static set that is entirely down when the router starts: each engine
+    /// resolves its model from `/model_info` but none answers `/server_info`,
+    /// so all three enter the pool on the seeded Plain role. As the engines
+    /// come up, in either order, each must take the role it reports — a
+    /// reported Prefill/Decode role must not be refused for good because the
+    /// peers still loading carry the Plain seed — and a plain set stays plain.
+    #[tokio::test]
+    async fn static_set_loading_at_start_settles_in_reported_roles_in_either_order() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let plain = json!({"served_model_name": "m", "disaggregation_mode": "null"});
+        let pd = [prefill_body(), decode_body(), decode_body()];
+        for (case, bodies, up_order) in [
+            ("prefill first", pd.clone(), [0, 1, 2]),
+            ("prefill last", pd, [1, 2, 0]),
+            (
+                "plain set",
+                [plain.clone(), plain.clone(), plain],
+                [2, 0, 1],
+            ),
+        ] {
+            let mut urls = Vec::new();
+            let mut ready = Vec::new();
+            let mut shutdowns = Vec::new();
+            let mut want = Vec::new();
+            for body in bodies {
+                let flag = Arc::new(AtomicBool::new(false));
+                let (url, shutdown) = spawn_loading_worker(body.clone(), flag.clone()).await;
+                let role = match body["disaggregation_mode"].as_str() {
+                    Some("prefill") => (WorkerMode::Prefill, Some(8998)),
+                    Some("decode") => (WorkerMode::Decode, None),
+                    _ => (WorkerMode::Plain, None),
+                };
+                want.push((url.clone(), role.0, role.1));
+                urls.push(url);
+                ready.push(flag);
+                shutdowns.push(shutdown);
+            }
+            want.sort_by(|a, b| a.0.cmp(&b.0));
+            let registry = Arc::new(WorkerRegistry::default());
+            let (discovery, manager) = spawn_static_router(urls, registry.clone()).await;
+
+            assert!(
+                settle(&registry, |r| {
+                    let pool = pool_of_m(r);
+                    pool.len() == 3 && pool.iter().all(|row| row.1 == WorkerMode::Plain)
+                })
+                .await,
+                "{case}: all three enter the pool on the Plain seed while loading; pool: {:?}",
+                pool_of_m(&registry),
+            );
+            for i in up_order {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                ready[i].store(true, Ordering::SeqCst);
+            }
+            assert!(
+                settle(&registry, |r| pool_of_m(r) == want).await,
+                "{case}: every engine must end in the role it reports; pool: {:?}",
+                pool_of_m(&registry),
+            );
+
+            discovery.abort();
+            manager.await.unwrap();
+        }
     }
 }
