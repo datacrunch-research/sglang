@@ -988,6 +988,7 @@ async fn full_decode_group_falls_back_to_another_version_group() {
                 bootstrap_port: Some(8998),
                 version_group: Some(group.into()),
                 services: Default::default(),
+                role_unknown: false,
             })
             .unwrap();
     }

@@ -67,6 +67,7 @@ mod tests {
             bootstrap_port: None,
             version_group: None,
             services: Default::default(),
+            role_unknown: false,
         };
         let profile = EngineProfile {
             protocol: WireProtocol::default(),

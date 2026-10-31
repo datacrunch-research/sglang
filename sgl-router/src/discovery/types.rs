@@ -71,6 +71,13 @@ pub struct WorkerSpec {
     /// of the pod-incarnation ID; empty for static URL discovery.
     #[serde(default)]
     pub services: BTreeSet<String>,
+    /// The backend cannot know this worker's PD role, so `mode` is only a
+    /// placeholder (static URLs). The worker joins no model pool until its
+    /// engine answers `/server_info`, which settles the role; see
+    /// [`crate::workers::WorkerRegistry::add_with_cb`]. `false` (the default)
+    /// means `mode` is the backend's own classification (K8s).
+    #[serde(default)]
+    pub role_unknown: bool,
 }
 
 /// Event produced by a discovery backend and consumed by `WorkerManager`.
@@ -145,6 +152,14 @@ mod tests {
         let json = r#"{"id":"w","url":"http://x","mode":"plain","model_ids":["m"]}"#;
         let w: WorkerSpec = serde_json::from_str(json).unwrap();
         assert_eq!(w.bootstrap_port, None);
+    }
+
+    /// Specs from senders that predate `role_unknown` keep the backend's mode.
+    #[test]
+    fn worker_spec_deserializes_with_missing_role_unknown() {
+        let json = r#"{"id":"w","url":"http://x","mode":"decode","model_ids":["m"]}"#;
+        let w: WorkerSpec = serde_json::from_str(json).unwrap();
+        assert!(!w.role_unknown);
     }
 
     #[test]
