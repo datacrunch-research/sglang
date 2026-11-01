@@ -72,6 +72,8 @@ hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
 # Utilities
 anyhow = "1"
 thiserror = "2"
+# The kimi_k3 tokenizer view of a Kimi tiktoken alias (src/tokenizer/adapter.rs).
+tempfile = "3"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

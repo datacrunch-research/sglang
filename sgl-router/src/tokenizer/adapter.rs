@@ -228,7 +228,7 @@ fn encoder(
                 "fastokens needs a tokenizer.json; encoding on tiktoken"
             );
         }
-        return Ok((create_tokenizer_from_file(path)?, EncodeBackend::Tiktoken));
+        return Ok((tiktoken_encoder(path)?, EncodeBackend::Tiktoken));
     }
     if backend == TokenizerBackend::Fast {
         match FastTokenizer::from_file(path) {
@@ -242,6 +242,52 @@ fn encoder(
         ));
     }
     Ok((create_tokenizer_from_file(path)?, EncodeBackend::Hf))
+}
+
+/// `config.json` model types of Kimi checkpoints that ship Kimi-K3's tiktoken vocabulary
+/// under a name dynamo-tokenizers does not list. Kimi-K3.1 (`kimi_k31`) ships Kimi-K3's
+/// `tiktoken.model` byte for byte and its `tokenization_kimi.py` (formatting aside), so it
+/// tokenizes exactly as Kimi-K3.
+const KIMI_K3_TIKTOKEN_ALIASES: [&str; 1] = ["kimi_k31"];
+
+/// The tiktoken encoder for `path`. dynamo-tokenizers takes the BPE pattern from the
+/// `model_type` in the sibling `config.json` and refuses a type it does not list. For a
+/// [`KIMI_K3_TIKTOKEN_ALIASES`] model it is handed copies of the same vocabulary and
+/// `tokenizer_config.json` beside a `config.json` naming `kimi_k3`, so the encoder is the one
+/// Kimi-K3 loads. Only the encoder sees that view: chat formatter selection and the cell's
+/// files read the checkpoint's own `config.json`.
+fn tiktoken_encoder(path: &str) -> Result<Arc<dyn traits::Tokenizer>> {
+    let file = Path::new(path);
+    let model_type = file
+        .parent()
+        .and_then(|dir| std::fs::read_to_string(dir.join("config.json")).ok())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|config| config["model_type"].as_str().map(str::to_owned));
+    let Some(alias) = model_type.filter(|t| KIMI_K3_TIKTOKEN_ALIASES.contains(&t.as_str())) else {
+        return create_tokenizer_from_file(path);
+    };
+    let name = file
+        .file_name()
+        .context("the tiktoken path names no file")?;
+    // The encoder reads every file while it is built and keeps nothing open, so the view is
+    // removed when this returns.
+    let view = tempfile::Builder::new()
+        .prefix("sgl-router-kimi-tiktoken-")
+        .tempdir()
+        .context("create the kimi_k3 tokenizer view")?;
+    std::fs::copy(file, view.path().join(name)).with_context(|| format!("copy {path}"))?;
+    let config = file.with_file_name("tokenizer_config.json");
+    if config.exists() {
+        std::fs::copy(&config, view.path().join("tokenizer_config.json"))
+            .with_context(|| format!("copy {}", config.display()))?;
+    }
+    std::fs::write(
+        view.path().join("config.json"),
+        r#"{"model_type":"kimi_k3"}"#,
+    )?;
+    tracing::info!(path, model_type = %alias, "Loaded the tiktoken vocabulary as kimi_k3");
+    let copy = view.path().join(name);
+    create_tokenizer_from_file(copy.to_str().context("the view path is not valid UTF-8")?)
 }
 
 /// L1 matches literal spellings, so only unconditional, non-overlapping added tokens
