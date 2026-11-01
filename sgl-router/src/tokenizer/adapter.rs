@@ -228,7 +228,7 @@ fn encoder(
                 "fastokens needs a tokenizer.json; encoding on tiktoken"
             );
         }
-        return Ok((create_tokenizer_from_file(path)?, EncodeBackend::Tiktoken));
+        return Ok((tiktoken_encoder(path)?, EncodeBackend::Tiktoken));
     }
     if backend == TokenizerBackend::Fast {
         match FastTokenizer::from_file(path) {
@@ -242,6 +242,52 @@ fn encoder(
         ));
     }
     Ok((create_tokenizer_from_file(path)?, EncodeBackend::Hf))
+}
+
+/// `config.json` model types of Kimi checkpoints that ship Kimi-K3's tiktoken vocabulary
+/// under a name dynamo-tokenizers does not list. Kimi-K3.1 (`kimi_k31`) ships Kimi-K3's
+/// `tiktoken.model` byte for byte and its `tokenization_kimi.py` (formatting aside), so it
+/// tokenizes exactly as Kimi-K3.
+const KIMI_K3_TIKTOKEN_ALIASES: [&str; 1] = ["kimi_k31"];
+
+/// The tiktoken encoder for `path`. dynamo-tokenizers takes the BPE pattern from the
+/// `model_type` in the sibling `config.json` and refuses a type it does not list. For a
+/// [`KIMI_K3_TIKTOKEN_ALIASES`] model it is handed copies of the same vocabulary and
+/// `tokenizer_config.json` beside a `config.json` naming `kimi_k3`, so the encoder is the one
+/// Kimi-K3 loads. Only the encoder sees that view: chat formatter selection and the cell's
+/// files read the checkpoint's own `config.json`.
+fn tiktoken_encoder(path: &str) -> Result<Arc<dyn traits::Tokenizer>> {
+    let file = Path::new(path);
+    let model_type = file
+        .parent()
+        .and_then(|dir| std::fs::read_to_string(dir.join("config.json")).ok())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|config| config["model_type"].as_str().map(str::to_owned));
+    let Some(alias) = model_type.filter(|t| KIMI_K3_TIKTOKEN_ALIASES.contains(&t.as_str())) else {
+        return create_tokenizer_from_file(path);
+    };
+    let name = file
+        .file_name()
+        .context("the tiktoken path names no file")?;
+    // The encoder reads every file while it is built and keeps nothing open, so the view is
+    // removed when this returns.
+    let view = tempfile::Builder::new()
+        .prefix("sgl-router-kimi-tiktoken-")
+        .tempdir()
+        .context("create the kimi_k3 tokenizer view")?;
+    std::fs::copy(file, view.path().join(name)).with_context(|| format!("copy {path}"))?;
+    let config = file.with_file_name("tokenizer_config.json");
+    if config.exists() {
+        std::fs::copy(&config, view.path().join("tokenizer_config.json"))
+            .with_context(|| format!("copy {}", config.display()))?;
+    }
+    std::fs::write(
+        view.path().join("config.json"),
+        r#"{"model_type":"kimi_k3"}"#,
+    )?;
+    tracing::info!(path, model_type = %alias, "Loaded the tiktoken vocabulary as kimi_k3");
+    let copy = view.path().join(name);
+    create_tokenizer_from_file(copy.to_str().context("the view path is not valid UTF-8")?)
 }
 
 /// L1 matches literal spellings, so only unconditional, non-overlapping added tokens
@@ -806,5 +852,71 @@ mod cache_tests {
         let mut cat = added("cat");
         cat["single_word"] = json!(true);
         check(vec![cat], None, "catfish", false);
+    }
+}
+
+#[cfg(test)]
+mod kimi_tiktoken_tests {
+    use super::{decode_complete, encode, load};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    /// The Kimi-K3 test vocabulary of `tests/fixtures/kimi_k3.rs` beside a `config.json` naming
+    /// `model_type`.
+    fn model_dir(model_type: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let merges = include_str!("../../tests/fixtures/kimi_k3/merges.txt")
+            .split_whitespace()
+            .map(|s| s.as_bytes().to_vec());
+        let vocab: String = (0..=255u8)
+            .map(|byte| vec![byte])
+            .chain(merges)
+            .enumerate()
+            .map(|(rank, token)| format!("{} {rank}\n", STANDARD.encode(token)))
+            .collect();
+        std::fs::write(dir.path().join("tiktoken.model"), vocab).unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            include_str!("../../tests/fixtures/kimi_k3/tokenizer_config.json"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            format!(r#"{{"model_type":"{model_type}"}}"#),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn path(dir: &tempfile::TempDir) -> String {
+        dir.path()
+            .join("tiktoken.model")
+            .to_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    /// A `kimi_k31` vocabulary loads with Kimi-K3's encoder: every text encodes to the same ids
+    /// and decodes to the same text, special tokens included. An unlisted type is still refused.
+    #[test]
+    fn kimi_k31_vocabulary_loads_as_kimi_k3() {
+        let (k3, k31) = (model_dir("kimi_k3"), model_dir("kimi_k31"));
+        let (k3_tokenizer, k31_tokenizer) = (load(&path(&k3)).unwrap(), load(&path(&k31)).unwrap());
+        for text in [
+            "hello <|open|> <|kimi_image_placeholder|>",
+            "[BOS]hi<|end_of_msg|>",
+            "plain text, 1234 \u{fc}n\u{ef}c\u{f6}d\u{e9}",
+        ] {
+            let ids = encode(&k3_tokenizer, text).unwrap();
+            assert!(!ids.is_empty(), "{text}");
+            assert_eq!(encode(&k31_tokenizer, text).unwrap(), ids, "{text}");
+            for skip in [false, true] {
+                assert_eq!(
+                    decode_complete(&k31_tokenizer, &ids, skip).unwrap(),
+                    decode_complete(&k3_tokenizer, &ids, skip).unwrap(),
+                    "{text}"
+                );
+            }
+        }
+        assert!(load(&path(&model_dir("kimi_k99"))).is_err());
     }
 }
