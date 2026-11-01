@@ -601,18 +601,17 @@ fn schema_is_standard(schema: &Value) -> bool {
         | "minContains" | "maxContains" => value.is_u64(),
         "uniqueItems" | "readOnly" | "writeOnly" | "deprecated" => value.is_boolean(),
         "dependentRequired" => value.as_object().is_some_and(|m| m.values().all(strings)),
-        // Python `re` and Rust `regex` accept different patterns; normalization
-        // also walks the remaining keywords, which tool schemas rarely use.
-        "pattern"
-        | "patternProperties"
-        | "dependentSchemas"
-        | "dependencies"
-        | "if"
-        | "then"
-        | "else"
-        | "propertyNames"
-        | "unevaluatedItems"
-        | "unevaluatedProperties" => false,
+        // Keywords that hold only subschemas: `check_schema` asks that each be a
+        // schema and `normalize_json_schema_types` walks into it, so a standard
+        // subschema is one both leave as is.
+        "if" | "then" | "else" | "propertyNames" | "unevaluatedItems" | "unevaluatedProperties" => {
+            schema_is_standard(value)
+        }
+        "dependentSchemas" => schemas(value),
+        // `check_schema` compiles regexes with Python's `re`, which accepts
+        // different patterns than Rust's `regex`; normalization skips the
+        // draft-7 `dependencies`.
+        "pattern" | "patternProperties" | "dependencies" => false,
         _ => true,
     })
 }
@@ -1585,6 +1584,96 @@ mod tests {
             {"role": "tool", "content": "42", "tool_call_id": "c"},
         ]);
         assert_eq!(unsupported(messages), None);
+    }
+
+    fn tools_with(parameters: Value) -> Result<Option<Vec<String>>, Unsupported> {
+        let raw = json!({"tools": [{"type": "function", "function": {"name": "f", "parameters": parameters}}]});
+        request_tools(raw.as_object().unwrap())
+    }
+
+    /// Keywords that hold only subschemas are judged by their subschemas, as
+    /// `check_schema` and `normalize_json_schema_types` judge them.
+    #[test]
+    fn subschema_keywords_are_lowered() {
+        let key = json!({"type": "string", "minLength": 1});
+        for schema in [
+            // Kimi Code's `AgentSwarm.resume_agent_ids`.
+            json!({"type": "object", "properties": {"m": {
+                "type": "object", "propertyNames": key, "additionalProperties": key}}}),
+            json!({"type": "object", "if": {"required": ["a"]}, "then": {"required": ["b"]}, "else": false}),
+            json!({"type": "object", "properties": {"m": {"type": "array", "unevaluatedItems": false}}}),
+            json!({"type": "object", "unevaluatedProperties": {"type": "integer"}}),
+            json!({"type": "object", "dependentSchemas": {"a": {"required": ["b"]}}}),
+        ] {
+            assert_eq!(
+                tools_with(schema.clone()),
+                Ok(Some(vec!["f".to_owned()])),
+                "{schema}"
+            );
+        }
+    }
+
+    /// Regexes, the draft-7 `dependencies` and subschemas normalization would
+    /// rewrite still go to the engine's own OpenAI layer.
+    #[test]
+    fn schemas_python_may_judge_otherwise_go_to_the_engine() {
+        for schema in [
+            json!({"type": "string", "pattern": "^[a-z]+$"}),
+            json!({"type": "object", "patternProperties": {"^x": {"type": "string"}}}),
+            json!({"type": "object", "dependencies": {"a": ["b"]}}),
+            json!({"type": "object", "propertyNames": {"type": "varchar"}}),
+            json!({"type": "object", "propertyNames": {"pattern": "^x"}}),
+            json!({"type": "object", "propertyNames": 1}),
+            json!({"type": "object", "if": "x"}),
+            json!({"type": "object", "dependentSchemas": {"a": 1}}),
+            json!({"type": "object", "dependentSchemas": []}),
+        ] {
+            assert_eq!(
+                tools_with(schema.clone()),
+                Err(Unsupported("tool_definition")),
+                "{schema}"
+            );
+        }
+    }
+
+    /// Kimi Code's main agent: an image with a tool that constrains its map
+    /// keys by `propertyNames` lowers with the image's source, so it never
+    /// reaches the engine's text-only OpenAI route.
+    #[test]
+    fn kimi_k3_image_with_a_property_names_tool_lowers() {
+        let key = json!({"type": "string", "minLength": 1});
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what is this"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]}],
+            "tools": [{"type": "function", "function": {"name": "AgentSwarm", "parameters": {
+                "type": "object", "properties": {"resume_agent_ids": {
+                    "type": "object", "propertyNames": key, "additionalProperties": key}}}}}],
+        });
+        let k3 = ChatModel {
+            chat_encoding_spec: Some("kimi_k3".into()),
+            is_multimodal: true,
+            ..ChatModel::default()
+        };
+        let settings = OpenAiSettings {
+            reasoning_parser: Some("kimi_k3".into()),
+            tool_call_parser: Some("kimi_k3".into()),
+            ..OpenAiSettings::default()
+        };
+        let (generate, _) = lower_chat(
+            &serde_json::to_vec(&body).unwrap(),
+            &OpenAiHeaders::default(),
+            &settings,
+            &k3,
+            |_: &Value| Some(vec![1, 7]),
+            None,
+        )
+        .expect("an image and a propertyNames tool lower for Kimi K3");
+        assert!(
+            generate.image_data.is_some(),
+            "image_data carries the source"
+        );
     }
 
     #[test]
