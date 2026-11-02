@@ -349,7 +349,8 @@ pub fn lower_chat(
         return Err(Unsupported("tool_grammar"));
     }
     let tools = request_tools(&raw)?;
-    let tool_definitions = raw.get("tools").and_then(Value::as_array).cloned();
+    // `_effective_tools`: the request's, then the system turns' declarations.
+    let tool_definitions = Some(effective_tools(&raw)).filter(|tools| !tools.is_empty());
     let parallel_tool_calls = raw.get("parallel_tool_calls") != Some(&Value::Bool(false));
     let tool_parsing = match (
         settings.tool_call_parser.as_deref(),
@@ -526,13 +527,15 @@ fn request_tools(raw: &Map<String, Value>) -> Result<Option<Vec<String>>, Unsupp
     {
         return Err(Unsupported("tool_choice"));
     }
-    let tools = match raw.get("tools") {
-        None | Some(Value::Null) => return Ok(None),
-        Some(Value::Array(tools)) => tools,
-        Some(_) => return Err(Unsupported("invalid_request")),
-    };
+    if !raw
+        .get("tools")
+        .is_none_or(|tools| tools.is_null() || tools.is_array())
+    {
+        return Err(Unsupported("invalid_request"));
+    }
+    let tools = effective_tools(raw);
     let mut names = Vec::with_capacity(tools.len());
-    for tool in tools {
+    for tool in &tools {
         let function = &tool["function"];
         let well_formed = tool.get("type").is_none_or(Value::is_string)
             && tool.get("defer_loading").is_none_or(Value::is_null)
@@ -547,8 +550,40 @@ fn request_tools(raw: &Map<String, Value>) -> Result<Option<Vec<String>>, Unsupp
         };
         names.push(name.to_owned());
     }
+    // `_validate_request`: with message tools, names are unique across both.
+    let declared = raw
+        .get("tools")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    if names.len() > declared && names.iter().collect::<HashSet<_>>().len() < names.len() {
+        return Err(Unsupported("invalid_request"));
+    }
     let parse = !tools.is_empty() && choice.is_none_or(|c| c == "auto");
     Ok(parse.then_some(names))
+}
+
+/// `_effective_tools`: the request's tools, then those declared on system and
+/// developer turns, which only a Kimi K3 request keeps (`has_tools_or_media`).
+fn effective_tools(raw: &Map<String, Value>) -> Vec<Value> {
+    let array = |key: &str| raw.get(key).and_then(Value::as_array).into_iter().flatten();
+    let (request, messages) = (array("tools"), array("messages"));
+    request
+        .chain(
+            messages
+                .filter(|message| declares_tools(message))
+                .flat_map(|message| message["tools"].as_array().into_iter().flatten()),
+        )
+        .cloned()
+        .collect()
+}
+
+/// A system or developer turn (roles compared lowercased, as Pydantic
+/// normalizes them) whose `tools` the Kimi K3 renderer places in the prompt.
+fn declares_tools(message: &Value) -> bool {
+    message["role"]
+        .as_str()
+        .is_some_and(|role| matches!(role.to_lowercase().as_str(), "system" | "developer"))
+        && message["tools"].as_array().is_some_and(|t| !t.is_empty())
 }
 
 const SCHEMA_TYPES: &[&str] = &[
@@ -653,9 +688,10 @@ fn truthy(value: &Value) -> bool {
 }
 
 /// Whether a message carries what this layer does not lower: per-message
-/// tools, video or audio, or images for a model whose renderer does not place
-/// them (Kimi K3's and DeepSeek's do, one placeholder per image, as Python's)
-/// or whose engine takes none.
+/// tools other than a Kimi K3 system or developer turn's (its renderer places
+/// them, as Python's), video or audio, or images for a model whose renderer
+/// does not place them (Kimi K3's and DeepSeek's do, one placeholder per
+/// image, as Python's) or whose engine takes none.
 fn has_tools_or_media(message: &Value, model: &ChatModel) -> bool {
     let images_render = model.is_multimodal && model.renders_images();
     let media = |part: &Value| match part["type"].as_str() {
@@ -663,7 +699,8 @@ fn has_tools_or_media(message: &Value, model: &ChatModel) -> bool {
         Some("image_url" | "input_image") => !images_render,
         _ => false,
     };
-    message.get("tools").is_some_and(truthy)
+    let rendered_tools = model.is_kimi_k3() && declares_tools(message);
+    (message.get("tools").is_some_and(truthy) && !rendered_tools)
         || message["content"]
             .as_array()
             .is_some_and(|parts| parts.iter().any(media))
@@ -812,10 +849,9 @@ fn valid_message(message: &Value) -> bool {
                         .as_array()
                         .is_some_and(|calls| calls.iter().all(valid_tool_call))
                 })
-                // Non-empty tools never get here.
-                && optional(message, "tools", |tools| {
-                    tools.as_array().is_some_and(Vec::is_empty)
-                })
+                // Non-empty tools get here only on a Kimi K3 system or
+                // developer turn; `request_tools` judges them with the request's.
+                && optional(message, "tools", Value::is_array)
         }
         _ => false,
     }
@@ -1879,6 +1915,146 @@ mod tests {
             "required": ["pages"],
             "type": "object"
         })
+    }
+
+    /// Kimi Code's `AgentSwarm` input schema (zod `toJSONSchema`):
+    /// `resume_agent_ids` is a `z.record`, so it carries `propertyNames`.
+    fn agent_swarm_tool() -> Value {
+        let text = json!({"type": "string", "minLength": 1});
+        json!({"type": "function", "function": {"name": "AgentSwarm", "description": "Launch subagents.", "parameters": {
+            "type": "object",
+            "properties": {
+                "description": text, "subagent_type": text, "prompt_template": text,
+                "items": {"type": "array", "items": text, "maxItems": 128},
+                "fork": {"type": "boolean"},
+                "resume_agent_ids": {"type": "object", "propertyNames": text, "additionalProperties": text},
+                "model": {"type": "string"},
+            },
+            "required": ["description"],
+            "additionalProperties": false,
+        }}})
+    }
+
+    fn k3_settings() -> OpenAiSettings {
+        OpenAiSettings {
+            reasoning_parser: Some("kimi_k3".into()),
+            tool_call_parser: Some("kimi_k3".into()),
+            ..OpenAiSettings::default()
+        }
+    }
+
+    fn k3_multimodal() -> ChatModel {
+        ChatModel {
+            chat_encoding_spec: Some("kimi_k3".into()),
+            is_multimodal: true,
+            ..ChatModel::default()
+        }
+    }
+
+    /// The K3 `/generate` body for `body`, or why it is not lowered.
+    fn lower_k3(body: &Value) -> Result<GenerateRequest, &'static str> {
+        lower_chat(
+            &serde_json::to_vec(body).unwrap(),
+            &OpenAiHeaders::default(),
+            &k3_settings(),
+            &k3_multimodal(),
+            |_: &Value| Some(vec![1, 7]),
+            None,
+        )
+        .map(|(generate, _)| generate)
+        .map_err(|reason| reason.0)
+    }
+
+    fn structural_tag(generate: &GenerateRequest) -> String {
+        let Some(sampling_params_or_list::Value::One(sampling)) = generate
+            .sampling_params
+            .as_ref()
+            .and_then(|p| p.value.as_ref())
+        else {
+            panic!("one sampling configuration")
+        };
+        sampling.structural_tag.clone().unwrap_or_default()
+    }
+
+    fn image_turn() -> Value {
+        json!({"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]})
+    }
+
+    /// Kimi Code's `kimi` provider copies the tools onto the system turn. K3
+    /// renders them there, so an image with Kimi Code's tools stays on the
+    /// token path, constrained and parsed by those tools as Python's
+    /// `_effective_tools` has them.
+    #[test]
+    fn kimi_k3_image_with_kimi_code_tools_lowers_from_either_place() {
+        for (name, body) in [
+            (
+                "system",
+                json!({"model": "m", "messages": [
+                {"role": "system", "content": "", "tools": [agent_swarm_tool()]}, image_turn()]}),
+            ),
+            (
+                "developer",
+                json!({"model": "m", "messages": [
+                {"role": "Developer", "content": "", "tools": [agent_swarm_tool()]}, image_turn()]}),
+            ),
+            (
+                "request",
+                json!({"model": "m", "messages": [image_turn()], "tools": [agent_swarm_tool()]}),
+            ),
+        ] {
+            let generate = lower_k3(&body).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(generate.image_data.is_some(), "{name}: image_data");
+            assert!(
+                structural_tag(&generate).contains(r#"tool=\"AgentSwarm\""#),
+                "{name}: the auto tag covers the tool"
+            );
+        }
+        // Request and system tools together, in `_effective_tools` order.
+        let weather = json!({"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}});
+        let both = json!({"model": "m", "tools": [weather], "messages": [
+            {"role": "system", "content": "", "tools": [agent_swarm_tool()]}, image_turn()]});
+        let tag = structural_tag(&lower_k3(&both).unwrap());
+        let (weather_at, swarm_at) = (
+            tag.find("get_weather").unwrap(),
+            tag.find("AgentSwarm").unwrap(),
+        );
+        assert!(weather_at < swarm_at, "{tag}");
+    }
+
+    /// An image with a `pattern` tool on the system turn.
+    #[test]
+    fn kimi_k3_image_with_a_pattern_tool_on_the_system_turn_lowers() {
+        let tool = json!({"type": "function", "function": {"name": "f", "parameters": {
+            "type": "object", "properties": {"s": {"type": "string", "pattern": "^[a-z]+$"}}}}});
+        let body = json!({"model": "m", "messages": [
+            {"role": "system", "content": "", "tools": [tool]}, image_turn()]});
+        let generate = lower_k3(&body).unwrap_or_else(|e| panic!("{e}"));
+        assert!(generate.image_data.is_some());
+    }
+
+    /// Message tools Python would not render or would refuse still go to the
+    /// engine: other models, other turns, and names declared twice.
+    #[test]
+    fn message_tools_k3_does_not_render_go_to_the_engine() {
+        let system = json!({"role": "system", "content": "", "tools": [agent_swarm_tool()]});
+        let user = json!({"role": "user", "content": "hi"});
+        assert_eq!(
+            unsupported(json!([system, user])),
+            Some("unsupported_chat_feature")
+        );
+        let assistant = json!({"role": "assistant", "content": "a", "tools": [agent_swarm_tool()]});
+        assert_eq!(
+            lower_k3(&json!({"model": "m", "messages": [user, assistant, user]})).err(),
+            Some("unsupported_chat_feature")
+        );
+        let twice =
+            json!({"model": "m", "tools": [agent_swarm_tool()], "messages": [system, user]});
+        assert_eq!(lower_k3(&twice).err(), Some("invalid_request"));
+        let strict = json!({"type": "function", "function": {"name": "g", "strict": true, "parameters": {"type": "object"}}});
+        let strict = json!({"model": "m", "messages": [{"role": "system", "content": "", "tools": [strict]}, user]});
+        assert_eq!(lower_k3(&strict).err(), Some("tool_definition"));
     }
 
     #[test]
