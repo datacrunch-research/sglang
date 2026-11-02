@@ -3828,6 +3828,7 @@ dependencies = [
  "hf-hub",
  "minijinja",
  "regex",
+ "regex-syntax",
  "serde",
  "serde_json",
  "sglang-api-types",
