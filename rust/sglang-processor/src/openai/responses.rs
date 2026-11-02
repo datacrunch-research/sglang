@@ -2,12 +2,15 @@
 //! host (sglang-server, sgl-router, an upstream router). [`lower`] turns a
 //! `/v1/responses` body into a chat completion request the host lowers with
 //! [`super::lower_chat`]: `input` items become messages, `instructions` a
-//! system turn, flat function tools the nested chat form, `text.format` a
-//! response format. [`ResponseShaper`] then rewrites the chat output, SSE
-//! chunks or a completion, into Responses events and the `response` object.
+//! system turn, flat function tools the nested chat form (`custom` tools as a
+//! function of one string `input`, `namespace` members as `<ns>__<name>`),
+//! `text.format` a response format. [`ResponseShaper`] then rewrites the chat
+//! output, SSE chunks or a completion, into Responses events and the
+//! `response` object.
 //! State (`previous_response_id`, `store: true`, `conversation`,
 //! `background`) is refused: the hosts keep no response store.
 
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
@@ -55,9 +58,42 @@ pub struct ResponseContext {
     pub model: String,
     pub stream: bool,
     echo: Map<String, Value>,
+    /// The `custom` and `namespace` tools by the chat function name they were
+    /// lowered to, so their calls come back as the client declared them.
+    tools: HashMap<String, ToolName>,
+}
+
+/// How a call to a lowered chat function is reported to the client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolName {
+    name: String,
+    namespace: Option<String>,
+    /// A `custom` tool: its call is a `custom_tool_call` with the raw `input`.
+    custom: bool,
+}
+
+/// The one string parameter a `custom` tool is offered as, as SGLang's Python
+/// Responses layer offers it (`responses_adapters.CUSTOM_TOOL_INPUT_KEY`).
+const CUSTOM_TOOL_INPUT: &str = "input";
+
+/// The chat function name of member `name` of namespace `namespace`.
+fn namespaced(namespace: &str, name: &str) -> String {
+    format!("{namespace}__{name}")
 }
 
 impl ResponseContext {
+    /// The tool a chat call to `chat_name` reports as.
+    fn tool(&self, chat_name: &str) -> ToolName {
+        self.tools
+            .get(chat_name)
+            .cloned()
+            .unwrap_or_else(|| ToolName {
+                name: chat_name.to_owned(),
+                namespace: None,
+                custom: false,
+            })
+    }
+
     /// The `response` object with the given status, output and usage.
     fn response(
         &self,
@@ -173,6 +209,7 @@ pub fn lower(body: &Value) -> Result<Lowered, ResponsesError> {
         chat["stream_options"] = json!({"include_usage": true});
     }
     let mut echo = Map::new();
+    let mut tool_names = HashMap::new();
 
     let copy = |chat: &mut Value, echo: &mut Map<String, Value>, from: &str, to: &str| {
         if let Some(v) = object.get(from).filter(|v| !v.is_null()) {
@@ -250,7 +287,9 @@ pub fn lower(body: &Value) -> Result<Lowered, ResponsesError> {
         .and_then(Value::as_array)
         .filter(|t| !t.is_empty())
     {
-        chat["tools"] = Value::Array(tools.iter().map(lower_tool).collect::<Result<_, _>>()?);
+        let (lowered, names) = lower_tools(tools)?;
+        chat["tools"] = Value::Array(lowered);
+        tool_names = names;
         echo.insert("tools".to_owned(), Value::Array(tools.clone()));
     }
     if let Some(choice) = object.get("tool_choice").filter(|v| !v.is_null()) {
@@ -265,6 +304,7 @@ pub fn lower(body: &Value) -> Result<Lowered, ResponsesError> {
         model,
         stream,
         echo,
+        tools: tool_names,
     };
     Ok(Lowered { chat, context })
 }
@@ -299,16 +339,27 @@ fn lower_items(items: &[Value], messages: &mut Vec<Value>) -> Result<(), Respons
                 }
                 messages.push(message);
             }
-            "function_call" => {
+            "function_call" | "custom_tool_call" => {
                 let name = object
                     .get("name")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| bad("function_call without a name"))?;
+                    .ok_or_else(|| bad(format!("{kind} without a name")))?;
+                // A namespace member is called by its flattened chat name.
+                let name = match object.get("namespace").and_then(Value::as_str) {
+                    Some(namespace) if !namespace.is_empty() => namespaced(namespace, name),
+                    _ => name.to_owned(),
+                };
                 let call_id = object.get("call_id").and_then(Value::as_str).unwrap_or("");
-                let arguments = match object.get("arguments") {
-                    Some(Value::String(s)) => s.clone(),
-                    Some(other @ Value::Object(_)) => other.to_string(),
-                    _ => "{}".to_owned(),
+                let arguments = if kind == "custom_tool_call" {
+                    // Replayed through the one-string function it was offered as.
+                    let input = object.get("input").and_then(Value::as_str).unwrap_or("");
+                    json!({ CUSTOM_TOOL_INPUT: input }).to_string()
+                } else {
+                    match object.get("arguments") {
+                        Some(Value::String(s)) => s.clone(),
+                        Some(other @ Value::Object(_)) => other.to_string(),
+                        _ => "{}".to_owned(),
+                    }
                 };
                 let call = json!({"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}});
                 // Consecutive calls ride on one assistant message, as chat expresses them.
@@ -330,7 +381,7 @@ fn lower_items(items: &[Value], messages: &mut Vec<Value>) -> Result<(), Respons
                     }
                 }
             }
-            "function_call_output" => {
+            "function_call_output" | "custom_tool_call_output" => {
                 let call_id = object.get("call_id").and_then(Value::as_str).unwrap_or("");
                 let output = match object.get("output") {
                     Some(Value::String(s)) => s.clone(),
@@ -467,28 +518,125 @@ fn lower_text_format(format: &Value) -> Result<Option<Value>, ResponsesError> {
     }
 }
 
-/// A flat Responses function tool as a nested chat tool.
-fn lower_tool(tool: &Value) -> Result<Value, ResponsesError> {
-    match tool.get("type").and_then(Value::as_str) {
-        Some("function") => {
-            let name = tool
-                .get("name")
-                .and_then(Value::as_str)
-                .ok_or_else(|| bad("function tool without a name"))?;
-            let mut function = json!({"name": name});
-            for key in ["description", "parameters", "strict"] {
-                if let Some(v) = tool.get(key).filter(|v| !v.is_null()) {
-                    function[key] = v.clone();
-                }
-            }
-            Ok(json!({"type": "function", "function": function}))
+/// Responses tools as nested chat function tools, with the `custom` and
+/// `namespace` tools they stand for by chat name.
+fn lower_tools(tools: &[Value]) -> Result<(Vec<Value>, HashMap<String, ToolName>), ResponsesError> {
+    let mut lowered = Vec::with_capacity(tools.len());
+    let mut names = HashMap::new();
+    for tool in tools {
+        if tool.get("type").and_then(Value::as_str) != Some("namespace") {
+            lowered.push(lower_tool(tool, None, &mut names)?);
+            continue;
         }
-        Some("custom") => Err(bad(
-            "`custom` tools with freeform arguments are not supported; use a function tool",
-        )),
-        Some(other) => Err(bad(format!("hosted tool type `{other}` is not supported"))),
-        None => Err(bad("tool without a type")),
+        let namespace = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| bad("namespace tool without a name"))?;
+        let members = tool
+            .get("tools")
+            .and_then(Value::as_array)
+            .ok_or_else(|| bad(format!("namespace tool `{namespace}` without `tools`")))?;
+        for member in members {
+            lowered.push(lower_tool(member, Some(namespace), &mut names)?);
+        }
     }
+    // A lowered name that shadows another tool would send its calls to the wrong one.
+    for name in names.keys() {
+        if lowered
+            .iter()
+            .filter(|t| t["function"]["name"] == *name)
+            .count()
+            > 1
+        {
+            return Err(bad(format!(
+                "tool name `{name}` is declared more than once"
+            )));
+        }
+    }
+    Ok((lowered, names))
+}
+
+/// A flat Responses function tool, or a `custom` tool as a function of one
+/// string `input`, as a nested chat tool; a `namespace` member is named
+/// `<namespace>__<name>`.
+fn lower_tool(
+    tool: &Value,
+    namespace: Option<&str>,
+    names: &mut HashMap<String, ToolName>,
+) -> Result<Value, ResponsesError> {
+    let kind = tool.get("type").and_then(Value::as_str);
+    let custom = match kind {
+        Some("function") => false,
+        Some("custom") => true,
+        Some(other) => {
+            return Err(bad(match namespace {
+                Some(namespace) => {
+                    format!("tool type `{other}` in namespace `{namespace}` is not supported")
+                }
+                None => format!("hosted tool type `{other}` is not supported"),
+            }));
+        }
+        None => return Err(bad("tool without a type")),
+    };
+    let name = tool.get("name").and_then(Value::as_str).ok_or_else(|| {
+        bad(if custom {
+            "custom tool without a name"
+        } else {
+            "function tool without a name"
+        })
+    })?;
+    let chat_name = match namespace {
+        Some(namespace) => namespaced(namespace, name),
+        None => name.to_owned(),
+    };
+    let mut function = json!({"name": chat_name});
+    if custom {
+        // As SGLang's Python Responses layer offers it (`custom_tool_parameters`,
+        // `custom_tool_description`): the grammar is described, not enforced.
+        let mut description: Vec<String> = tool
+            .get("description")
+            .and_then(Value::as_str)
+            .filter(|d| !d.is_empty())
+            .map(str::to_owned)
+            .into_iter()
+            .collect();
+        if let Some(format) = tool.get("format").filter(|f| f["type"] == "grammar") {
+            let syntax = format["syntax"].as_str().filter(|s| !s.is_empty());
+            let definition = format["definition"].as_str().unwrap_or_default();
+            description.push(format!(
+                "The payload must conform to this {} grammar:\n{definition}",
+                syntax.unwrap_or("lark")
+            ));
+        }
+        if !description.is_empty() {
+            function["description"] = Value::String(description.join("\n\n"));
+        }
+        function["parameters"] = json!({
+            "type": "object",
+            "properties": {CUSTOM_TOOL_INPUT: {
+                "type": "string", "description": "The freeform text payload for this tool."}},
+            "required": [CUSTOM_TOOL_INPUT],
+            "additionalProperties": false,
+        });
+    } else {
+        for key in ["description", "parameters", "strict"] {
+            if let Some(v) = tool.get(key).filter(|v| !v.is_null()) {
+                function[key] = v.clone();
+            }
+        }
+    }
+    if custom || namespace.is_some() {
+        names.insert(
+            chat_name,
+            ToolName {
+                name: name.to_owned(),
+                namespace: namespace.map(str::to_owned),
+                custom,
+            },
+        );
+    }
+    Ok(json!({"type": "function", "function": function}))
 }
 
 fn lower_tool_choice(choice: &Value) -> Result<Value, ResponsesError> {
@@ -528,9 +676,58 @@ enum ItemKind {
     },
     FunctionCall {
         call_id: String,
+        /// The client's name: a namespace member's own, without its namespace.
         name: String,
         arguments: String,
+        namespace: Option<String>,
+        /// A `custom` tool's call: a `custom_tool_call` whose `input` is the
+        /// string the model passed as `arguments.input`.
+        custom: bool,
     },
+}
+
+/// A `custom` call's raw input from the arguments of the function it was
+/// offered as, as Python's `decode_custom_tool_input` recovers it: `input`, or
+/// a lone string argument, else the arguments text as sent.
+fn custom_input(arguments: &str) -> String {
+    if let Ok(Value::Object(object)) = serde_json::from_str::<Value>(arguments) {
+        if let Some(Value::String(input)) = object.get(CUSTOM_TOOL_INPUT) {
+            return input.clone();
+        }
+        if object.len() == 1
+            && let Some(Value::String(only)) = object.values().next()
+        {
+            return only.clone();
+        }
+    }
+    arguments.to_owned()
+}
+
+/// A completed or streaming tool-call item as the client declared the tool.
+fn call_item(
+    id: &str,
+    status: &str,
+    call_id: &str,
+    tool: &ToolName,
+    arguments: &str,
+    done: bool,
+) -> Value {
+    let mut item = if tool.custom {
+        let input = if done {
+            custom_input(arguments)
+        } else {
+            String::new()
+        };
+        json!({"id": id, "type": "custom_tool_call", "status": status,
+            "call_id": call_id, "name": tool.name, "input": input})
+    } else {
+        json!({"id": id, "type": "function_call", "status": status,
+            "call_id": call_id, "name": tool.name, "arguments": arguments})
+    };
+    if let Some(namespace) = &tool.namespace {
+        item["namespace"] = Value::String(namespace.clone());
+    }
+    item
 }
 
 #[derive(Debug)]
@@ -557,10 +754,20 @@ impl Item {
                 call_id,
                 name,
                 arguments,
-            } => json!({
-                "id": self.id, "type": "function_call", "status": status,
-                "call_id": call_id, "name": name, "arguments": arguments,
-            }),
+                namespace,
+                custom,
+            } => call_item(
+                &self.id,
+                status,
+                call_id,
+                &ToolName {
+                    name: name.clone(),
+                    namespace: namespace.clone(),
+                    custom: *custom,
+                },
+                arguments,
+                done,
+            ),
         }
     }
 }
@@ -632,6 +839,25 @@ impl ResponseShaper {
                 out.push(self.emit(
                     "response.reasoning_text.done",
                     json!({"item_id": id, "output_index": index, "content_index": 0, "text": text}),
+                ));
+            }
+            ItemKind::FunctionCall {
+                arguments,
+                custom: true,
+                ..
+            } => {
+                // The input streams whole once the call is done: its deltas
+                // would be the JSON-escaped `arguments`, not the input itself.
+                let input = custom_input(arguments);
+                if !input.is_empty() {
+                    out.push(self.emit(
+                        "response.custom_tool_call_input.delta",
+                        json!({"item_id": id, "output_index": index, "delta": input}),
+                    ));
+                }
+                out.push(self.emit(
+                    "response.custom_tool_call_input.done",
+                    json!({"item_id": id, "output_index": index, "input": input}),
                 ));
             }
             ItemKind::FunctionCall { arguments, .. } => {
@@ -746,12 +972,15 @@ impl ResponseShaper {
                 } else {
                     call_id.to_owned()
                 };
+                let tool = self.ctx.tool(name);
                 let item = Item {
-                    id: fresh_id("fc"),
+                    id: fresh_id(if tool.custom { "ctc" } else { "fc" }),
                     kind: ItemKind::FunctionCall {
                         call_id,
-                        name: name.to_owned(),
+                        name: tool.name,
                         arguments: String::new(),
+                        namespace: tool.namespace,
+                        custom: tool.custom,
                     },
                     done: false,
                 };
@@ -769,13 +998,19 @@ impl ResponseShaper {
         if let ItemKind::FunctionCall {
             name: item_name,
             arguments: item_args,
+            namespace: item_namespace,
+            custom,
             ..
         } = &mut self.items[index].kind
         {
             if item_name.is_empty() && !name.is_empty() {
-                *item_name = name.to_owned();
+                let tool = self.ctx.tool(name);
+                *item_name = tool.name;
+                *item_namespace = tool.namespace;
             }
-            if !arguments.is_empty() {
+            if *custom {
+                item_args.push_str(arguments);
+            } else if !arguments.is_empty() {
                 item_args.push_str(arguments);
                 let id = self.items[index].id.clone();
                 out.push(self.emit(
@@ -974,10 +1209,21 @@ impl ResponseShaper {
                     .and_then(Value::as_str)
                     .filter(|s| !s.is_empty())
                     .map(str::to_owned);
-                items.push(json!({"id": fresh_id("fc"), "type": "function_call", "status": "completed",
-                    "call_id": call_id.unwrap_or_else(|| fresh_id("call")),
-                    "name": call.pointer("/function/name").and_then(Value::as_str).unwrap_or(""),
-                    "arguments": call.pointer("/function/arguments").and_then(Value::as_str).unwrap_or("")}));
+                let tool = self.ctx.tool(
+                    call.pointer("/function/name")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                );
+                items.push(call_item(
+                    &fresh_id(if tool.custom { "ctc" } else { "fc" }),
+                    "completed",
+                    &call_id.unwrap_or_else(|| fresh_id("call")),
+                    &tool,
+                    call.pointer("/function/arguments")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                    true,
+                ));
             }
         }
         let finish = parsed
@@ -1098,8 +1344,26 @@ mod tests {
         assert!(lower(&with("background", json!(true))).is_err());
         assert!(lower(&with("store", json!(true))).is_err());
         assert!(lower(&with("store", json!(false))).is_ok());
-        assert!(lower(&with("tools", json!([{"type": "custom", "name": "x"}]))).is_err());
+        assert!(lower(&with("tools", json!([{"type": "custom", "name": "x"}]))).is_ok());
+        assert!(lower(&with("tools", json!([{"type": "custom"}]))).is_err());
         assert!(lower(&with("tools", json!([{"type": "web_search"}]))).is_err());
+        assert!(lower(&with("tools", json!([{"type": "namespace", "name": "ns"}]))).is_err());
+        assert!(
+            lower(&with(
+                "tools",
+                json!([{"type": "namespace", "name": "ns", "tools": [{"type": "web_search"}]}])
+            ))
+            .is_err()
+        );
+        // A flattened member may not shadow a function tool.
+        assert!(
+            lower(&with(
+                "tools",
+                json!([{"type": "function", "name": "ns__f"},
+                       {"type": "namespace", "name": "ns", "tools": [{"type": "function", "name": "f"}]}])
+            ))
+            .is_err()
+        );
         assert!(
             lower(&with(
                 "input",
@@ -1288,5 +1552,235 @@ mod tests {
         let error: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(error["error"]["type"], "invalid_request_error");
         assert_eq!(error["error"]["message"], "bad");
+    }
+
+    /// Codex 0.166's tools, as its `smoke/` request bodies send them: a
+    /// function tool, the `custom` tool `apply_patch` with a Lark grammar, and
+    /// an MCP server as a `namespace` of function tools.
+    fn codex_tools() -> Value {
+        json!([
+            {"type": "function", "name": "shell", "description": "Runs a shell command.", "strict": false,
+             "parameters": {"type": "object", "properties": {"command": {"type": "array", "items": {"type": "string"}}},
+                            "required": ["command"], "additionalProperties": false}},
+            {"type": "custom", "name": "apply_patch",
+             "description": "Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.",
+             "format": {"type": "grammar", "syntax": "lark",
+                        "definition": "start: begin_patch hunk+ end_patch\nbegin_patch: \"*** Begin Patch\" LF\nend_patch: \"*** End Patch\" LF?\nhunk: /(.+)\\n/+\n%import common.LF\n"}},
+            {"type": "namespace", "name": "mcp__docs", "description": "Tools in the mcp__docs namespace.",
+             "tools": [{"type": "function", "name": "search", "description": "Search the docs.", "strict": false,
+                        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}]}
+        ])
+    }
+
+    fn codex_request(tools: Value, input: Value) -> Value {
+        json!({"model": "k3", "store": false, "max_output_tokens": 16, "input": input, "tools": tools})
+    }
+
+    fn say_hi() -> Value {
+        json!([{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Say hi in 3 words."}]}])
+    }
+
+    #[test]
+    fn codex_custom_and_namespace_tools_lower_to_function_tools() {
+        let tools = codex_tools();
+        // The smoke shapes: the function-tool control (b1), then the custom
+        // tool (b2) and the namespace (b3) beside it.
+        for (picked, names) in [
+            (vec![0], vec!["shell"]),
+            (vec![0, 1], vec!["shell", "apply_patch"]),
+            (vec![0, 2], vec!["shell", "mcp__docs__search"]),
+        ] {
+            let declared = Value::Array(picked.iter().map(|&i| tools[i].clone()).collect());
+            let request = codex_request(declared.clone(), say_hi());
+            let Lowered { chat, context } = lower(&request).unwrap();
+            let lowered: Vec<&str> = chat["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["function"]["name"].as_str().unwrap())
+                .collect();
+            assert_eq!(lowered, names);
+            assert!(
+                chat["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|t| t["type"] == "function")
+            );
+            // The response echoes the tools as the client declared them.
+            let echoed = context.response("completed", vec![], None, None)["tools"].clone();
+            assert_eq!(echoed, declared);
+        }
+        let chat = lower(&codex_request(tools, say_hi())).unwrap().chat;
+        assert_eq!(
+            chat["tools"][0],
+            json!({"type": "function", "function": {
+            "name": "shell", "description": "Runs a shell command.", "strict": false,
+            "parameters": codex_tools()[0]["parameters"]}})
+        );
+        let patch = &chat["tools"][1]["function"];
+        assert_eq!(
+            patch["parameters"],
+            json!({"type": "object", "properties": {"input": {"type": "string",
+                "description": "The freeform text payload for this tool."}},
+                "required": ["input"], "additionalProperties": false})
+        );
+        let description = patch["description"].as_str().unwrap();
+        assert!(description.starts_with("Use the `apply_patch` tool to edit files."));
+        assert!(description.contains(
+            "\n\nThe payload must conform to this lark grammar:\nstart: begin_patch hunk+ end_patch\n"
+        ));
+        assert_eq!(
+            chat["tools"][2],
+            json!({"type": "function", "function": {
+            "name": "mcp__docs__search", "description": "Search the docs.", "strict": false,
+            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}})
+        );
+    }
+
+    #[test]
+    fn custom_and_namespaced_calls_come_back_as_declared() {
+        let ctx = lower(&codex_request(codex_tools(), say_hi()))
+            .unwrap()
+            .context;
+        let patch = "*** Begin Patch\n*** Add File: a.txt\n+hi \"there\"\n*** End Patch\n";
+        let completion = json!({"id": "c", "object": "chat.completion", "model": "k3",
+            "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {"role": "assistant", "content": null,
+                "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "apply_patch",
+                        "arguments": json!({"input": patch}).to_string()}},
+                    {"id": "call_2", "type": "function", "function": {"name": "mcp__docs__search",
+                        "arguments": "{\"query\":\"tools\"}"}},
+                    {"id": "call_3", "type": "function", "function": {"name": "apply_patch",
+                        "arguments": "not json"}},
+                    {"id": "call_4", "type": "function", "function": {"name": "shell",
+                        "arguments": "{\"command\":[\"ls\"]}"}}]}}]});
+        let (status, body) = ResponseShaper::new(ctx).unary(200, &completion.to_string());
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&body).unwrap();
+        let output = response["output"].as_array().unwrap();
+        assert_eq!(output[0]["type"], "custom_tool_call");
+        assert!(output[0]["id"].as_str().unwrap().starts_with("ctc_"));
+        assert_eq!(output[0]["call_id"], "call_1");
+        assert_eq!(output[0]["name"], "apply_patch");
+        assert_eq!(output[0]["input"], patch);
+        assert!(output[0].get("arguments").is_none() && output[0].get("namespace").is_none());
+        assert_eq!(output[1]["type"], "function_call");
+        assert_eq!(output[1]["name"], "search");
+        assert_eq!(output[1]["namespace"], "mcp__docs");
+        assert_eq!(output[1]["arguments"], "{\"query\":\"tools\"}");
+        // Arguments that are not the `input` object pass through as the input.
+        assert_eq!(output[2]["input"], "not json");
+        assert_eq!(output[3]["name"], "shell");
+        assert!(output[3].get("namespace").is_none());
+    }
+
+    #[test]
+    fn a_second_turn_replays_custom_and_namespaced_calls() {
+        let patch = "*** Begin Patch\n*** End Patch\n";
+        let mut input = say_hi().as_array().unwrap().clone();
+        input.extend([
+            json!({"type": "custom_tool_call", "call_id": "call_1", "name": "apply_patch", "input": patch, "status": "completed"}),
+            json!({"type": "custom_tool_call_output", "call_id": "call_1", "output": "Done!"}),
+            json!({"type": "function_call", "call_id": "call_2", "name": "search", "namespace": "mcp__docs", "arguments": "{\"query\":\"x\"}"}),
+            json!({"type": "function_call_output", "call_id": "call_2", "output": [{"type": "input_text", "text": "found"}]}),
+        ]);
+        let chat = lower(&codex_request(codex_tools(), Value::Array(input)))
+            .unwrap()
+            .chat;
+        let messages = chat["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[1]["role"], "assistant");
+        let call = &messages[1]["tool_calls"][0];
+        assert_eq!(call["id"], "call_1");
+        assert_eq!(call["function"]["name"], "apply_patch");
+        let arguments: Value =
+            serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments, json!({"input": patch}));
+        assert_eq!(
+            messages[2],
+            json!({"role": "tool", "tool_call_id": "call_1", "content": "Done!"})
+        );
+        assert_eq!(
+            messages[3]["tool_calls"][0]["function"],
+            json!({"name": "mcp__docs__search", "arguments": "{\"query\":\"x\"}"})
+        );
+        assert_eq!(
+            messages[4],
+            json!({"role": "tool", "tool_call_id": "call_2", "content": "found"})
+        );
+    }
+
+    #[test]
+    fn streams_custom_and_namespaced_calls_as_their_events() {
+        let mut request = codex_request(codex_tools(), say_hi());
+        request["stream"] = json!(true);
+        let mut shaper = ResponseShaper::new(lower(&request).unwrap().context);
+        let mut out = shaper.start();
+        let patch = "*** Begin Patch\n*** End Patch\n";
+        let arguments = json!({"input": patch}).to_string();
+        let (head, tail) = arguments.split_at(5);
+        for delta in [
+            json!({"tool_calls": [{"index": 0, "id": "call_1", "type": "function", "function": {"name": "apply_patch", "arguments": head}}]}),
+            json!({"tool_calls": [{"index": 0, "function": {"arguments": tail}}]}),
+            json!({"tool_calls": [{"index": 1, "id": "call_2", "type": "function", "function": {"name": "mcp__docs__search", "arguments": "{\"query\":"}}]}),
+            json!({"tool_calls": [{"index": 1, "function": {"arguments": "\"x\"}"}}]}),
+        ] {
+            out.extend(shaper.event(&chunk(delta, None, None)));
+        }
+        out.extend(shaper.event(&chunk(json!({}), Some("tool_calls"), None)));
+        out.extend(shaper.end());
+        let parsed = events(&out);
+        let kinds: Vec<&str> = parsed.iter().map(|(k, _)| k.as_str()).collect();
+        // Calls stay open until the stream ends; the custom call's input
+        // streams whole when it closes, never its JSON-wrapped arguments.
+        assert_eq!(
+            kinds,
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.output_item.added",
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.delta",
+                "response.custom_tool_call_input.delta",
+                "response.custom_tool_call_input.done",
+                "response.output_item.done",
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        let added = &parsed[2].1["item"];
+        assert_eq!(added["type"], "custom_tool_call");
+        assert!(added["id"].as_str().unwrap().starts_with("ctc_"));
+        assert_eq!(added["name"], "apply_patch");
+        assert_eq!(added["input"], "");
+        assert_eq!(parsed[6].1["delta"], patch);
+        assert_eq!(parsed[7].1["input"], patch);
+        assert_eq!(parsed[8].1["item"]["input"], patch);
+        assert_eq!(parsed[8].1["item"]["call_id"], "call_1");
+        let added = &parsed[3].1["item"];
+        assert_eq!(
+            (&added["type"], &added["name"], &added["namespace"]),
+            (
+                &json!("function_call"),
+                &json!("search"),
+                &json!("mcp__docs")
+            )
+        );
+        let done = &parsed[10].1["item"];
+        assert_eq!(
+            (&done["name"], &done["namespace"], &done["arguments"]),
+            (
+                &json!("search"),
+                &json!("mcp__docs"),
+                &json!("{\"query\":\"x\"}")
+            )
+        );
+        let output = parsed.last().unwrap().1["response"]["output"].clone();
+        assert_eq!(output[0]["type"], "custom_tool_call");
+        assert_eq!(output[0]["input"], patch);
+        assert_eq!(output[1]["namespace"], "mcp__docs");
     }
 }
