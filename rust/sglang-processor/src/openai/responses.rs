@@ -333,14 +333,22 @@ fn lower_items(items: &[Value], messages: &mut Vec<Value>) -> Result<(), Respons
             "function_call_output" => {
                 let call_id = object.get("call_id").and_then(Value::as_str).unwrap_or("");
                 let output = match object.get("output") {
-                    Some(Value::String(s)) => s.clone(),
-                    Some(Value::Array(parts)) => parts
-                        .iter()
-                        .filter_map(|p| p.get("text").and_then(Value::as_str))
-                        .collect::<Vec<_>>()
-                        .join(""),
-                    Some(other) if !other.is_null() => other.to_string(),
-                    _ => String::new(),
+                    Some(Value::String(s)) => Value::String(s.clone()),
+                    // Python flattens parts to their text; media a tool returned
+                    // keeps its place as chat content parts instead of
+                    // disappearing (or answers 400, as in a message).
+                    Some(output @ Value::Array(parts)) if parts.iter().any(is_media_part) => {
+                        lower_content(Some(output), "tool")?
+                    }
+                    Some(Value::Array(parts)) => Value::String(
+                        parts
+                            .iter()
+                            .filter_map(|p| p.get("text").and_then(Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join(""),
+                    ),
+                    Some(other) if !other.is_null() => Value::String(other.to_string()),
+                    _ => Value::String(String::new()),
                 };
                 messages.push(json!({"role": "tool", "tool_call_id": call_id, "content": output}));
             }
@@ -383,6 +391,14 @@ fn reasoning_text(item: &Map<String, Value>) -> String {
     } else {
         from("summary", "summary_text")
     }
+}
+
+/// A media content part: `lower_content` maps it to a chat part or refuses it.
+fn is_media_part(part: &Value) -> bool {
+    matches!(
+        part.get("type").and_then(Value::as_str),
+        Some("input_image" | "input_audio" | "input_file")
+    )
 }
 
 /// A message's content as chat content: a string stays one; parts map by type.
@@ -1127,6 +1143,88 @@ mod tests {
         assert_eq!(
             lowered.chat["messages"][0]["content"][0]["image_url"]["detail"],
             "low"
+        );
+    }
+
+    /// An image a tool returned reaches the chat tool message as an image
+    /// part; text-only output stays the string Python flattens it to.
+    #[test]
+    fn tool_output_images_are_kept_as_chat_parts() {
+        let png = "data:image/png;base64,AA";
+        let with_output = |output: Value| {
+            json!({"model": "k3", "input": [
+                {"role": "user", "content": "look at the page"},
+                {"type": "function_call", "call_id": "call_1", "name": "read_media", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": output}]})
+        };
+        let image = lower(&with_output(json!([
+            {"type": "input_text", "text": "page 1"},
+            {"type": "input_image", "image_url": png, "detail": "high"}])))
+        .unwrap();
+        assert_eq!(
+            image.chat["messages"][2],
+            json!({"role": "tool", "tool_call_id": "call_1", "content": [
+                {"type": "text", "text": "page 1"},
+                {"type": "image_url", "image_url": {"url": png, "detail": "high"}}]})
+        );
+        let text = lower(&with_output(json!([
+            {"type": "input_text", "text": "a"},
+            {"type": "output_text", "text": "b"}])))
+        .unwrap();
+        assert_eq!(text.chat["messages"][2]["content"], "ab");
+        assert_eq!(
+            lower(&with_output(json!("12C"))).unwrap().chat["messages"][2]["content"],
+            "12C"
+        );
+        // Media lowering refuses what a message refuses, rather than dropping it.
+        assert!(
+            lower(&with_output(
+                json!([{"type": "input_file", "file_id": "f"}])
+            ))
+            .is_err()
+        );
+        assert!(
+            lower(&with_output(
+                json!([{"type": "input_image", "file_id": "f"}])
+            ))
+            .is_err()
+        );
+    }
+
+    /// The lowered tool message keeps the image on Kimi K3's token path:
+    /// `/generate` gets it as `image_data`.
+    #[test]
+    fn kimi_k3_tool_output_image_reaches_generate() {
+        use crate::openai::{ChatModel, OpenAiHeaders, OpenAiSettings, lower_chat};
+        let body = json!({"model": "k3", "input": [
+            {"role": "user", "content": "look"},
+            {"type": "function_call", "call_id": "call_1", "name": "read_media", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": [
+                {"type": "input_image", "image_url": "data:image/png;base64,AA"}]}],
+            "tools": [{"type": "function", "name": "read_media", "parameters": {"type": "object"}}]});
+        let chat = lower(&body).unwrap().chat;
+        let k3 = ChatModel {
+            chat_encoding_spec: Some("kimi_k3".into()),
+            is_multimodal: true,
+            ..ChatModel::default()
+        };
+        let settings = OpenAiSettings {
+            reasoning_parser: Some("kimi_k3".into()),
+            tool_call_parser: Some("kimi_k3".into()),
+            ..OpenAiSettings::default()
+        };
+        let (generate, _) = lower_chat(
+            &serde_json::to_vec(&chat).unwrap(),
+            &OpenAiHeaders::default(),
+            &settings,
+            &k3,
+            |_: &Value| Some(vec![1, 7]),
+            None,
+        )
+        .expect("a Responses tool output image lowers for Kimi K3");
+        assert!(
+            generate.image_data.is_some(),
+            "image_data carries the tool's image"
         );
     }
 
