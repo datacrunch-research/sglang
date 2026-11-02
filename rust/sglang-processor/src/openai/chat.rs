@@ -601,20 +601,50 @@ fn schema_is_standard(schema: &Value) -> bool {
         | "minContains" | "maxContains" => value.is_u64(),
         "uniqueItems" | "readOnly" | "writeOnly" | "deprecated" => value.is_boolean(),
         "dependentRequired" => value.as_object().is_some_and(|m| m.values().all(strings)),
-        // Python `re` and Rust `regex` accept different patterns; normalization
-        // also walks the remaining keywords, which tool schemas rarely use.
-        "pattern"
-        | "patternProperties"
-        | "dependentSchemas"
-        | "dependencies"
-        | "if"
-        | "then"
-        | "else"
-        | "propertyNames"
-        | "unevaluatedItems"
-        | "unevaluatedProperties" => false,
+        // Keywords that hold only subschemas: `check_schema` asks that each be a
+        // schema and `normalize_json_schema_types` walks into it, so a standard
+        // subschema is one both leave as is.
+        "if" | "then" | "else" | "propertyNames" | "unevaluatedItems" | "unevaluatedProperties" => {
+            schema_is_standard(value)
+        }
+        "dependentSchemas" => schemas(value),
+        // `check_schema` compiles them with Python `re` (format `regex`); see `re_compiles`.
+        "pattern" => value.as_str().is_some_and(re_compiles),
+        "patternProperties" => value.as_object().is_some_and(|m| {
+            m.iter()
+                .all(|(key, v)| re_compiles(key) && schema_is_standard(v))
+        }),
+        // Draft 7's form, which neither normalizer walks: a schema, or the
+        // property names the key requires.
+        "dependencies" => value.as_object().is_some_and(|m| {
+            m.values()
+                .all(|v| schema_is_standard(v) || unique_strings(v, None))
+        }),
         _ => true,
     })
+}
+
+/// Whether Python `re` compiles `pattern`, judged with Rust's parser: a pattern
+/// regex-syntax parses is one `re` compiles too, once the syntax only Rust has
+/// is ruled out. Judged conservatively: a doubt sends the request to the engine.
+fn re_compiles(pattern: &str) -> bool {
+    // Escapes `re` rejects as unknown; regex-syntax reads them as classes,
+    // anchors, word boundaries and brace-delimited code points.
+    const RUST_ONLY_ESCAPES: &[&str] = &["\\p", "\\P", "\\z", "\\<", "\\>", "\\x{", "\\u{", "\\U{"];
+    if RUST_ONLY_ESCAPES
+        .iter()
+        .any(|escape| pattern.contains(escape))
+    {
+        return false;
+    }
+    // `(?:` and `(?P<` are the groups both sides accept. Flags (`re` wants them
+    // first), lookarounds and Rust's `(?<name>` are not; an escaped `(` is a literal.
+    let bytes = pattern.as_bytes();
+    let groups_shared = pattern.match_indices("(?").all(|(i, _)| {
+        let escaped = bytes[..i].iter().rev().take_while(|&&b| b == b'\\').count() % 2 == 1;
+        escaped || pattern[i + 2..].starts_with(':') || pattern[i + 2..].starts_with("P<")
+    });
+    groups_shared && regex_syntax::Parser::new().parse(pattern).is_ok()
 }
 
 fn truthy(value: &Value) -> bool {
@@ -1585,6 +1615,270 @@ mod tests {
             {"role": "tool", "content": "42", "tool_call_id": "c"},
         ]);
         assert_eq!(unsupported(messages), None);
+    }
+
+    fn tools_with(parameters: Value) -> Result<Option<Vec<String>>, Unsupported> {
+        let raw = json!({"tools": [{"type": "function", "function": {"name": "f", "parameters": parameters}}]});
+        request_tools(raw.as_object().unwrap())
+    }
+
+    /// Keywords that hold only subschemas are judged by their subschemas, as
+    /// `check_schema` and `normalize_json_schema_types` judge them.
+    #[test]
+    fn subschema_keywords_are_lowered() {
+        let key = json!({"type": "string", "minLength": 1});
+        for schema in [
+            // Kimi Code's `AgentSwarm.resume_agent_ids`.
+            json!({"type": "object", "properties": {"m": {
+                "type": "object", "propertyNames": key, "additionalProperties": key}}}),
+            json!({"type": "object", "if": {"required": ["a"]}, "then": {"required": ["b"]}, "else": false}),
+            json!({"type": "object", "properties": {"m": {"type": "array", "unevaluatedItems": false}}}),
+            json!({"type": "object", "unevaluatedProperties": {"type": "integer"}}),
+            json!({"type": "object", "dependentSchemas": {"a": {"required": ["b"]}}}),
+        ] {
+            assert_eq!(
+                tools_with(schema.clone()),
+                Ok(Some(vec!["f".to_owned()])),
+                "{schema}"
+            );
+        }
+    }
+
+    /// Subschemas normalization would rewrite, and values that are not
+    /// schemas, still go to the engine's own OpenAI layer.
+    #[test]
+    fn schemas_python_may_judge_otherwise_go_to_the_engine() {
+        for schema in [
+            json!({"type": "object", "propertyNames": {"type": "varchar"}}),
+            json!({"type": "object", "propertyNames": 1}),
+            json!({"type": "object", "if": "x"}),
+            json!({"type": "object", "dependentSchemas": {"a": 1}}),
+            json!({"type": "object", "dependentSchemas": []}),
+        ] {
+            assert_eq!(
+                tools_with(schema.clone()),
+                Err(Unsupported("tool_definition")),
+                "{schema}"
+            );
+        }
+    }
+
+    /// Kimi Code's main agent: an image with a tool that constrains its map
+    /// keys by `propertyNames` lowers with the image's source, so it never
+    /// reaches the engine's text-only OpenAI route.
+    #[test]
+    fn kimi_k3_image_with_a_property_names_tool_lowers() {
+        let key = json!({"type": "string", "minLength": 1});
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what is this"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]}],
+            "tools": [{"type": "function", "function": {"name": "AgentSwarm", "parameters": {
+                "type": "object", "properties": {"resume_agent_ids": {
+                    "type": "object", "propertyNames": key, "additionalProperties": key}}}}}],
+        });
+        let k3 = ChatModel {
+            chat_encoding_spec: Some("kimi_k3".into()),
+            is_multimodal: true,
+            ..ChatModel::default()
+        };
+        let settings = OpenAiSettings {
+            reasoning_parser: Some("kimi_k3".into()),
+            tool_call_parser: Some("kimi_k3".into()),
+            ..OpenAiSettings::default()
+        };
+        let (generate, _) = lower_chat(
+            &serde_json::to_vec(&body).unwrap(),
+            &OpenAiHeaders::default(),
+            &settings,
+            &k3,
+            |_: &Value| Some(vec![1, 7]),
+            None,
+        )
+        .expect("an image and a propertyNames tool lower for Kimi K3");
+        assert!(
+            generate.image_data.is_some(),
+            "image_data carries the source"
+        );
+    }
+
+    /// `check_schema` compiles a tool schema's `pattern` and the keys of its
+    /// `patternProperties` with Python `re`, so one both parsers accept lowers;
+    /// one only Python or only Rust accepts, and a non-string, go to the engine.
+    #[test]
+    fn tool_schema_patterns_lower_when_both_parsers_accept_them() {
+        let with_pattern = |pattern: &str| json!({"type": "object", "properties": {"start": {"type": "string", "pattern": pattern}}});
+        for pattern in [
+            r"^[a-z]+$",
+            r"^([0-9]+)(:[0-9]+)?$",
+            r"^\d{4}-\d{2}-\d{2}$",
+            r"^.+$",
+            r"^((?:\d{4}-\d{2}-\d{2})T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?|now(?:-\d+[smhd])?)$",
+            r"\(?\d{3}\)?",
+            r"(?P<year>\d{4})",
+            r"[[:alpha:]]+",
+        ] {
+            assert_eq!(
+                tools_with(with_pattern(pattern)),
+                Ok(Some(vec!["f".to_owned()])),
+                "{pattern}"
+            );
+        }
+        for schema in [
+            json!({"type": "object", "patternProperties": {"^x": {"type": "string"}, r"^\d+$": true}}),
+            json!({"type": "object", "propertyNames": {"pattern": "^x"}}),
+        ] {
+            assert_eq!(
+                tools_with(schema.clone()),
+                Ok(Some(vec!["f".to_owned()])),
+                "{schema}"
+            );
+        }
+        for pattern in [
+            r"\p{L}+",
+            r"end\z",
+            r"\x{41}",
+            r"(?i)abc",
+            r"(?=a)b",
+            r"(?<name>a)",
+            r"(a)\1",
+        ] {
+            assert_eq!(
+                tools_with(with_pattern(pattern)),
+                Err(Unsupported("tool_definition")),
+                "{pattern}"
+            );
+        }
+        for schema in [
+            json!({"type": "object", "pattern": 1}),
+            json!({"type": "object", "patternProperties": {r"^\p{L}": {"type": "string"}}}),
+            json!({"type": "object", "patternProperties": []}),
+        ] {
+            assert_eq!(
+                tools_with(schema.clone()),
+                Err(Unsupported("tool_definition")),
+                "{schema}"
+            );
+        }
+    }
+
+    /// Draft 7's `dependencies` takes a schema or a list of property names, as
+    /// `check_schema` asks; the Notion MCP tool lowers whole.
+    #[test]
+    fn dependencies_and_the_notion_tool_lower() {
+        for schema in [
+            json!({"type": "object", "dependencies": {"a": ["b"], "c": {"required": ["d"]}}}),
+            notion_create_pages(),
+        ] {
+            assert_eq!(
+                tools_with(schema.clone()),
+                Ok(Some(vec!["f".to_owned()])),
+                "{schema}"
+            );
+        }
+        assert_eq!(
+            tools_with(json!({"type": "object", "dependencies": {"a": 1}})),
+            Err(Unsupported("tool_definition"))
+        );
+    }
+
+    /// With Kimi K3's parsers, as the cards run them, the Notion tool and a
+    /// VictoriaLogs-shaped tool lower beside an image, with the auto tag set.
+    #[test]
+    fn kimi_k3_lowers_mcp_tools_with_its_auto_tag() {
+        let victoria = json!({"type": "object", "properties": {
+            "query": {"type": "string"},
+            "start": {"type": "string", "pattern": r"^((?:\d{4}-\d{2}-\d{2})T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?|now(?:-\d+[smhd])?)$"},
+            "tenant": {"type": "string", "pattern": r"^([0-9]+)(:[0-9]+)?$"}},
+            "required": ["query"]});
+        let settings = OpenAiSettings {
+            reasoning_parser: Some("kimi_k3".into()),
+            tool_call_parser: Some("kimi_k3".into()),
+            ..OpenAiSettings::default()
+        };
+        let k3 = ChatModel {
+            chat_encoding_spec: Some("kimi_k3".into()),
+            is_multimodal: true,
+            ..ChatModel::default()
+        };
+        let render = |_: &Value| Some(vec![1, 7, 7]);
+        for parameters in [notion_create_pages(), victoria] {
+            let body = serde_json::to_vec(&json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "what is this"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]}],
+                "tools": [{"type": "function", "function": {"name": "f", "parameters": parameters}}],
+            }))
+            .unwrap();
+            let (generate, _) = lower_chat(
+                &body,
+                &OpenAiHeaders::default(),
+                &settings,
+                &k3,
+                render,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{parameters}: {e:?}"));
+            let Some(sampling_params_or_list::Value::One(sampling)) =
+                generate.sampling_params.and_then(|p| p.value)
+            else {
+                panic!("one sampling configuration")
+            };
+            assert!(sampling.structural_tag.is_some_and(|tag| !tag.is_empty()));
+            assert!(generate.image_data.is_some());
+        }
+    }
+
+    /// The Notion MCP server's `notion-create-pages` parameters (2 Nov 2026),
+    /// descriptions shortened.
+    fn notion_create_pages() -> Value {
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "additionalProperties": {},
+            "properties": {
+                "allow_async": {"description": "Default to true.", "type": "boolean"},
+                "creation_mode": {"description": "Draft mode.", "enum": ["draft"], "type": "string"},
+                "pages": {
+                    "description": "The pages to create.",
+                    "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                            "content": {"description": "Notion Markdown.", "type": "string"},
+                            "is_skill": {"type": "boolean"},
+                            "properties": {
+                                "additionalProperties": {"anyOf": [
+                                    {"type": "string"}, {"type": "number"},
+                                    {"items": {"type": "string"}, "maxItems": 100, "type": "array"},
+                                    {"type": "null"}]},
+                                "description": "Property names to SQLite values.",
+                                "propertyNames": {"type": "string"},
+                                "type": "object"
+                            },
+                            "template_id": {"type": "string"}
+                        },
+                        "type": "object"
+                    },
+                    "maxItems": 100,
+                    "type": "array"
+                },
+                "parent": {
+                    "anyOf": [
+                        {"description": "Always `memory`", "enum": ["memory"], "type": "string"},
+                        {"additionalProperties": {}, "properties": {"page_id": {"type": "string"},
+                            "type": {"enum": ["page_id"], "type": "string"}}, "required": ["page_id"], "type": "object"},
+                        {"additionalProperties": false, "properties": {"teamspace_id": {"type": "string"}},
+                            "required": ["teamspace_id"], "type": "object"}
+                    ],
+                    "description": "All pages in one call share this parent."
+                },
+                "telemetry": {"properties": {"feedback": {"enum": ["bug", "opportunity"], "type": "string"},
+                    "intent": {"maxLength": 300, "type": "string"}}, "type": "object"}
+            },
+            "required": ["pages"],
+            "type": "object"
+        })
     }
 
     #[test]

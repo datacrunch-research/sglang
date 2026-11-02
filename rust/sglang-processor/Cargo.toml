@@ -19,7 +19,7 @@ render = [
 ]
 tokenizer = ["dep:dynamo-tokenizers"]
 # OpenAI endpoints served through `/generate`.
-openai = ["dep:regex", "dep:uuid", "dep:sglang-api-types"]
+openai = ["dep:regex", "dep:regex-syntax", "dep:uuid", "dep:sglang-api-types"]
 
 [dependencies]
 sglang-api-types = { version = "0.1.0", path = "../sglang-api-types", optional = true }
@@ -43,6 +43,9 @@ dynamo-protocols = { version = "7.0.0", optional = true }
 dynamo-renderer = { version = "7.1.1", optional = true }
 hf-hub = { version = "0.4", default-features = false }
 regex = { version = "1", optional = true }
+# Pinned as in sglang-server: what this parser accepts decides which tool
+# schema `pattern`s lower (`re_compiles`); a bump can widen that silently.
+regex-syntax = { version = "=0.8.11", optional = true }
 uuid = { workspace = true, optional = true }
 minijinja = { version = "2.24.0", features = ["unstable_machinery"], optional = true }
 
