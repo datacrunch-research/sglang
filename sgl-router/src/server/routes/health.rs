@@ -72,6 +72,23 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
     }
 
+    /// `/health` is the liveness path SGLang engines and sgl-model-gateway
+    /// serve; a probe written for them must get 200 here, not 404.
+    #[tokio::test]
+    async fn health_is_served_as_liveness() {
+        let app = crate::server::app::build_router(test_ctx(false, false));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn readyz_503_when_not_ready() {
         let app = crate::server::app::build_router(test_ctx(false, true));
