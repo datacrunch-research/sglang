@@ -825,8 +825,19 @@ impl ResponseShaper {
         format!("event: {kind}\ndata: {body}\n\n")
     }
 
+    /// The output items; one the stream left open is `incomplete`, as the
+    /// failed response it ends in was cut around it.
     fn output(&self) -> Vec<Value> {
-        self.items.iter().map(|item| item.value(true)).collect()
+        self.items
+            .iter()
+            .map(|item| {
+                let mut value = item.value(true);
+                if !item.done {
+                    value["status"] = json!("incomplete");
+                }
+                value
+            })
+            .collect()
     }
 
     /// Closes the item at `index`: its text or arguments done, then the item.
@@ -1067,12 +1078,17 @@ impl ResponseShaper {
         vec![self.emit("response.failed", json!({"response": response}))]
     }
 
-    /// The terminal event: completed, or incomplete when the model hit its
-    /// token budget.
+    /// The terminal event, by [`ending`]: completed, incomplete when the
+    /// model hit its token budget, failed when the generation was cut.
     fn finish(&mut self) -> Vec<String> {
         if self.completed || self.failed {
             return Vec::new();
         }
+        let (status, incomplete) = match ending(self.finish_reason.as_deref(), true) {
+            Ending::Completed => ("completed", None),
+            Ending::Incomplete(reason) => ("incomplete", Some(json!({"reason": reason}))),
+            Ending::Failed(message) => return self.fail(500, &json!({"message": message})),
+        };
         self.completed = true;
         let mut out = self.close_open();
         let open: Vec<usize> = (0..self.items.len())
@@ -1081,11 +1097,6 @@ impl ResponseShaper {
         for index in open {
             out.extend(self.close(index));
         }
-        let (status, incomplete) = match self.finish_reason.as_deref() {
-            Some("length") => ("incomplete", Some(json!({"reason": "max_output_tokens"}))),
-            Some("content_filter") => ("incomplete", Some(json!({"reason": "content_filter"}))),
-            _ => ("completed", None),
-        };
         let response = self
             .ctx
             .response(status, self.output(), self.usage.clone(), incomplete);
@@ -1096,6 +1107,48 @@ impl ResponseShaper {
         };
         out.push(self.emit(kind, json!({"response": response})));
         out
+    }
+}
+
+/// How a response ends, by the chat `finish_reason` of its choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Ending {
+    Completed,
+    /// Its `incomplete_details.reason`.
+    Incomplete(&'static str),
+    /// Its `error.message`; the error's code is `server_error`.
+    Failed(String),
+}
+
+/// The ending a chat `finish_reason` gives the response. Only a model that
+/// finished its answer completes it; anything else is never `completed`, so
+/// a client retries an answer that was cut and usage is not recorded as a
+/// finished generation:
+/// - `stop`, `tool_calls` and the deprecated `function_call`: completed.
+/// - `length` and `content_filter`: incomplete, with the spec's reasons
+///   `max_output_tokens` and `content_filter`.
+/// - `abort` (SGLang's graceful abort), `server_interrupted` (how a server
+///   may report that abort, or an engine error after the stream started) and
+///   `error`: failed.
+/// - Any other reason: failed, as nothing says the answer is whole.
+/// - None: a stream that ended without one was cut (the backend crashed,
+///   timed out or restarted mid-answer), so it fails. A unary reply arrived
+///   whole, so it completes, as SGLang's Python Responses layer does.
+fn ending(finish_reason: Option<&str>, streamed: bool) -> Ending {
+    match finish_reason {
+        Some("stop" | "tool_calls" | "function_call") => Ending::Completed,
+        Some("length") => Ending::Incomplete("max_output_tokens"),
+        Some("content_filter") => Ending::Incomplete("content_filter"),
+        Some(reason @ ("abort" | "server_interrupted" | "error")) => Ending::Failed(format!(
+            "the generation was interrupted (finish_reason `{reason}`)"
+        )),
+        Some(reason) => Ending::Failed(format!(
+            "the generation ended with an unrecognized finish_reason `{reason}`"
+        )),
+        None if streamed => {
+            Ending::Failed("the backend stream ended before the generation finished".into())
+        }
+        None => Ending::Completed,
     }
 }
 
@@ -1245,21 +1298,30 @@ impl ResponseShaper {
         let finish = parsed
             .pointer("/choices/0/finish_reason")
             .and_then(Value::as_str);
-        let (state, incomplete) = match finish {
-            Some("length") => ("incomplete", Some(json!({"reason": "max_output_tokens"}))),
-            Some("content_filter") => ("incomplete", Some(json!({"reason": "content_filter"}))),
-            _ => ("completed", None),
+        let (state, incomplete, error) = match ending(finish, false) {
+            Ending::Completed => ("completed", None, None),
+            Ending::Incomplete(reason) => ("incomplete", Some(json!({"reason": reason})), None),
+            Ending::Failed(message) => (
+                "failed",
+                None,
+                Some(json!({"code": error_type(500), "message": message})),
+            ),
         };
+        if error.is_some() {
+            // The generation was cut, so none of its items is whole.
+            for item in &mut items {
+                item["status"] = json!("incomplete");
+            }
+        }
         let usage = parsed
             .get("usage")
             .filter(|u| u.is_object())
             .map(usage_value);
-        (
-            200,
-            self.ctx
-                .response(state, items, usage, incomplete)
-                .to_string(),
-        )
+        let mut response = self.ctx.response(state, items, usage, incomplete);
+        if let Some(error) = error {
+            response["error"] = error;
+        }
+        (200, response.to_string())
     }
 }
 
@@ -1607,6 +1669,229 @@ mod tests {
         assert_eq!(failed[0].1["response"]["status"], "failed");
         assert_eq!(failed[0].1["response"]["error"]["message"], "boom");
         assert!(shaper.end().is_empty());
+    }
+
+    /// A chat `finish_reason` (`None`: the stream ended without one), then
+    /// the terminal event, `status`, `incomplete_details.reason` and
+    /// `error.code` it ends a stream in.
+    type StreamEnding = (
+        Option<&'static str>,
+        &'static str,
+        &'static str,
+        Option<&'static str>,
+        Option<&'static str>,
+    );
+
+    /// Every chat `finish_reason` a backend reports, one unknown to the
+    /// shaper and none at all.
+    const STREAM_ENDINGS: [StreamEnding; 10] = [
+        (Some("stop"), "response.completed", "completed", None, None),
+        (
+            Some("tool_calls"),
+            "response.completed",
+            "completed",
+            None,
+            None,
+        ),
+        (
+            Some("function_call"),
+            "response.completed",
+            "completed",
+            None,
+            None,
+        ),
+        (
+            Some("length"),
+            "response.incomplete",
+            "incomplete",
+            Some("max_output_tokens"),
+            None,
+        ),
+        (
+            Some("content_filter"),
+            "response.incomplete",
+            "incomplete",
+            Some("content_filter"),
+            None,
+        ),
+        (
+            Some("abort"),
+            "response.failed",
+            "failed",
+            None,
+            Some("server_error"),
+        ),
+        (
+            Some("server_interrupted"),
+            "response.failed",
+            "failed",
+            None,
+            Some("server_error"),
+        ),
+        (
+            Some("error"),
+            "response.failed",
+            "failed",
+            None,
+            Some("server_error"),
+        ),
+        (
+            Some("not_a_finish_reason"),
+            "response.failed",
+            "failed",
+            None,
+            Some("server_error"),
+        ),
+        (
+            None,
+            "response.failed",
+            "failed",
+            None,
+            Some("server_error"),
+        ),
+    ];
+
+    const TERMINAL: [&str; 3] = [
+        "response.completed",
+        "response.incomplete",
+        "response.failed",
+    ];
+
+    #[test]
+    fn each_finish_reason_ends_a_stream_as_the_spec_names_it() {
+        let ctx = lower(&json!({"model": "k3", "input": "hi", "stream": true}))
+            .unwrap()
+            .context;
+        let usage = json!({"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4});
+        for (finish, event, status, incomplete, code) in STREAM_ENDINGS {
+            let what = format!("finish_reason {finish:?}");
+            let mut shaper = ResponseShaper::new(ctx.clone());
+            let mut out = shaper.start();
+            out.extend(shaper.event(&chunk(json!({"content": "x"}), None, None)));
+            out.extend(shaper.event(&chunk(json!({}), finish, Some(usage.clone()))));
+            if finish.is_some() {
+                out.extend(shaper.event("data: [DONE]\n\n"));
+            }
+            out.extend(shaper.end());
+            let parsed = events(&out);
+            let terminal: Vec<&str> = parsed
+                .iter()
+                .map(|(k, _)| k.as_str())
+                .filter(|k| TERMINAL.contains(k))
+                .collect();
+            assert_eq!(terminal, vec![event], "{what}");
+            let response = &parsed.last().unwrap().1["response"];
+            assert_eq!(response["status"], status, "{what}");
+            assert_eq!(
+                response["incomplete_details"]["reason"].as_str(),
+                incomplete,
+                "{what}"
+            );
+            assert_eq!(response["error"]["code"].as_str(), code, "{what}");
+            assert_eq!(response["usage"]["input_tokens"], 3, "{what}");
+            // An interrupted answer is not whole: its message is never done.
+            let whole = code.is_none();
+            assert_eq!(
+                parsed.iter().any(|(k, _)| k == "response.output_text.done"),
+                whole,
+                "{what}"
+            );
+            assert_eq!(
+                response["output"][0]["status"],
+                if whole { "completed" } else { "incomplete" },
+                "{what}"
+            );
+            assert!(shaper.end().is_empty(), "{what}: one terminal event");
+        }
+    }
+
+    /// A backend that drops the stream in the middle of a tool call (a
+    /// crash, a timeout, a pod restart): the response fails, the call is
+    /// never done, and nothing says the answer completed.
+    #[test]
+    fn a_stream_cut_mid_tool_call_fails_the_response() {
+        let ctx = lower(&json!({"model": "k3", "input": "hi", "stream": true}))
+            .unwrap()
+            .context;
+        let mut shaper = ResponseShaper::new(ctx);
+        let mut out = shaper.start();
+        out.extend(shaper.event(&chunk(json!({"content": "Let me look."}), None, None)));
+        out.extend(shaper.event(&chunk(
+            json!({"tool_calls": [{"index": 0, "id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{\"a\""}}]}),
+            None,
+            None,
+        )));
+        out.extend(shaper.end());
+        let parsed = events(&out);
+        let kinds: Vec<&str> = parsed.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.output_item.added",
+                "response.function_call_arguments.delta",
+                "response.failed",
+            ]
+        );
+        let response = &parsed.last().unwrap().1["response"];
+        assert_eq!(response["status"], "failed");
+        assert_eq!(response["error"]["code"], "server_error");
+        assert_eq!(
+            response["error"]["message"],
+            "the backend stream ended before the generation finished"
+        );
+        // The message closed before the call began; the call was cut.
+        assert_eq!(response["output"][0]["status"], "completed");
+        assert_eq!(response["output"][1]["type"], "function_call");
+        assert_eq!(response["output"][1]["status"], "incomplete");
+        assert_eq!(response["output"][1]["arguments"], "{\"a\"");
+        assert!(shaper.end().is_empty());
+    }
+
+    #[test]
+    fn each_finish_reason_ends_a_unary_reply_as_the_spec_names_it() {
+        let ctx = lower(&json!({"model": "k3", "input": "hi"}))
+            .unwrap()
+            .context;
+        for (finish, _, status, incomplete, code) in STREAM_ENDINGS {
+            // A unary reply arrived whole: without a finish reason it completes.
+            let (status, code) = match finish {
+                None => ("completed", None),
+                Some(_) => (status, code),
+            };
+            let what = format!("finish_reason {finish:?}");
+            let completion = json!({"id": "c", "object": "chat.completion", "model": "k3",
+                "choices": [{"index": 0, "finish_reason": finish,
+                    "message": {"role": "assistant", "content": "x"}}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}});
+            let (http, body) = ResponseShaper::new(ctx.clone()).unary(200, &completion.to_string());
+            assert_eq!(http, 200, "{what}");
+            let response: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(response["status"], status, "{what}");
+            assert_eq!(
+                response["incomplete_details"]["reason"].as_str(),
+                incomplete,
+                "{what}"
+            );
+            assert_eq!(response["error"]["code"].as_str(), code, "{what}");
+            assert_eq!(response["usage"]["input_tokens"], 3, "{what}");
+            assert_eq!(
+                response["output"][0]["status"],
+                if code.is_none() {
+                    "completed"
+                } else {
+                    "incomplete"
+                },
+                "{what}"
+            );
+        }
     }
 
     #[test]
