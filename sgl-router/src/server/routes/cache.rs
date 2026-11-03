@@ -22,6 +22,10 @@ use std::time::Duration;
 /// and run as slots free up.
 const MAX_CONCURRENT_FLUSH: usize = 32;
 
+/// Cap on the bytes of a refusing worker's answer copied into its error.
+/// Arbitrary; SGLang's refusals are one short line.
+const MAX_WORKER_ANSWER_BYTES: usize = 512;
+
 /// One worker that failed to flush, with a human-readable reason.
 #[derive(Serialize)]
 pub struct FailedWorker {
@@ -59,9 +63,10 @@ impl FlushCacheResult {
             )
         } else {
             format!(
-                "Cache flush: {} succeeded, {} failed",
+                "Cache flush: {} succeeded, {} failed: {}",
                 successful.len(),
-                failed.len()
+                failed.len(),
+                describe_failed(&failed)
             )
         };
         Self {
@@ -71,6 +76,15 @@ impl FlushCacheResult {
             message,
         }
     }
+}
+
+/// `<worker> (<error>)` for each failed worker, `; `-separated.
+fn describe_failed(failed: &[FailedWorker]) -> String {
+    failed
+        .iter()
+        .map(|f| format!("{} ({})", f.worker, f.error))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Query string of `GET /internal/kv_snapshot`.
@@ -218,7 +232,11 @@ fn json_error(status: StatusCode, message: &str) -> Response {
 ///
 /// Status: `200 OK` when every worker flushed successfully (or the fleet is
 /// empty); `502 BAD_GATEWAY` when at least one worker failed. The JSON body
-/// always carries the full breakdown so a partial failure is actionable.
+/// always carries the full breakdown so a partial failure is actionable: each
+/// failed worker's error holds its HTTP status and the start of its answer,
+/// and `message` names every failed worker. SGLang answers `400` without
+/// flushing while it has running or waiting requests, so a flush under load
+/// gets `502` naming the busy workers.
 pub async fn flush_cache(State(ctx): State<Arc<AppContext>>, headers: HeaderMap) -> Response {
     let workers = ctx.registry.all();
     let total_workers = workers.len();
@@ -253,6 +271,7 @@ pub async fn flush_cache(State(ctx): State<Arc<AppContext>>, headers: HeaderMap)
             total_workers,
             succeeded = successful.len(),
             failed = failed.len(),
+            failed_workers = %describe_failed(&failed),
             "flush_cache: some workers failed to flush",
         );
     }
@@ -277,7 +296,7 @@ pub async fn flush_cache(State(ctx): State<Arc<AppContext>>, headers: HeaderMap)
 /// POST `/flush_cache` to each worker concurrently (bounded by
 /// [`MAX_CONCURRENT_FLUSH`]) and partition the outcomes into
 /// (successful URLs, failed workers). A non-2xx status or a transport
-/// error both count as failures.
+/// error both count as failures; a non-2xx keeps the start of the answer.
 async fn fan_out_flush(
     workers: &[Arc<Worker>],
     client: &Client,
@@ -296,7 +315,17 @@ async fn fan_out_flush(
             if let Some(auth) = auth {
                 request = request.header(header::AUTHORIZATION, auth);
             }
-            async move { (url, request.send().await) }
+            async move {
+                let outcome = match request.send().await {
+                    Ok(resp) if resp.status().is_success() => Ok(()),
+                    Ok(resp) => Err(refusal(resp).await),
+                    // Render the full source chain (`{:#}`), not just reqwest's outer
+                    // message, so a connect-refused / DNS / TLS / timeout cause is
+                    // visible in the per-worker error rather than collapsed away.
+                    Err(e) => Err(format!("{:#}", anyhow::Error::new(e))),
+                };
+                (url, outcome)
+            }
         })
         .buffer_unordered(MAX_CONCURRENT_FLUSH)
         .collect::<Vec<_>>()
@@ -304,23 +333,37 @@ async fn fan_out_flush(
 
     let mut successful = Vec::new();
     let mut failed = Vec::new();
-    for (url, result) in outcomes {
-        match result {
-            Ok(resp) if resp.status().is_success() => successful.push(url),
-            Ok(resp) => failed.push(FailedWorker {
-                worker: url,
-                error: format!("HTTP {}", resp.status()),
-            }),
-            // Render the full source chain (`{:#}`), not just reqwest's outer
-            // message, so a connect-refused / DNS / TLS / timeout cause is
-            // visible in the per-worker error rather than collapsed away.
-            Err(e) => failed.push(FailedWorker {
-                worker: url,
-                error: format!("{:#}", anyhow::Error::new(e)),
-            }),
+    for (url, outcome) in outcomes {
+        match outcome {
+            Ok(()) => successful.push(url),
+            Err(error) => failed.push(FailedWorker { worker: url, error }),
         }
     }
     (successful, failed)
+}
+
+/// `HTTP <status>: <answer>` for a worker that answered non-2xx, with at most
+/// [`MAX_WORKER_ANSWER_BYTES`] of its body, whitespace collapsed. A body that
+/// cannot be read (or is empty) leaves `HTTP <status>`.
+async fn refusal(mut resp: reqwest::Response) -> String {
+    let status = resp.status();
+    let mut body = Vec::new();
+    while body.len() < MAX_WORKER_ANSWER_BYTES {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    body.truncate(MAX_WORKER_ANSWER_BYTES);
+    let answer = String::from_utf8_lossy(&body)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if answer.is_empty() {
+        format!("HTTP {status}")
+    } else {
+        format!("HTTP {status}: {answer}")
+    }
 }
 
 #[cfg(test)]
@@ -341,9 +384,24 @@ mod tests {
     /// Spawn a fake worker that answers `POST /flush_cache` with `status`.
     /// Returns its base URL and a shutdown handle (drop or send to stop).
     async fn spawn_fake_flush_worker(status: StatusCode) -> (String, oneshot::Sender<()>) {
+        spawn_fake_flush_worker_answering(status, "").await
+    }
+
+    /// As [`spawn_fake_flush_worker`], with `answer` as the response body.
+    async fn spawn_fake_flush_worker_answering(
+        status: StatusCode,
+        answer: &str,
+    ) -> (String, oneshot::Sender<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let app = Router::new().route("/flush_cache", post(move || async move { status }));
+        let answer = answer.to_string();
+        let app = Router::new().route(
+            "/flush_cache",
+            post(move || {
+                let answer = answer.clone();
+                async move { (status, answer) }
+            }),
+        );
         let (tx, rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
             let _ = axum::serve(listener, app)
@@ -456,6 +514,58 @@ mod tests {
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0]["worker"], nf_url);
         assert!(failed[0]["error"].as_str().unwrap().contains("404"));
+    }
+
+    /// SGLang refuses a flush with `400 Flush cache failed.` while it has
+    /// running or waiting requests. The 502 must name the refusing worker and
+    /// carry its answer, in the per-worker error and in `message`.
+    #[tokio::test]
+    async fn refused_flush_names_the_worker_and_its_answer() {
+        let (ok_url, _s1) = spawn_fake_flush_worker(StatusCode::OK).await;
+        let (busy_url, _s2) =
+            spawn_fake_flush_worker_answering(StatusCode::BAD_REQUEST, "Flush cache failed.\n")
+                .await;
+        let (status, body) = post_flush(ctx_with_workers(&[&ok_url, &busy_url])).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let failed = body["failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0]["worker"], busy_url);
+        assert_eq!(
+            failed[0]["error"],
+            "HTTP 400 Bad Request: Flush cache failed."
+        );
+        let message = body["message"].as_str().unwrap();
+        assert!(
+            message.contains(&format!(
+                "{busy_url} (HTTP 400 Bad Request: Flush cache failed.)"
+            )),
+            "message must name the refusing worker and its answer: {message}"
+        );
+        assert!(
+            !message.contains(&ok_url),
+            "message must not list a worker that flushed: {message}"
+        );
+    }
+
+    /// A worker's answer is copied into its error only in part, so a
+    /// misbehaving worker cannot inflate the response or the log line.
+    #[tokio::test]
+    async fn refusal_answer_is_bounded() {
+        let long = "x".repeat(8192);
+        let (url, _s) =
+            spawn_fake_flush_worker_answering(StatusCode::SERVICE_UNAVAILABLE, &long).await;
+        let (status, body) = post_flush(ctx_with_workers(&[&url])).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let error = body["failed"][0]["error"].as_str().unwrap();
+        assert!(
+            error.starts_with("HTTP 503 Service Unavailable: xxxx"),
+            "{error}"
+        );
+        assert!(
+            error.len() < long.len() / 4,
+            "error not bounded: {} bytes",
+            error.len()
+        );
     }
 
     /// The caller's `Authorization` reaches workers started with `--api-key`.
