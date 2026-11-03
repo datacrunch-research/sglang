@@ -228,7 +228,7 @@ fn encoder(
                 "fastokens needs a tokenizer.json; encoding on tiktoken"
             );
         }
-        return Ok((create_tokenizer_from_file(path)?, EncodeBackend::Tiktoken));
+        return Ok((tiktoken_encoder(path)?, EncodeBackend::Tiktoken));
     }
     if backend == TokenizerBackend::Fast {
         match FastTokenizer::from_file(path) {
@@ -242,6 +242,74 @@ fn encoder(
         ));
     }
     Ok((create_tokenizer_from_file(path)?, EncodeBackend::Hf))
+}
+
+/// The tiktoken encoder for `path`. dynamo-tokenizers takes a vocabulary's BPE pattern from
+/// the `model_type` in the sibling `config.json` and refuses a type it does not list. A
+/// multimodal wrapper names its own type there, while the text model it wraps
+/// (`text_config.model_type`) can be one the tokenizer lists. Only when the first load
+/// fails, the vocabulary is loaded again from a short-lived copy placed beside a
+/// `config.json` naming the text model's type. Only the encoder sees that copy: chat
+/// formatter selection and the cell's files read the checkpoint's own `config.json`. If the
+/// retry fails as well, the first error is returned unchanged.
+fn tiktoken_encoder(path: &str) -> Result<Arc<dyn traits::Tokenizer>> {
+    let first = match create_tokenizer_from_file(path) {
+        Ok(tokenizer) => return Ok(tokenizer),
+        Err(e) => e,
+    };
+    let file = Path::new(path);
+    let Some(text_type) = text_model_type(file) else {
+        return Err(first);
+    };
+    match load_tiktoken_as(file, &text_type) {
+        Ok(tokenizer) => {
+            tracing::info!(
+                path,
+                model_type = %text_type,
+                "loaded the tiktoken vocabulary as its text model's type"
+            );
+            Ok(tokenizer)
+        }
+        Err(retry) => {
+            tracing::debug!(path, model_type = %text_type, error = %format!("{retry:#}"),
+                "loading the tiktoken vocabulary as its text model's type failed");
+            Err(first)
+        }
+    }
+}
+
+/// `text_config.model_type` from the `config.json` beside `file`, when it is set and differs
+/// from the top-level `model_type`.
+fn text_model_type(file: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(file.with_file_name("config.json")).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let text_type = config["text_config"]["model_type"].as_str()?;
+    (!text_type.is_empty() && config["model_type"].as_str() != Some(text_type))
+        .then(|| text_type.to_owned())
+}
+
+/// Load `file` from a temporary directory holding copies of it and its
+/// `tokenizer_config.json` beside a `config.json` naming `model_type`. The encoder reads its
+/// files while it is built and keeps none open, so the directory is removed on return.
+fn load_tiktoken_as(file: &Path, model_type: &str) -> Result<Arc<dyn traits::Tokenizer>> {
+    let name = file
+        .file_name()
+        .context("the tiktoken path names no file")?;
+    let view = tempfile::Builder::new()
+        .prefix("sgl-router-tiktoken-")
+        .tempdir()
+        .context("create the tokenizer view")?;
+    let copy = view.path().join(name);
+    std::fs::copy(file, &copy).with_context(|| format!("copy {}", file.display()))?;
+    let config = file.with_file_name("tokenizer_config.json");
+    if config.is_file() {
+        std::fs::copy(&config, view.path().join("tokenizer_config.json"))
+            .with_context(|| format!("copy {}", config.display()))?;
+    }
+    let model = serde_json::json!({ "model_type": model_type }).to_string();
+    std::fs::write(view.path().join("config.json"), model)
+        .context("write the tokenizer view's config.json")?;
+    create_tokenizer_from_file(copy.to_str().context("the view path is not valid UTF-8")?)
 }
 
 /// L1 matches literal spellings, so only unconditional, non-overlapping added tokens
