@@ -6149,6 +6149,162 @@ class TestUsageReasoningTokens(CustomTestCase):
         self.assertIsNone(no_reasoning.completion_tokens_details)
 
 
+class KimiK3UnrenderableRequestTestCase(CustomTestCase):
+    """Chat input the Kimi K3 encoder cannot render is a client error, not a 500."""
+
+    READ_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "read",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+            },
+        },
+    }
+    NAMED_CALL = {
+        "id": "read:0",
+        "type": "function",
+        "function": {"name": "read", "arguments": '{"path": "config.yaml"}'},
+    }
+
+    def setUp(self):
+        super().setUp()
+        reset_context()
+        self.addCleanup(reset_context)
+        self.addCleanup(ServingChatTestCase._close_event_loops)
+        publish(
+            ServerArgs(model_path="dummy", default_chat_template_kwargs=None),
+            role="tokenizer",
+        )
+        self.tm = _MockTokenizerManager()
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        template_manager = _MockTemplateManager()
+        template_manager.chat_template_name = None
+        template_manager.jinja_template_content_format = "string"
+        self.chat = OpenAIServingChat(self.tm, template_manager)
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = "kimi_k3"
+
+    def _request(self, tool_calls=(), **kwargs):
+        messages = [{"role": "user", "content": "Read the config."}]
+        if tool_calls:
+            messages += [
+                {"role": "assistant", "content": "", "tool_calls": list(tool_calls)},
+                *(
+                    {"role": "tool", "tool_call_id": call.get("id"), "content": "ok"}
+                    for call in tool_calls
+                ),
+                {"role": "user", "content": "What is the port?"},
+            ]
+        return ChatCompletionRequest(
+            model="x", messages=messages, tools=[self.READ_TOOL], **kwargs
+        )
+
+    def test_history_tool_call_without_function_name_is_a_400(self):
+        """A history tool call without function.name (missing or null) reached the
+        encoder, which reads the name to render the call."""
+        encoder = self.tm.tokenizer.apply_chat_template
+        encoder.reset_mock()  # the serving layer probes the template at init
+        for function in ({"arguments": "{}"}, {"name": None, "arguments": "{}"}):
+            nameless = {"id": ":1", "type": "function", "function": function}
+            with self.subTest(function=function):
+                response = get_or_create_event_loop().run_until_complete(
+                    self.chat.handle_request(
+                        self._request([self.NAMED_CALL, nameless]),
+                        Mock(spec=Request, headers={}),
+                    )
+                )
+                self.assertEqual(response.status_code, HTTPStatus.BAD_REQUEST)
+                self.assertEqual(
+                    json.loads(response.body)["message"],
+                    "messages[1].tool_calls[1].function.name is required.",
+                )
+        encoder.assert_not_called()
+
+        # OpenAI requires the name for every model, and the dsv32 encoder reads it
+        # too. An empty name and an id-less call still render.
+        nameless = {"id": ":1", "type": "function", "function": {"arguments": "{}"}}
+        empty_name = {
+            "id": ":1",
+            "type": "function",
+            "function": {"name": "", "arguments": "{}"},
+        }
+        id_less = {"type": "function", "function": {"name": "read", "arguments": ""}}
+        for spec in (None, "dsv32", "kimi_k3"):
+            with self.subTest(chat_encoding_spec=spec):
+                self.chat.chat_encoding_spec = spec
+                self.assertIsNotNone(
+                    self.chat._validate_request(self._request([nameless]))
+                )
+                for call in (empty_name, id_less):
+                    self.assertIsNone(
+                        self.chat._validate_request(self._request([call]))
+                    )
+
+    def test_chat_template_kwargs_the_k3_encoder_rejects_are_400s(self):
+        """The K3 encoder asserts thinking_effort, and _encode_messages passes three
+        apply_chat_template arguments itself; such chat_template_kwargs were 500s."""
+        rejected = (
+            ({"thinking_effort": "ultra"}, ".thinking_effort must be one of"),
+            ({"thinking_effort": "medium"}, ".thinking_effort must be one of"),
+            ({"thinking_effort": ["max"]}, ".thinking_effort must be one of"),
+            (
+                {"thinking": True, "thinking_effort": "ultra"},
+                ".thinking_effort must be one of",
+            ),
+            ({"add_generation_prompt": False}, " cannot set add_generation_prompt"),
+            ({"tools": []}, " cannot set tools"),
+            ({"conversation": []}, " cannot set conversation"),
+        )
+        for kwargs, message in rejected:
+            with self.subTest(chat_template_kwargs=kwargs):
+                error = self.chat._validate_request(
+                    self._request(chat_template_kwargs=kwargs)
+                )
+                self.assertIn(f"chat_template_kwargs{message}", error or "")
+
+        accepted = (
+            {"thinking_effort": "low"},
+            {"thinking_effort": "high"},
+            {"thinking_effort": "max"},
+            {"thinking_effort": None},
+            {"thinking": False, "thinking_effort": "ultra"},
+            {"tokenize": False, "return_dict": True},
+        )
+        for kwargs in accepted:
+            with self.subTest(chat_template_kwargs=kwargs):
+                self.assertIsNone(
+                    self.chat._validate_request(
+                        self._request(chat_template_kwargs=kwargs)
+                    )
+                )
+
+        # A server default of thinking off applies unless the request sets thinking.
+        self.chat.default_chat_template_kwargs = {"thinking": False}
+        self.assertIsNone(
+            self.chat._validate_request(
+                self._request(chat_template_kwargs={"thinking_effort": "ultra"})
+            )
+        )
+        self.assertIsNotNone(
+            self.chat._validate_request(
+                self._request(
+                    chat_template_kwargs={"thinking": True, "thinking_effort": "ultra"}
+                )
+            )
+        )
+
+        # The rule is the K3 encoder's; other encodings keep their behaviour.
+        self.chat.default_chat_template_kwargs = {}
+        self.chat.chat_encoding_spec = None
+        self.assertIsNone(
+            self.chat._validate_request(
+                self._request(chat_template_kwargs={"thinking_effort": "ultra"})
+            )
+        )
+
+
 class TestRequestChatTemplateTrustGate(CustomTestCase):
     def setUp(self):
         super().setUp()

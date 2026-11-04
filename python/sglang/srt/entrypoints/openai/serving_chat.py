@@ -325,6 +325,53 @@ def _tool_call_pairing_error(messages: list) -> str | None:
     return None
 
 
+def _tool_call_name_error(messages: list) -> str | None:
+    """OpenAI requires function.name on history tool calls; the encoders read it."""
+    for i, message in enumerate(messages):
+        if not (
+            isinstance(message, ChatCompletionMessageGenericParam)
+            and message.role == "assistant"
+            and message.tool_calls
+        ):
+            continue
+        for j, call in enumerate(message.tool_calls):
+            if call.function.name is None:
+                return f"messages[{i}].tool_calls[{j}].function.name is required."
+    return None
+
+
+# The Kimi K3 encoder asserts thinking_effort is one of these while thinking is on.
+_KIMI_K3_THINKING_EFFORTS = ("low", "high", "max")
+# _encode_messages passes these to the Kimi K3 tokenizer's apply_chat_template
+# itself; a chat_template_kwargs copy fails that call with a TypeError.
+_KIMI_K3_ENCODER_OWNED_KWARGS = ("conversation", "tools", "add_generation_prompt")
+
+
+def _kimi_k3_template_kwargs_error(
+    chat_template_kwargs: Optional[dict], default_chat_template_kwargs: dict
+) -> str | None:
+    """chat_template_kwargs the Kimi K3 encoder cannot take."""
+    kwargs = chat_template_kwargs or {}
+    owned = [key for key in _KIMI_K3_ENCODER_OWNED_KWARGS if key in kwargs]
+    if owned:
+        return f"chat_template_kwargs cannot set {', '.join(owned)}."
+    effort = kwargs.get("thinking_effort")
+    # Server defaults fill what the request leaves unset; the encoder checks the
+    # effort only when thinking is on, its default.
+    thinking = kwargs.get(
+        "thinking", default_chat_template_kwargs.get("thinking", True)
+    )
+    if effort is None or not thinking:
+        return None
+    if isinstance(effort, str) and effort in _KIMI_K3_THINKING_EFFORTS:
+        return None
+    supported = ", ".join(repr(value) for value in _KIMI_K3_THINKING_EFFORTS)
+    return (
+        f"chat_template_kwargs.thinking_effort must be one of {supported}; "
+        f"got {effort!r}."
+    )
+
+
 def _normalize_minimax_m3_request(request: ChatCompletionRequest) -> None:
     """Map the thinking config and effort aliases onto what the M3 template reads."""
     template_kwargs = dict(request.chat_template_kwargs or {})
@@ -1129,6 +1176,17 @@ class OpenAIServingChat(OpenAIServingBase):
         media_error = self._validate_media_content(request)
         if media_error:
             return media_error
+
+        tool_call_name_error = _tool_call_name_error(request.messages)
+        if tool_call_name_error:
+            return tool_call_name_error
+
+        if self.chat_encoding_spec == "kimi_k3":
+            template_kwargs_error = _kimi_k3_template_kwargs_error(
+                request.chat_template_kwargs, self.default_chat_template_kwargs
+            )
+            if template_kwargs_error:
+                return template_kwargs_error
 
         effective_tools = self._effective_tools(request)
         has_message_tools = any(
