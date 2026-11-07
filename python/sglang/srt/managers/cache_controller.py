@@ -573,7 +573,9 @@ class HiCacheController:
             from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
             from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
-            if storage_backend not in ("file", "mooncake"):
+            # Dynamic backends must key DCP shards and translate logical pages
+            # themselves (e.g. via get_page_buffer_meta), like file/mooncake.
+            if storage_backend not in ("file", "mooncake", "dynamic"):
                 raise NotImplementedError(
                     "HiCache L3 with DCP requires file or Mooncake storage."
                 )
