@@ -158,6 +158,7 @@ class RustfsHiCacheStorage(HiCacheStorage):
             devices=rails[device % len(rails)] if rails else "",
             agent_name=f"hicache-{os.uname().nodename}-{os.getpid()}-tp{storage_config.tp_rank}",
         )
+        self.debug = os.environ.get("RUSTFS_HICACHE_DEBUG", "0") == "1"
         self._io = concurrent.futures.ThreadPoolExecutor(self.io_threads, thread_name_prefix="rustfs-hicache")
         # Write-side copies and background PUTs get their own pools so a write
         # burst waiting for staging slots never delays prefetch reads.
@@ -504,9 +505,34 @@ class RustfsHiCacheStorage(HiCacheStorage):
             for (obj, j), key in zip(self._candidates(keys, p0), keys)
         ]
 
+    def _infer_start(self, keys: List[str]) -> Optional[int]:
+        """Absolute start (mod group_pages) of `keys` when the caller passes no prefix_keys.
+
+        SGLang drops an empty prefix_keys list to None, e.g. for a prefix at the
+        radix root of a node that never saw it. A group object exists only under
+        the hash of a page that ends a group, so the first existing candidate
+        among the first `group_pages` pages fixes the alignment. A page's index in
+        a group is its distance from that end, so a found object is never
+        misread whatever the true absolute start is.
+        """
+        g = self.group_pages
+        for w in range(0, len(keys), g):
+            ends = list(range(w, min(w + g, len(keys))))
+            found = self._exists_many([self._group_obj(keys[e]) for e in ends])
+            for e in ends:
+                if found[self._group_obj(keys[e])]:
+                    return (g - 1 - e) % g
+            # No group ends here: the prefix continues only if these pages are single-page objects.
+            singles = self._exists_many([self._page_obj(keys[e]) for e in ends])
+            if not all(singles.values()):
+                return None
+        return None
+
     def _kv_prefix_hits(self, keys: List[str], p0: Optional[int]) -> int:
         if not keys:
             return 0
+        if p0 is None and self.group_pages > 1 and not self._page_loc.get(keys[0]):
+            p0 = self._infer_start(keys)
         locs = self._candidates(keys, p0)
         groups = self._exists_many([obj for obj, _ in locs])
         # Pages whose group is missing may still be single-page objects.
@@ -525,7 +551,11 @@ class RustfsHiCacheStorage(HiCacheStorage):
         return hits
 
     def batch_exists(self, keys, extra_info=None) -> int:
-        return self._kv_prefix_hits(keys, self._abs_start(extra_info))
+        hits = self._kv_prefix_hits(keys, self._abs_start(extra_info))
+        if self.debug:
+            logger.info("[rustfs-hicache] tp%d exists: %d keys p0=%s first=%s -> kv %d", self.storage_config.tp_rank,
+                        len(keys), self._abs_start(extra_info), keys[0][:16] if keys else None, hits)
+        return hits
 
     def batch_get_v1(self, keys, host_indices, extra_info=None) -> List[bool]:
         if not keys:
@@ -611,6 +641,13 @@ class RustfsHiCacheStorage(HiCacheStorage):
             if boundary:
                 hit_count[name] = boundary
             restorable = [p for p in restorable if p in pool_restorable]
+        if self.debug:
+            logger.info(
+                "[rustfs-hicache] tp%d exists_v2: %d keys p0=%s first=%s last=%s pools=%s -> kv %d final %d",
+                self.storage_config.tp_rank, len(keys), self._abs_start(extra_info), keys[0][:16] if keys else None,
+                keys[-1][:16] if keys else None, [(t.name.value, t.hit_policy.value, len(t.keys or [])) for t in pool_transfers or []],
+                kv_pages, restorable[-1] if restorable else 0,
+            )
         return PoolTransferResult(restorable[-1] if restorable else 0, hit_count, restorable)
 
     # ---- legacy single-key surface (not used by the zero-copy paths) ---------
