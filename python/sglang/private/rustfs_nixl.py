@@ -10,11 +10,13 @@ Requests use per-thread keep-alive connections and SigV4 with
 UNSIGNED-PAYLOAD (the payload never crosses HTTP).
 """
 import base64
+import collections
 import datetime
 import hashlib
 import hmac
 import http.client
 import os
+import random
 import threading
 import time
 import urllib.parse
@@ -23,6 +25,13 @@ import uuid
 from nixl._api import nixl_agent, nixl_agent_config
 
 UNSIGNED = "UNSIGNED-PAYLOAD"
+RETRY_ATTEMPTS = int(os.environ.get("RUSTFS_NIXL_RETRY_ATTEMPTS", "10"))
+
+
+def _retryable(status, body: bytes) -> bool:
+    """Back-pressure answers worth retrying: SlowDown/503, a momentarily exhausted staging pool,
+    or a request that timed out waiting for a disk permit."""
+    return status == 503 or (status == 500 and (b"exhausted" in body or b"waiting for disk permit" in body))
 
 
 class RustfsError(IOError):
@@ -45,6 +54,8 @@ class RustfsNixlClient:
         self._next = 0
         self._local = threading.local()
         self._signing_key = (None, None)
+        self._retry_lock = threading.Lock()
+        self._retries = collections.Counter()  # method -> back-off retries taken
 
     def endpoint(self, hint=None):
         if hint is not None:
@@ -150,7 +161,7 @@ class RustfsNixlClient:
 
     def head_size(self, bucket, key, endpoint=None):
         """Object size, or None if it does not exist."""
-        status, headers, _ = self.request("HEAD", bucket, key, None, endpoint)
+        status, headers, _ = self._retrying_request("HEAD", bucket, key, None, endpoint)
         if status == 404:
             return None
         if status != 200:
@@ -166,6 +177,23 @@ class RustfsNixlClient:
             "x-rustfs-nixl-metadata": self._metadata,
         }
 
+    def _retrying_request(self, method, bucket, key, headers, endpoint):
+        """Send a request, retrying back-pressure answers with jittered exponential backoff."""
+        for attempt in range(RETRY_ATTEMPTS):
+            status, h, body = self.request(method, bucket, key, headers, endpoint)
+            if not _retryable(status, body) or attempt == RETRY_ATTEMPTS - 1:
+                return status, h, body
+            with self._retry_lock:
+                self._retries[method] += 1
+            time.sleep(min(4.0, 0.05 * 2 ** attempt) * (0.5 + random.random()))
+        return status, h, body
+
+    def take_retries(self):
+        """Retries taken per method since the previous call."""
+        with self._retry_lock:
+            taken, self._retries = self._retries, collections.Counter()
+        return taken
+
     def fetch_into(self, bucket, key, addr, length, start=0, endpoint=None):
         """RDMA-fetch bytes [start, start+length) of `bucket/key` to `addr`; returns seconds taken.
 
@@ -173,7 +201,7 @@ class RustfsNixlClient:
         started = time.time()
         headers = self._nixl_headers(addr, length)
         headers["Range"] = f"bytes={start}-{start + length - 1}"
-        status, h, body = self.request("GET", bucket, key, headers, endpoint)
+        status, h, body = self._retrying_request("GET", bucket, key, headers, endpoint)
         if status not in (200, 206):
             raise RustfsError(f"{bucket}/{key}: GET {status}: {body[:300]!r}", status)
         reply, moved = h.get("x-amz-rdma-reply"), int(h.get("x-amz-rdma-bytes-transferred") or -1)
@@ -184,7 +212,7 @@ class RustfsNixlClient:
     def store_from(self, bucket, key, addr, length, endpoint=None):
         """RDMA-PUT `length` bytes at `addr` as `bucket/key`; returns seconds taken."""
         started = time.time()
-        status, h, body = self.request("PUT", bucket, key, self._nixl_headers(addr, length), endpoint)
+        status, h, body = self._retrying_request("PUT", bucket, key, self._nixl_headers(addr, length), endpoint)
         reply, moved = h.get("x-amz-rdma-reply"), int(h.get("x-amz-rdma-bytes-transferred") or -1)
         if status != 200 or reply != "200" or moved != length:
             raise RustfsError(f"{bucket}/{key}: PUT {status} (rdma reply {reply!r}, moved {moved} of {length}): {body[:300]!r}", status)

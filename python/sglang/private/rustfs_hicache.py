@@ -34,7 +34,9 @@ Extra config keys: endpoints (required), bucket ("kvcache"), prefix ("hicache"),
 access_key / secret_key (or RUSTFS_ACCESS_KEY / RUSTFS_SECRET_KEY), region,
 rails (UCX device per local GPU index), group_pages (32), io_threads (32),
 staging_slots (16, read staging), write_behind (true), write_slots (64),
-write_threads (32).
+write_threads (32), get_split_mb (8: ranged GETs per object read, issued in
+parallel), mamba_probe_window (32: trailing-state existence is probed from the
+end of the prefix in windows of this many pages).
 """
 
 from __future__ import annotations
@@ -144,6 +146,8 @@ class RustfsHiCacheStorage(HiCacheStorage):
         self.write_behind = str(extra.get("write_behind", True)).lower() not in ("0", "false", "no")
         self.write_slots = int(extra.get("write_slots", 64))
         self.write_threads = int(extra.get("write_threads", 32))
+        self.get_split = int(extra.get("get_split_mb", 8)) << 20
+        self.probe_window = max(1, int(extra.get("mamba_probe_window", 32)))
         rails = _split(extra.get("rails"))
         device = torch.cuda.current_device() if torch.cuda.is_available() else storage_config.tp_rank
         self.storage_config = storage_config
@@ -164,6 +168,8 @@ class RustfsHiCacheStorage(HiCacheStorage):
         # burst waiting for staging slots never delays prefetch reads.
         self._wio = concurrent.futures.ThreadPoolExecutor(self.io_threads, thread_name_prefix="rustfs-hicache-wcopy")
         self._wb = concurrent.futures.ThreadPoolExecutor(self.write_threads, thread_name_prefix="rustfs-hicache-wb")
+        # Sub-range GETs of one object read; separate from _io, whose tasks wait on them.
+        self._sub = concurrent.futures.ThreadPoolExecutor(max(16, 2 * self.io_threads), thread_name_prefix="rustfs-hicache-sub")
         self._pending: Dict[str, threading.Event] = {}
         self._pending_lock = threading.Lock()
         self._wstaging: Optional[_Staging] = None
@@ -369,18 +375,27 @@ class RustfsHiCacheStorage(HiCacheStorage):
         if done is not None and not done.wait(300):
             logger.warning("[rustfs-hicache] still waiting on background PUT of %s", obj)
 
+    def _fetch_range(self, obj: str, addr: int, total: int, start: int) -> float:
+        """GET bytes [start, start+total) of `obj` to `addr`, split into parallel ranged GETs."""
+        if total <= self.get_split:
+            return self.client.fetch_into(self.bucket, obj, addr, total, start)
+        parts = [(o, min(self.get_split, total - o)) for o in range(0, total, self.get_split)]
+        t = time.time()
+        list(self._sub.map(lambda p: self.client.fetch_into(self.bucket, obj, addr + p[0], p[1], start + p[0]), parts))
+        return time.time() - t
+
     def _get_pieces(self, obj: str, start: int, ptrs: List[int], sizes: List[int]) -> bool:
         """GET bytes [start, start+sum(sizes)) of `obj` scattered into (ptr, size) pieces."""
         self._wait_pending(obj)
         total = sum(sizes)
         try:
             if self._contiguous(ptrs, sizes):
-                seconds = self.client.fetch_into(self.bucket, obj, ptrs[0], total, start)
+                seconds = self._fetch_range(obj, ptrs[0], total, start)
             else:
                 self._ensure_staging()
                 slot, base = self._staging.acquire()
                 try:
-                    seconds = self.client.fetch_into(self.bucket, obj, base, total, start)
+                    seconds = self._fetch_range(obj, base, total, start)
                     off = 0
                     for p, n in zip(ptrs, sizes):
                         ctypes.memmove(p, base + off, n)
@@ -405,12 +420,14 @@ class RustfsHiCacheStorage(HiCacheStorage):
         with self._pending_lock:
             if obj in self._pending:
                 return True
+        started = time.time()
         try:
             found = self.client.head_size(self.bucket, obj) is not None
         except Exception as e:
             logger.warning("[rustfs-hicache] HEAD %s failed: %s", obj, e)
+            self._count(head_errors=1)
             found = False
-        self._count(heads=1)
+        self._count(heads=1, head_seconds=time.time() - started)
         if found:
             self._known.put(obj)
         return found
@@ -427,16 +444,18 @@ class RustfsHiCacheStorage(HiCacheStorage):
                 return
             s, self._stats, elapsed = self._stats, collections.Counter(), now - self._last_report
             self._last_report = now
+        retries = self.client.take_retries()
         logger.info(
             "[rustfs-hicache] tp%d last %.0fs: put %d obj %.2f GB (%.2f GB/s, %.1f ms avg), "
-            "get %d obj %.2f GB (%.2f GB/s, %.1f ms avg), heads %d, misses %d, errors put %d get %d, "
-            "write-behind pending %d",
+            "get %d obj %.2f GB (%.2f GB/s, %.1f ms avg), heads %d (%.1f ms avg), misses %d, "
+            "retries put %d get %d head %d, failed put %d get %d head %d, write-behind pending %d",
             self.storage_config.tp_rank, elapsed,
             s["put_objects"], s["put_bytes"] / 1e9, s["put_bytes"] / 1e9 / elapsed,
             1e3 * s["put_seconds"] / max(1, s["put_objects"]),
             s["get_objects"], s["get_bytes"] / 1e9, s["get_bytes"] / 1e9 / elapsed,
             1e3 * s["get_seconds"] / max(1, s["get_objects"]),
-            s["heads"], s["get_misses"], s["put_errors"], s["get_errors"], len(self._pending),
+            s["heads"], 1e3 * s["head_seconds"] / max(1, s["heads"]), s["get_misses"], retries["PUT"], retries["GET"], retries["HEAD"],
+            s["put_errors"], s["get_errors"], s["head_errors"], len(self._pending),
         )
 
     # ---- KV (v1 zero-copy path) ------------------------------------------
@@ -531,8 +550,12 @@ class RustfsHiCacheStorage(HiCacheStorage):
     def _kv_prefix_hits(self, keys: List[str], p0: Optional[int]) -> int:
         if not keys:
             return 0
-        if p0 is None and self.group_pages > 1 and not self._page_loc.get(keys[0]):
-            p0 = self._infer_start(keys)
+        if p0 is None and self.group_pages > 1:
+            # A recorded group location fixes the alignment (a page's index in its group is its absolute
+            # position mod group_pages). Without an alignment, pages other nodes grouped after this node's
+            # last lookup would be probed as single-page objects and the prefix would stop short.
+            loc = self._page_loc.get(keys[0])
+            p0 = loc[1] if loc else self._infer_start(keys)
         locs = self._candidates(keys, p0)
         groups = self._exists_many([obj for obj, _ in locs])
         # Pages whose group is missing may still be single-page objects.
@@ -625,6 +648,14 @@ class RustfsHiCacheStorage(HiCacheStorage):
             if not restorable:
                 break
             name = transfer.name
+            if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                # Only the longest restorable prefix matters: probe from the end, one window at a time.
+                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
+                boundary = self._trailing_boundary(name, keys, kv_pages, trailing)
+                if boundary:
+                    hit_count[name] = boundary
+                restorable = [p for p in restorable if p == boundary]
+                continue
             present = self._exists_many([self._sidecar_obj(name, keys[i]) for i in range(kv_pages)])
             has = [present[self._sidecar_obj(name, keys[i])] for i in range(kv_pages)]
             if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
@@ -649,6 +680,20 @@ class RustfsHiCacheStorage(HiCacheStorage):
                 kv_pages, restorable[-1] if restorable else 0,
             )
         return PoolTransferResult(restorable[-1] if restorable else 0, hit_count, restorable)
+
+    def _trailing_boundary(self, name, keys: List[str], kv_pages: int, trailing: int) -> int:
+        """Largest n <= kv_pages whose last `trailing` pages all have `name` state stored (0 if none)."""
+        hi = kv_pages
+        while hi > 0:
+            lo = max(0, hi - self.probe_window)
+            idx = list(range(max(0, lo - trailing + 1), hi))
+            found = self._exists_many([self._sidecar_obj(name, keys[i]) for i in idx])
+            has = {i: found[self._sidecar_obj(name, keys[i])] for i in idx}
+            for n in range(hi, lo, -1):
+                if all(has.get(i, False) for i in range(max(0, n - trailing), n)):
+                    return n
+            hi = lo
+        return 0
 
     # ---- legacy single-key surface (not used by the zero-copy paths) ---------
     def get(self, key, target_location=None, target_sizes=None):
@@ -678,5 +723,6 @@ class RustfsHiCacheStorage(HiCacheStorage):
     def close(self):
         self._wio.shutdown(wait=True)
         self._wb.shutdown(wait=True)  # finish background PUTs before the memory goes away
+        self._sub.shutdown(wait=True)
         self._io.shutdown(wait=True)
         self.client.deregister_all()
