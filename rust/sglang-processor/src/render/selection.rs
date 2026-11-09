@@ -225,7 +225,7 @@ fn load_model_identity(config_file: &str) -> ModelIdentity {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatFormatterOptions, select_chat_formatter};
+    use super::{ChatFormatter, ChatFormatterOptions, select_chat_formatter};
     use crate::OneOrMany;
 
     #[test]
@@ -240,5 +240,39 @@ mod tests {
             panic!("chatml declares multiple stop strings");
         };
         assert_eq!(stops, ["<|endoftext|>", "<|im_end|>"]);
+    }
+
+    /// Kimi K3.1 ships K3's files under `model_type: kimi_k31` (a multimodal
+    /// wrapper around `text_config.model_type: kimi_linear`) and no Jinja
+    /// template, so the renderer's K3 detection must take it and select the
+    /// native XTML formatter, as it does for `kimi_k3`.
+    #[test]
+    fn kimi_k31_selects_the_native_k3_formatter() {
+        let dir = std::env::temp_dir().join(format!(
+            "sglang-processor-selection-{}-kimi-k31",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"model_type": "kimi_k31", "architectures": ["KimiK31ForConditionalGeneration"], "text_config": {"model_type": "kimi_linear"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"tokenizer_class": "TikTokenTokenizer"}"#,
+        )
+        .unwrap();
+        let (formatter, error) = select_chat_formatter(&ChatFormatterOptions {
+            tokenizer_path: dir.to_string_lossy().into_owned(),
+            model_path: dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(error.is_none(), "{error:?}");
+        assert!(
+            matches!(formatter, Some(ChatFormatter::KimiK3)),
+            "kimi_k31 must select the native K3 formatter"
+        );
     }
 }
