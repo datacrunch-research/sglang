@@ -2269,8 +2269,7 @@
         ],
         "reasoning_effort": "medium"
       },
-      "error": "AssertionError: Unsupported thinking_effort='medium'; supported values are ['high', 'low', 'max'].",
-      "known_gap": "the fork's Python (release line 586355a8) passes reasoning_effort medium to the encoder, which accepts only low, high and max (K3 and K3.1 Pro alike); the processor still maps medium to max as SGLang did when the Kimi K3 fixture was recorded"
+      "error": "AssertionError: Unsupported thinking_effort='medium'; supported values are ['high', 'low', 'max']."
     },
     {
       "name": "effort_float",
@@ -2283,8 +2282,7 @@
         ],
         "reasoning_effort": 0.5
       },
-      "error": "ValueError: Kimi K3 supports reasoning_effort 'low', 'medium', 'high', 'max' (the other OpenAI tiers map onto them); got 0.5.",
-      "known_gap": "the fork's Python (release line 586355a8) rejects a non-string reasoning_effort; the processor maps it as SGLang did when the Kimi K3 fixture was recorded"
+      "error": "ValueError: Kimi K3 supports reasoning_effort 'low', 'medium', 'high', 'max' (the other OpenAI tiers map onto them); got 0.5."
     },
     {
       "name": "effort_none_kwargs_thinking",
@@ -2404,8 +2402,7 @@
           "reasoning_effort": "medium"
         }
       },
-      "error": "AssertionError: Unsupported thinking_effort='medium'; supported values are ['high', 'low', 'max'].",
-      "known_gap": "the fork's Python (release line 586355a8) passes thinking_effort medium to the encoder, which accepts only low, high and max; the processor still maps medium to max as SGLang did when the Kimi K3 fixture was recorded"
+      "error": "AssertionError: Unsupported thinking_effort='medium'; supported values are ['high', 'low', 'max']."
     },
     {
       "name": "kwargs_thinking_effort",

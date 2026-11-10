@@ -372,6 +372,33 @@ def _kimi_k3_template_kwargs_error(
     )
 
 
+def _kimi_k3_reasoning_effort_error(
+    request: ChatCompletionRequest, default_chat_template_kwargs: dict
+) -> str | None:
+    """A request effort the Kimi K3 encoder cannot take: official efforts only.
+
+    `chat_template_kwargs.reasoning_effort` wins over `reasoning_effort`, as the
+    request conversion lifts it. `none` only turns thinking off, and an effort
+    means nothing with thinking off. The processor answers the same 400 on the
+    token path, so a request gets one verdict wherever it is rendered.
+    """
+    kwargs = request.chat_template_kwargs or {}
+    effort = kwargs.get("reasoning_effort")
+    if effort is None:
+        effort = request.reasoning_effort
+    if effort is None or effort == "none":
+        return None
+    thinking = kwargs.get(
+        "thinking", default_chat_template_kwargs.get("thinking", True)
+    )
+    if not thinking:
+        return None
+    if isinstance(effort, str) and effort in _KIMI_K3_THINKING_EFFORTS:
+        return None
+    supported = ", ".join(repr(value) for value in _KIMI_K3_THINKING_EFFORTS)
+    return f"reasoning_effort must be one of {supported}; got {effort!r}."
+
+
 def _normalize_minimax_m3_request(request: ChatCompletionRequest) -> None:
     """Map the thinking config and effort aliases onto what the M3 template reads."""
     template_kwargs = dict(request.chat_template_kwargs or {})
@@ -1187,6 +1214,11 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             if template_kwargs_error:
                 return template_kwargs_error
+            effort_error = _kimi_k3_reasoning_effort_error(
+                request, self.default_chat_template_kwargs
+            )
+            if effort_error:
+                return effort_error
 
         effective_tools = self._effective_tools(request)
         has_message_tools = any(

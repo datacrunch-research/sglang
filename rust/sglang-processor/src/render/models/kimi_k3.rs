@@ -79,10 +79,24 @@ pub(crate) fn render(
             .as_str()
             .is_some_and(|effort| THINKING_EFFORTS.contains(&effort))
     };
-    let effort = kwargs_effort
-        .as_ref()
-        .or_else(|| requested_effort(request))
-        .or_else(|| defaults.get("reasoning_effort").filter(|e| !e.is_null()));
+    // The request's own effort, `chat_template_kwargs.reasoning_effort` before
+    // `reasoning_effort`: with thinking on it must be one the encoder takes.
+    // `none` only turns thinking off (`requested_thinking`). SGLang answers the
+    // same 400 (`_kimi_k3_reasoning_effort_error`); the encoder rejects the rest.
+    let requested = kwargs_effort.as_ref().or_else(|| requested_effort(request));
+    if thinking {
+        if let Some(effort) = requested.filter(|e| e.as_str() != Some("none") && !supported(e)) {
+            let shown = match effort.as_str() {
+                Some(effort) => format!("'{effort}'"),
+                None => effort.to_string(),
+            };
+            return Err(format!(
+                "reasoning_effort must be one of 'low', 'high', 'max'; got {shown}."
+            )
+            .into());
+        }
+    }
+    let effort = requested.or_else(|| defaults.get("reasoning_effort").filter(|e| !e.is_null()));
     // The tokenizer's default is `max`.
     let thinking_effort = match kwargs.get("thinking_effort") {
         Some(thinking_effort) => thinking_effort.clone(),
