@@ -28,7 +28,13 @@ every slot is in flight, writers wait. An object whose PUT is still running
 counts as existing, and a GET for it first waits for that PUT. A failed
 background PUT only turns into a later miss. Reads go straight into host pages
 when they are contiguous, else through a separate read-staging area. Existence
-checks are concurrent HEADs plus a local cache of objects known to exist.
+checks consult a local cache of objects known to exist; the rest are one
+`prefix-query` request per batch on a bucket bound to the `kv-cache` engine
+(detected at start, or forced with batch_exists), else concurrent HEADs. A
+write the engine refuses because its drive is full is skipped, not retried.
+On such a bucket every request goes to the node owning its key, from the
+bucket's placement view (refreshed every `placement_refresh_s`, 60), and
+queries are split by owner.
 
 Extra config keys: endpoints (required), bucket ("kvcache"), prefix ("hicache"),
 access_key / secret_key (or RUSTFS_ACCESS_KEY / RUSTFS_SECRET_KEY), region,
@@ -36,7 +42,8 @@ rails (UCX device per local GPU index), group_pages (32), io_threads (32),
 staging_slots (16, read staging), write_behind (true), write_slots (64),
 write_threads (32), get_split_mb (8: ranged GETs per object read, issued in
 parallel), mamba_probe_window (32: trailing-state existence is probed from the
-end of the prefix in windows of this many pages).
+end of the prefix in windows of this many pages), batch_exists ("auto": use
+`prefix-query` when the bucket answers it; true or false to force).
 """
 
 from __future__ import annotations
@@ -148,6 +155,11 @@ class RustfsHiCacheStorage(HiCacheStorage):
         self.write_threads = int(extra.get("write_threads", 32))
         self.get_split = int(extra.get("get_split_mb", 8)) << 20
         self.probe_window = max(1, int(extra.get("mamba_probe_window", 32)))
+        batch_exists = str(extra.get("batch_exists", "auto")).lower()
+        self.placement_refresh = float(extra.get("placement_refresh_s", 60))
+        self._placement = None
+        self._placement_at = 0.0
+        self._placement_lock = threading.Lock()
         rails = _split(extra.get("rails"))
         device = torch.cuda.current_device() if torch.cuda.is_available() else storage_config.tp_rank
         self.storage_config = storage_config
@@ -181,11 +193,26 @@ class RustfsHiCacheStorage(HiCacheStorage):
         self._stats_lock = threading.Lock()
         self._stats = collections.Counter()
         self._last_report = time.time()
+        self.use_query = self._detect_query(batch_exists)
         logger.info(
-            "[rustfs-hicache] tp%d: bucket=%s prefix=%s group_pages=%d endpoints=%d rail=%s suffix=%s",
+            "[rustfs-hicache] tp%d: bucket=%s prefix=%s group_pages=%d endpoints=%d rail=%s suffix=%s prefix_query=%s",
             storage_config.tp_rank, self.bucket, self.prefix, self.group_pages, len(endpoints),
-            rails[device % len(rails)] if rails else "all", self.config_suffix,
+            rails[device % len(rails)] if rails else "all", self.config_suffix, self.use_query,
         )
+
+    def _detect_query(self, mode: str) -> bool:
+        """Whether existence checks use the kv-cache engine's `prefix-query`."""
+        if mode in ("0", "false", "no"):
+            return False
+        try:
+            self.client.contains_many(self.bucket, [f"{self.prefix}/.probe"])
+            self._refresh_placement()
+            return True
+        except Exception as e:
+            if mode != "auto":
+                raise ValueError(f"batch_exists is on but {self.bucket} does not answer prefix-query: {e}") from e
+            logger.info("[rustfs-hicache] %s does not answer prefix-query (%s); using HEADs", self.bucket, e)
+            return False
 
     # ---- keys ------------------------------------------------------------
     def _init_suffix(self, cfg: HiCacheStorageConfig) -> None:
@@ -294,7 +321,7 @@ class RustfsHiCacheStorage(HiCacheStorage):
         total = sum(sizes)
         try:
             if self._contiguous(ptrs, sizes):
-                seconds = self.client.store_from(self.bucket, obj, ptrs[0], total)
+                seconds = self.client.store_from(self.bucket, obj, ptrs[0], total, self._owner(obj))
             else:
                 self._ensure_staging()
                 slot, base = self._staging.acquire()
@@ -303,15 +330,14 @@ class RustfsHiCacheStorage(HiCacheStorage):
                     for p, n in zip(ptrs, sizes):
                         ctypes.memmove(base + off, p, n)
                         off += n
-                    seconds = self.client.store_from(self.bucket, obj, base, total)
+                    seconds = self.client.store_from(self.bucket, obj, base, total, self._owner(obj))
                 finally:
                     self._staging.release(slot)
             self._known.put(obj)
             self._count(put_objects=1, put_bytes=total, put_seconds=seconds)
             return True
         except Exception as e:
-            self._count(put_errors=1)
-            logger.warning("[rustfs-hicache] PUT %s failed: %s", obj, e)
+            self._put_failed(obj, e)
             return False
 
     def _put_behind(self, obj: str, ptrs: List[int], sizes: List[int]) -> bool:
@@ -341,12 +367,11 @@ class RustfsHiCacheStorage(HiCacheStorage):
 
         def flush():
             try:
-                seconds = self.client.store_from(self.bucket, obj, base, total)
+                seconds = self.client.store_from(self.bucket, obj, base, total, self._owner(obj))
                 self._known.put(obj)
                 self._count(put_objects=1, put_bytes=total, put_seconds=seconds)
             except Exception as e:
-                self._count(put_errors=1)
-                logger.warning("[rustfs-hicache] background PUT %s failed: %s", obj, e)
+                self._put_failed(obj, e, "background ")
             finally:
                 self._wstaging.release(slot)
                 with self._pending_lock:
@@ -355,6 +380,33 @@ class RustfsHiCacheStorage(HiCacheStorage):
 
         self._wb.submit(flush)
         return True
+
+    def _refresh_placement(self) -> None:
+        try:
+            placement = self.client.placement(self.bucket)
+        except Exception as e:
+            logger.warning("[rustfs-hicache] placement view refresh failed, keeping the old one: %s", e)
+            placement = self._placement
+        self._placement, self._placement_at = placement, time.time()
+
+    def _owner(self, obj: str) -> Optional[str]:
+        """Endpoint of the node owning `obj`; None (any node) without a placement view."""
+        if not self.use_query:
+            return None
+        if time.time() - self._placement_at > self.placement_refresh and self._placement_lock.acquire(blocking=False):
+            try:
+                self._refresh_placement()
+            finally:
+                self._placement_lock.release()
+        placement = self._placement
+        return placement.owner_endpoint(obj) if placement is not None else None
+
+    def _put_failed(self, obj: str, e: Exception, kind: str = "") -> None:
+        if getattr(e, "cache_full", False):
+            self._count(put_full=1)  # the owner's drive is full: skip the entry
+            return
+        self._count(put_errors=1)
+        logger.warning("[rustfs-hicache] %sPUT %s failed: %s", kind, obj, e)
 
     def drain(self, timeout: Optional[float] = None) -> bool:
         """Wait until every background PUT has finished; False on timeout."""
@@ -377,11 +429,12 @@ class RustfsHiCacheStorage(HiCacheStorage):
 
     def _fetch_range(self, obj: str, addr: int, total: int, start: int) -> float:
         """GET bytes [start, start+total) of `obj` to `addr`, split into parallel ranged GETs."""
+        owner = self._owner(obj)
         if total <= self.get_split:
-            return self.client.fetch_into(self.bucket, obj, addr, total, start)
+            return self.client.fetch_into(self.bucket, obj, addr, total, start, owner)
         parts = [(o, min(self.get_split, total - o)) for o in range(0, total, self.get_split)]
         t = time.time()
-        list(self._sub.map(lambda p: self.client.fetch_into(self.bucket, obj, addr + p[0], p[1], start + p[0]), parts))
+        list(self._sub.map(lambda p: self.client.fetch_into(self.bucket, obj, addr + p[0], p[1], start + p[0], owner), parts))
         return time.time() - t
 
     def _get_pieces(self, obj: str, start: int, ptrs: List[int], sizes: List[int]) -> bool:
@@ -434,7 +487,37 @@ class RustfsHiCacheStorage(HiCacheStorage):
 
     def _exists_many(self, objs: List[str]) -> Dict[str, bool]:
         unique = list(dict.fromkeys(objs))
-        return dict(zip(unique, self._io.map(self._exists, unique)))
+        if not self.use_query:
+            return dict(zip(unique, self._io.map(self._exists, unique)))
+        found = {}
+        ask = []
+        with self._pending_lock:
+            for obj in unique:
+                if self._known.get(obj) or obj in self._pending:
+                    found[obj] = True
+                else:
+                    ask.append(obj)
+        if not ask:
+            return found
+        started = time.time()
+        by_owner: Dict[Optional[str], List[str]] = collections.defaultdict(list)
+        for obj in ask:
+            by_owner[self._owner(obj)].append(obj)
+        groups = list(by_owner.items())
+        try:
+            answers = list(self._io.map(lambda g: self.client.contains_many(self.bucket, g[1], g[0]), groups))
+        except Exception as e:
+            logger.warning("[rustfs-hicache] prefix-query of %d keys failed, falling back to HEADs: %s", len(ask), e)
+            self._count(query_errors=1)
+            found.update(zip(ask, self._io.map(self._exists, ask)))
+            return found
+        self._count(queries=1, query_keys=len(ask), query_seconds=time.time() - started)
+        for (_, objs), present in zip(groups, answers):
+            for obj, hit in zip(objs, present):
+                if hit:
+                    self._known.put(obj)
+                found[obj] = hit
+        return found
 
     def _count(self, **values):
         with self._stats_lock:
@@ -448,7 +531,8 @@ class RustfsHiCacheStorage(HiCacheStorage):
         logger.info(
             "[rustfs-hicache] tp%d last %.0fs: put %d obj %.2f GB (%.2f GB/s, %.1f ms avg), "
             "get %d obj %.2f GB (%.2f GB/s, %.1f ms avg), heads %d (%.1f ms avg), misses %d, "
-            "retries put %d get %d head %d, failed put %d get %d head %d, write-behind pending %d",
+            "retries put %d get %d head %d, failed put %d get %d head %d, write-behind pending %d, "
+            "queries %d (%d keys, %.1f ms avg, failed %d), skipped full %d",
             self.storage_config.tp_rank, elapsed,
             s["put_objects"], s["put_bytes"] / 1e9, s["put_bytes"] / 1e9 / elapsed,
             1e3 * s["put_seconds"] / max(1, s["put_objects"]),
@@ -456,6 +540,7 @@ class RustfsHiCacheStorage(HiCacheStorage):
             1e3 * s["get_seconds"] / max(1, s["get_objects"]),
             s["heads"], 1e3 * s["head_seconds"] / max(1, s["heads"]), s["get_misses"], retries["PUT"], retries["GET"], retries["HEAD"],
             s["put_errors"], s["get_errors"], s["head_errors"], len(self._pending),
+            s["queries"], s["query_keys"], 1e3 * s["query_seconds"] / max(1, s["queries"]), s["query_errors"], s["put_full"],
         )
 
     # ---- KV (v1 zero-copy path) ------------------------------------------
