@@ -27,7 +27,9 @@ dynamo-tokenizers = "=3.1.0"
 # Renders the model's chat template (HF Jinja, or Dynamo's built-in encoder for
 # template-less models like DeepSeek-V4) so cache-aware routing hashes the same
 # tokens the engine caches.
-dynamo-renderer = "=7.1.1"
+# The same dynamo-renderer as ../rust/sglang-processor (one package, so the processor's formatter
+# types are this crate's): 7.1.1 plus Kimi K3.1 detection from the org fork.
+dynamo-renderer = { git = "https://github.com/datacrunch-research/frontend-crates.git", tag = "dynamo-renderer-v7.1.1-verda.1" }
 # `OAIChatLikeRequest` speaks minijinja values.
 minijinja = "2.24"
 # SGLang chat rendering shared with the Rust server; DeepSeek-V4 renders through it.
