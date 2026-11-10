@@ -84,17 +84,16 @@ pub(crate) fn render(
     // `none` only turns thinking off (`requested_thinking`). SGLang answers the
     // same 400 (`_kimi_k3_reasoning_effort_error`); the encoder rejects the rest.
     let requested = kwargs_effort.as_ref().or_else(|| requested_effort(request));
-    if thinking {
-        if let Some(effort) = requested.filter(|e| e.as_str() != Some("none") && !supported(e)) {
-            let shown = match effort.as_str() {
-                Some(effort) => format!("'{effort}'"),
-                None => effort.to_string(),
-            };
-            return Err(format!(
-                "reasoning_effort must be one of 'low', 'high', 'max'; got {shown}."
-            )
-            .into());
-        }
+    if thinking
+        && let Some(effort) = requested.filter(|e| e.as_str() != Some("none") && !supported(e))
+    {
+        let shown = match effort.as_str() {
+            Some(effort) => format!("'{effort}'"),
+            None => effort.to_string(),
+        };
+        return Err(
+            format!("reasoning_effort must be one of 'low', 'high', 'max'; got {shown}.").into(),
+        );
     }
     let effort = requested.or_else(|| defaults.get("reasoning_effort").filter(|e| !e.is_null()));
     // The tokenizer's default is `max`.
