@@ -309,10 +309,10 @@ pub fn lower(body: &Value) -> Result<Lowered, ResponsesError> {
     Ok(Lowered { chat, context })
 }
 
-/// Responses input items as chat messages. Function calls become the
-/// `tool_calls` of the assistant message they follow (a new one when none
-/// does), their outputs `tool` messages, reasoning items the next assistant
-/// message's `reasoning_content`.
+/// Responses input items as chat messages. A function call joins the
+/// `tool_calls` of the assistant message directly before it, or becomes a new
+/// assistant message when there is none; its output is a `tool` message; a
+/// reasoning item is the next assistant message's `reasoning_content`.
 fn lower_items(items: &[Value], messages: &mut Vec<Value>) -> Result<(), ResponsesError> {
     let mut pending_reasoning: Option<String> = None;
     for item in items {
@@ -1475,6 +1475,55 @@ mod tests {
         );
         assert_eq!(messages[2]["reasoning_content"], "next");
         assert_eq!(messages[2]["tool_calls"][0]["id"], "call_1");
+    }
+
+    #[test]
+    fn calls_separated_by_an_output_are_separate_assistant_turns() {
+        let messages = lowered_messages(json!([
+            {"role": "user", "content": "fix it"},
+            call("call_1", "pytest"),
+            output("call_1", "1 failed"),
+            call("call_2", "sed"),
+        ]));
+        let roles: Vec<&str> = messages
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "tool", "assistant"]);
+        assert_eq!(messages[1]["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(messages[3]["tool_calls"][0]["id"], "call_2");
+    }
+
+    #[test]
+    fn a_custom_tool_call_joins_the_assistant_text_it_follows() {
+        let messages = lowered_messages(json!([
+            {"role": "user", "content": "fix it"},
+            text("Applying the patch."),
+            {"type": "custom_tool_call", "call_id": "call_1", "name": "apply_patch", "input": "*** Begin Patch"},
+        ]));
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(messages[1]["content"], "Applying the patch.");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(
+            messages[1]["tool_calls"][0]["function"]["name"],
+            "apply_patch"
+        );
+    }
+
+    #[test]
+    fn reasoning_without_replayable_text_does_not_split_a_turn() {
+        // Encrypted reasoning cannot be replayed through chat and is dropped,
+        // so the text and the call around it are still one turn.
+        let messages = lowered_messages(json!([
+            {"role": "user", "content": "fix it"},
+            text("Running the test."),
+            {"type": "reasoning", "summary": [], "encrypted_content": "zzz"},
+            call("call_1", "pytest"),
+        ]));
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(messages[1]["content"], "Running the test.");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_1");
+        assert!(messages[1].get("reasoning_content").is_none());
     }
 
     #[test]
