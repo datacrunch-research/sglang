@@ -217,9 +217,6 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
 pub fn build_router_with_body_limit(ctx: Arc<AppContext>, max_body_bytes: usize) -> Router {
     let router = Router::new()
         .route("/healthz", get(crate::server::routes::health::healthz))
-        // The liveness path SGLang engines and sgl-model-gateway serve, so a
-        // probe written for either works against this router unchanged.
-        .route("/health", get(crate::server::routes::health::healthz))
         .route("/readyz", get(crate::server::routes::health::readyz))
         // Aliases of the probes above: the engine's `/health`, and the
         // `/liveness` and `/readiness` paths deployments poll.

@@ -440,14 +440,15 @@ mod tests {
         RadixTreePrefixProvider::new(tree, oracle)
     }
 
-    fn tokens(blocks: usize) -> Vec<u64> {
-        (1..=(blocks * BLOCK as usize) as u64).collect()
+    fn tokens(blocks: usize) -> Vec<u32> {
+        (1..=(blocks * BLOCK as usize) as u32).collect()
     }
 
     /// Publish the first `blocks` blocks of `tokens` for `url` as KV events.
-    fn confirm(provider: &RadixTreePrefixProvider, url: &str, tokens: &[u64], blocks: usize) {
+    fn confirm(provider: &RadixTreePrefixProvider, url: &str, tokens: &[u32], blocks: usize) {
+        let tokens = widen(tokens);
         let hashes = provider
-            .block_hashes(tokens, &CacheNamespace::default())
+            .block_hashes(&tokens, &CacheNamespace::default())
             .expect("hashes");
         let event = BlockStored {
             block_hashes: hashes[..blocks].to_vec(),
@@ -465,9 +466,9 @@ mod tests {
             .store_event(&KvWorkerId::new(url.to_owned(), 0), &event);
     }
 
-    fn lookup(provider: &RadixTreePrefixProvider, tokens: &[u64]) -> PrefixLookupResult {
+    fn lookup(provider: &RadixTreePrefixProvider, tokens: &[u32]) -> PrefixLookupResult {
         provider
-            .match_request_tokens(tokens, &CacheNamespace::default())
+            .match_request_tokens(&widen(tokens), &CacheNamespace::default())
             .expect("lookup")
     }
 
@@ -648,11 +649,11 @@ mod tests {
         for rank in 0..2 {
             let event = BlockStored {
                 block_hashes: provider
-                    .block_hashes(&prompt, &CacheNamespace::default())
+                    .block_hashes(&widen(&prompt), &CacheNamespace::default())
                     .unwrap()[..4]
                     .to_vec(),
                 parent_block_hash: None,
-                token_ids: prompt[..4 * BLOCK as usize].to_vec(),
+                token_ids: widen(&prompt[..4 * BLOCK as usize]),
                 block_size: BLOCK,
                 lora_id: None,
                 lora_name: None,
@@ -676,7 +677,7 @@ mod tests {
         assert!(provider
             .tree
             .media_ranks()
-            .depths(&provider.block_hashes(&text, &ns).unwrap())
+            .depths(&provider.block_hashes(&widen(&text), &ns).unwrap())
             .is_empty());
     }
 
@@ -700,8 +701,8 @@ mod tests {
         turn1.extend([IMAGE, MEDIA_TAG_MARK, 50_000, 50_001]);
         let mut turn2 = turn1.clone();
         turn2.extend(50_002..50_022);
-        let hashes1 = provider.block_hashes(&turn1, &ns).unwrap();
-        let hashes2 = provider.block_hashes(&turn2, &ns).unwrap();
+        let hashes1 = provider.block_hashes(&widen(&turn1), &ns).unwrap();
+        let hashes2 = provider.block_hashes(&widen(&turn2), &ns).unwrap();
         assert_ne!(hashes1[4], hashes2[4], "the image block's own hash moves");
         let media1 = provider.media_chain(&turn1, &ns, &hashes1).unwrap();
         let media2 = provider.media_chain(&turn2, &ns, &hashes2).unwrap();
@@ -716,7 +717,7 @@ mod tests {
             let event = BlockStored {
                 block_hashes: hashes1[..4].to_vec(),
                 parent_block_hash: None,
-                token_ids: turn1[..32].to_vec(),
+                token_ids: widen(&turn1[..32]),
                 block_size: WIDE,
                 lora_id: None,
                 lora_name: None,
@@ -798,9 +799,10 @@ mod tests {
                 let provider = media_provider();
                 for rank in [0, 1] {
                     let event = BlockStored {
-                        block_hashes: provider.block_hashes(&prompt, &ns).unwrap()[..4].to_vec(),
+                        block_hashes: provider.block_hashes(&widen(&prompt), &ns).unwrap()[..4]
+                            .to_vec(),
                         parent_block_hash: None,
-                        token_ids: prompt[..4 * BLOCK as usize].to_vec(),
+                        token_ids: widen(&prompt[..4 * BLOCK as usize]),
                         block_size: BLOCK,
                         lora_id: None,
                         lora_name: None,
@@ -888,9 +890,9 @@ mod tests {
         let prompt = media_prompt(4, 2);
         // Rank 0 of a holds the four text blocks.
         let event = BlockStored {
-            block_hashes: provider.block_hashes(&prompt, &ns).unwrap()[..4].to_vec(),
+            block_hashes: provider.block_hashes(&widen(&prompt), &ns).unwrap()[..4].to_vec(),
             parent_block_hash: None,
-            token_ids: prompt[..4 * BLOCK as usize].to_vec(),
+            token_ids: widen(&prompt[..4 * BLOCK as usize]),
             block_size: BLOCK,
             lora_id: None,
             lora_name: None,

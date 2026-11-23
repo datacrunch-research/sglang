@@ -19,6 +19,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
 from sglang.srt.mem_cache.allocation import alloc_req_slots, ensure_mamba_capacity
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
@@ -351,7 +352,7 @@ class TestMambaCapacity(unittest.TestCase):
                 cache.get_last_hash_value = lambda _: "h2"
                 cache.prefetch_from_storage = MagicMock()
                 cache.has_ongoing_prefetch = lambda _: True
-                req = SimpleNamespace(
+                req = FakeReq(
                     rid=case,
                     cache_request_handle=CacheRequestHandle(case, 0),
                     origin_input_ids=list(range(8)),
@@ -359,6 +360,7 @@ class TestMambaCapacity(unittest.TestCase):
                     finished_reason=None,
                     extra_key=None,
                     cache_salt=None,
+                    kv_hints=None,
                     kv=SimpleNamespace(
                         req_pool_idx=0,
                         cache_protected_len=0,
@@ -366,8 +368,14 @@ class TestMambaCapacity(unittest.TestCase):
                         mamba_ping_pong_track_buffer=None,
                     ),
                 )
+                req.kv.protect_prefix = lambda n, kv=req.kv: setattr(
+                    kv, "cache_protected_len", n
+                )
                 decode_req = SimpleNamespace(
-                    req=req, waiting_for_input=True, is_rebootstrap=False
+                    req=req,
+                    waiting_for_input=True,
+                    is_rebootstrap=False,
+                    kv_receiver=SimpleNamespace(prefill_info=None),
                 )
                 # L1 2 + L2 2 + L3 2 tokens: L2 and L3 need a local restore.
                 prefix_match = DecodePrefixMatch(
@@ -378,13 +386,16 @@ class TestMambaCapacity(unittest.TestCase):
                     last_host_node=22,
                 )
                 queued_restore = SimpleNamespace(
+                    req=FakeReq(rid=f"{case}-queued"),
                     prefix_match=DecodePrefixMatch(torch.tensor([]), 2, 0, 0),
                     hicache_restore_status=HiCacheRestoreResult.PENDING,
                     hicache_restore_lock=None,
                 )
                 queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
                 queue.pp_size = 1
-                queue.queue = [decode_req]
+                queue.queue = decode_queue(ListKind.PD_PREALLOC, [decode_req])
+                queue._num_published_destinations = 0
+                queue.retracted_queue = IndexedReqList(ListKind.PD_RETRACTED)
                 queue.pending_reqs = []
                 queue.req_to_token_pool = pool
                 queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
@@ -392,7 +403,9 @@ class TestMambaCapacity(unittest.TestCase):
                 )
                 queue.tree_cache = cache
                 queue.transfer_queue = SimpleNamespace(
-                    queue=[queued_restore] if pending else []
+                    queue=decode_queue(
+                        ListKind.PD_RECEIVING, [queued_restore] if pending else []
+                    )
                 )
                 queue.scheduler = SimpleNamespace(
                     running_batch=SimpleNamespace(reqs=[]),
@@ -402,7 +415,9 @@ class TestMambaCapacity(unittest.TestCase):
                     enable_decode_hicache=True,
                 )
                 queue.token_to_kv_pool_allocator = SimpleNamespace(
-                    page_size=1, translate_kv_indices_for_transfer=lambda x: x
+                    page_size=1,
+                    translate_kv_indices_for_transfer=lambda x: x,
+                    state=pool.state,
                 )
                 queue.kv_manager = SimpleNamespace(
                     kv_args=SimpleNamespace(state_types=[])
@@ -418,6 +433,8 @@ class TestMambaCapacity(unittest.TestCase):
                 queue._required_alloc_tokens = MagicMock(return_value=8)
                 queue._required_admission_tokens = MagicMock(return_value=8)
                 queue._prealloc_reservation_fits = MagicMock(return_value=True)
+                queue._prealloc_demand = MagicMock()
+                queue._pending_state_slots = MagicMock(return_value=0)
                 promised = []
                 sent = []
 
@@ -425,11 +442,14 @@ class TestMambaCapacity(unittest.TestCase):
                     promised.append(total)
                     return torch.arange(10 + total, 18)
 
-                def send(_decode_req, indices, _page_size, _state, **metadata):
-                    sent.append((indices.tolist(), metadata["decode_prefix_len"]))
+                def publish(*, dst_kv_indices, total_prefix_len, **_):
+                    sent.append((dst_kv_indices.tolist(), total_prefix_len))
 
                 queue._pre_alloc = pre_alloc
-                queue._send_kv_metadata = send
+                queue._defer_publish = False
+                queue.draft_kv_ring = None
+                queue._publish_destination = publish
+                queue.note_destinations_queued = MagicMock()
                 with patch(
                     "sglang.srt.disaggregation.decode.get_disagg",
                     return_value=SimpleNamespace(
@@ -437,7 +457,10 @@ class TestMambaCapacity(unittest.TestCase):
                         disaggregation_decode_enable_radix_cache=True,
                     ),
                 ):
-                    self.assertEqual(queue.pop_preallocated(), ([decode_req], []))
+                    self.assertEqual(
+                        queue.move_preallocated(queue.transfer_queue.queue),
+                        ([decode_req], []),
+                    )
                 self.assertEqual(promised, [expected])
                 self.assertEqual(sent, [(list(range(10 + expected, 18)), expected)])
                 self.assertEqual(req.kv.cache_protected_len, expected)

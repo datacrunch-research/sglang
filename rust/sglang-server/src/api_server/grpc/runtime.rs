@@ -14,8 +14,8 @@ use std::pin::Pin;
 use futures::{Stream, StreamExt};
 use sglang_api_types::api::v1 as api;
 use sglang_api_types::api::v1::sglang_service_server::SglangService as ApiService;
-use sglang_api_types::runtime::v1 as rt;
-use sglang_api_types::runtime::v1::sglang_service_server::SglangService as RuntimeService;
+use sglang_runtime_v1_types as rt;
+use sglang_runtime_v1_types::sglang_service_server::SglangService as RuntimeService;
 use tonic::{Request, Response, Status};
 
 use super::service::GrpcService;
@@ -460,6 +460,7 @@ mod tests {
                     error: Some(api::ErrorBody {
                         message: "boom".into(),
                         code: 429,
+                        ..Default::default()
                     }),
                     index: Some(0),
                 },

@@ -14,9 +14,7 @@ use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{outcome_from_status, RequestLogContext};
 use crate::server::routes::cell;
-use crate::server::routes::chat::{
-    prompt_ids, route_grpc, route_typed, Endpoint, MAX_CHAT_BODY_BYTES,
-};
+use crate::server::routes::chat::{prompt_ids, route_grpc, route_typed, Endpoint};
 use crate::workers::GRPC_MAX_MESSAGE_BYTES;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use bytes::Bytes;

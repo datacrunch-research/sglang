@@ -2117,6 +2117,7 @@ mod tests {
 
         let (http_addr, grpc_addr) = free_loopback_addrs();
         let rt = start(test_config(http_addr, Some(grpc_addr)), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
 
         let body = r#"{"input_ids":[1,2,3],"image_data":"data:image/png;base64,AAAA","sampling_params":{"max_new_tokens":1}}"#;
         let mut conn = std::net::TcpStream::connect(http_addr).expect("connect");

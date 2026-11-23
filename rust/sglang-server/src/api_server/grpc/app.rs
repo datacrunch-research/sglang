@@ -6,7 +6,7 @@
 //! [`crate::api_server::handlers::CoreHandle`] contract.
 
 use sglang_api_types::api::v1::sglang_service_server::SglangServiceServer;
-use sglang_api_types::runtime::v1::sglang_service_server::SglangServiceServer as RuntimeServiceServer;
+use sglang_runtime_v1_types::sglang_service_server::SglangServiceServer as RuntimeServiceServer;
 use tokio_stream::wrappers::TcpListenerStream;
 
 use super::runtime::RuntimeFacade;

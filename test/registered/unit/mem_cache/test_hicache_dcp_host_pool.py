@@ -980,6 +980,7 @@ class TestDcpDecodeStorageAttach(CustomTestCase):
             token_to_kv_pool_allocator=SimpleNamespace(),
             _enable_metrics_flag=False,
             extra_metric_labels=None,
+            storage_existence_cache=set(),
         )
         return StorageAttachment(cache), cache, controller
 

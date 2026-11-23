@@ -217,14 +217,10 @@ impl ChatFormatter {
             // recipe renders a continued final message itself, so no prefix follows.
             ChatFormatter::DeepSeekV4(_) | ChatFormatter::DeepSeekV41(_) => {
                 let v41 = matches!(self, ChatFormatter::DeepSeekV41(_));
-                // SGLang rejects images on a text-only server.
+                // Images render as recipe places them, one `IMAGE_TOKEN` each; the
+                // chat layer admits them only for a multimodal engine.
                 render_deepseek_v4(v41, request, default_kwargs)
-                    .and_then(|(prompt, images)| {
-                        if !images.is_empty() {
-                            return Err("image input is not supported for this model".into());
-                        }
-                        Ok((prompt, String::new()))
-                    })
+                    .map(|(prompt, _images)| (prompt, String::new()))
                     .map_err(RenderError::Failed)
             }
             ChatFormatter::Glm53(formatter) => {

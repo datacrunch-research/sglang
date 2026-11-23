@@ -31,7 +31,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use sgl_kv_indexer::PrefixOutcome;
-use sglang_api_types::runtime::v1 as proto;
+use sglang_runtime_v1_types as proto;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1059,6 +1059,7 @@ mod tests {
             dp_ranks: 1,
             openai: None,
             grpc_port: None,
+            supports_inline_system: false,
             mm: Some(Arc::new(crate::workers::introspect::EngineMm {
                 enabled: true,
                 max_items: [("image".to_owned(), 4)].into_iter().collect(),

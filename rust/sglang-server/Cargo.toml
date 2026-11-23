@@ -84,6 +84,7 @@ tokio-stream = { workspace = true }
 # (`SGLANG_ENABLE_REQUEST_DECOMPRESSION`).
 zstd = { version = "0.13", default-features = false }
 sglang_api_types = { package = "sglang-api-types", path = "../sglang-api-types" }
+sglang_runtime_v1_types = { package = "sglang-runtime-v1-types", path = "../sglang-runtime-v1-types" }
 
 # Hardware SHA-256 extensions; identical digests. sha2 0.10 compiles its
 # aarch64 backend only with `asm` (x86 already uses SHA-NI without it).

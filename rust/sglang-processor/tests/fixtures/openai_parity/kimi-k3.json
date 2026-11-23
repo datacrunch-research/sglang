@@ -1978,7 +1978,7 @@
             "completion_tokens": 42,
             "prompt_tokens_details": null,
             "reasoning_tokens": 0,
-            "completion_tokens_details": null
+            "completion_tokens_details": {"reasoning_tokens": 0}
           },
           "metadata": {"weight_version": "default"}
         }

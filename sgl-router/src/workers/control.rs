@@ -60,6 +60,8 @@ impl WorkerInput {
             bootstrap_port: self.bootstrap_port,
             version_group: self.version_group,
             services: self.services,
+            // The caller names the mode.
+            role_unknown: false,
         }
     }
 }

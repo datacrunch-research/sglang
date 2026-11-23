@@ -192,7 +192,7 @@ class DecodeHiCachePreallocMixin:
             return 0
         return sum(
             dr.prefix_match.needs_local_restore
-            for dr in self.transfer_queue.queue
+            for dr in self.transfer_queue.queue.items()
             if dr.prefix_match is not None
             and dr.hicache_restore_status == HiCacheRestoreResult.PENDING
             and dr.hicache_restore_lock is None
