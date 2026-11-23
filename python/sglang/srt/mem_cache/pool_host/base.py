@@ -202,12 +202,17 @@ def host_memory_budget_plain_hugetlb(
     auto_size: bool = False,
     free_hugetlb_bytes: Optional[int] = None,
     page_size_and_mode: Optional[tuple[int, str]] = None,
+    plain_per_rank: bool = True,
 ) -> tuple[int, int]:
     """The (plain RAM, hugetlb pool) bytes this rank may claim for HiCache.
 
     Bound machine availability by the visible cgroup limits before splitting
     among local ranks. Independent engines with separate container budgets
     therefore size against their own remaining allowance.
+    ``plain_per_rank=False`` leaves plain RAM undivided, for checking an
+    explicitly sized pool: ranks read the headroom at different moments, so a
+    rank that checks after its peers pinned their pools would otherwise be
+    refused although every pool fits (sgl-project/sglang#38156).
     Auto-sizing requires successful cgroup discovery; explicit pool sizing
     can fall back to checking host availability when discovery fails.
     The pool is credited only when ``allocator`` (an instance, or its class
@@ -229,12 +234,13 @@ def host_memory_budget_plain_hugetlb(
             else free_hugetlb_bytes
         )
     ranks = ranks_per_host()
+    plain_share = plain // ranks if plain_per_rank else max(0, plain)
     # gfx950 can pin host memory only up to the amdgpu TTM page limit
     if is_gfx95_supported():
         from sglang.srt.mem_cache.pool_host.rocm_budget import clamp_plain_budget
 
-        return clamp_plain_budget(plain // ranks), pool // ranks
-    return plain // ranks, pool // ranks
+        return clamp_plain_budget(plain_share), pool // ranks
+    return plain_share, pool // ranks
 
 
 def host_memory_budget_from_plain_hugetlb(
@@ -276,6 +282,7 @@ def host_memory_preflight(
     *,
     auto_size: bool = False,
     book: bool = True,
+    sizing: bool = False,
 ) -> HostMemoryPreflight:
     """Charge mapping_lengths against this rank's HiCache host-memory budget.
 
@@ -290,6 +297,9 @@ def host_memory_preflight(
     ``book=False`` only inspects the scope budget without charging it, for
     aggregate stack-level checks whose constituent pools bill themselves at
     construction.
+
+    Outside a scope, a check is against the host's whole plain-RAM headroom;
+    ``sizing=True`` (or ``auto_size``) returns this rank's share instead.
     """
     available = _host_memory_budget.get()
     if available is not None:
@@ -336,6 +346,7 @@ def host_memory_preflight(
         auto_size=auto_size,
         free_hugetlb_bytes=free_hugetlb,
         page_size_and_mode=page_size_and_mode,
+        plain_per_rank=sizing or auto_size,
     )
     plain_part, pool_part = _host_memory_allocation_bytes(
         mapping_lengths,

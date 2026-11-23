@@ -688,7 +688,7 @@ class TestHostMemoryBudget(CustomTestCase):
     # psutil value drifts between calls and would flake the equality checks.
     _AVAILABLE = base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 64 * (1024**3)
 
-    def _budget_with_ranks(self, ranks):
+    def _budget_with_ranks(self, ranks, sizing=True):
         # Deliberate single-accessor stub: isolates the budget math from the
         # topology derivation, which the ranks_per_host case below covers.
         with (
@@ -698,11 +698,18 @@ class TestHostMemoryBudget(CustomTestCase):
             ),
             envs.SGLANG_HUGEPAGE_MODE.override("off"),
         ):
-            return base.host_memory_preflight().available_bytes
+            return base.host_memory_preflight(sizing=sizing).available_bytes
 
     def test_budget_is_split_across_co_located_ranks(self):
         solo = self._budget_with_ranks(1)
         self.assertEqual(self._budget_with_ranks(4), solo // 4)
+
+    def test_explicit_size_check_is_not_split_across_ranks(self):
+        """Ranks read the host headroom at different moments, so a rank that
+        checks an explicitly sized pool after its peers pinned theirs must see
+        the whole remaining headroom, not a 1/ranks share of it."""
+        solo = self._budget_with_ranks(1, sizing=False)
+        self.assertEqual(self._budget_with_ranks(8, sizing=False), solo)
 
     def test_reserve_is_taken_before_the_split(self):
         # Each rank must not get its own copy of the reserve.
@@ -730,6 +737,7 @@ class TestHostMemoryBudget(CustomTestCase):
     def _budget_for(
         self, allocator, device, available, ranks=8, mode="prefer", size="2MB"
     ):
+        # The per-rank share (sizing); the explicit-size check is covered above.
         with (
             unittest.mock.patch.object(base, "ranks_per_host", return_value=ranks),
             unittest.mock.patch.object(
@@ -739,7 +747,7 @@ class TestHostMemoryBudget(CustomTestCase):
             envs.SGLANG_HUGEPAGE_SIZE.override(size),
         ):
             return base.host_memory_preflight(
-                allocator=allocator, device=device
+                allocator=allocator, device=device, sizing=True
             ).available_bytes
 
     def test_budget_is_the_larger_of_plain_ram_and_the_hugetlb_pool(self):
@@ -839,7 +847,7 @@ class TestHostMemoryBudget(CustomTestCase):
             )
             # The bookable boundary is this rank's pool share, not the
             # host-wide pool: 2 ranks, an 8 GiB pool and a 6 GiB batch bill
-            # plain, which fits the 7 GiB per-rank plain budget.
+            # plain, checked against the whole 14 GiB plain headroom.
             allocator.free_hugetlb_bytes.return_value = 8 * gib
             with (
                 unittest.mock.patch.object(base, "ranks_per_host", return_value=2),
@@ -851,7 +859,7 @@ class TestHostMemoryBudget(CustomTestCase):
             ):
                 preflight = base.host_memory_preflight([6 * gib], allocator, "cuda")
                 self.assertEqual(preflight.allocation_bytes, 6 * gib)
-                self.assertEqual(preflight.available_bytes, 7 * gib)
+                self.assertEqual(preflight.available_bytes, 14 * gib)
         # Without SGLANG_HUGEPAGE_SIZE there is no page size to round to.
         with envs.SGLANG_HUGEPAGE_SIZE.override(""):
             self.assertEqual(allocation_bytes(), 2 * int(1.1 * gib))

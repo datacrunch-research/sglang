@@ -113,8 +113,11 @@ class _SharedPageEnvelopeHostBacking:
         self.allocator = get_allocator_from_storage(allocator_type)
 
         if host_size == 0 and host_to_device_ratio == 0:
+            # Sizing, not checking: keep this rank's share.
             total_bytes = host_memory_preflight(
-                allocator=self.allocator, device=device_buffers[0].device
+                allocator=self.allocator,
+                device=device_buffers[0].device,
+                sizing=True,
             ).available_bytes
         elif host_size > 0:
             total_bytes = max(nominal_view_bytes)
