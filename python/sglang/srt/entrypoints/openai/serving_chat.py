@@ -331,21 +331,6 @@ def _tool_call_pairing_error(messages: list) -> str | None:
     return None
 
 
-def _tool_call_name_error(messages: list) -> str | None:
-    """OpenAI requires function.name on history tool calls; the encoders read it."""
-    for i, message in enumerate(messages):
-        if not (
-            isinstance(message, ChatCompletionMessageGenericParam)
-            and message.role == "assistant"
-            and message.tool_calls
-        ):
-            continue
-        for j, call in enumerate(message.tool_calls):
-            if call.function.name is None:
-                return f"messages[{i}].tool_calls[{j}].function.name is required."
-    return None
-
-
 # The Kimi K3 encoder asserts thinking_effort is one of these while thinking is on.
 _KIMI_K3_THINKING_EFFORTS = ("low", "high", "max")
 # _encode_messages passes these to the Kimi K3 tokenizer's apply_chat_template
@@ -1106,10 +1091,6 @@ class OpenAIServingChat(OpenAIServingBase):
         media_error = self._validate_media_content(request)
         if media_error:
             return media_error
-
-        tool_call_name_error = _tool_call_name_error(request.messages)
-        if tool_call_name_error:
-            return tool_call_name_error
 
         if self.chat_encoding_spec == "kimi_k3":
             template_kwargs_error = _kimi_k3_template_kwargs_error(

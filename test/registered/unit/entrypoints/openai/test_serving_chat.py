@@ -6340,12 +6340,6 @@ class KimiK3UnrenderableRequestTestCase(CustomTestCase):
             },
         },
     }
-    NAMED_CALL = {
-        "id": "read:0",
-        "type": "function",
-        "function": {"name": "read", "arguments": '{"path": "config.yaml"}'},
-    }
-
     def setUp(self):
         super().setUp()
         reset_context()
@@ -6378,47 +6372,6 @@ class KimiK3UnrenderableRequestTestCase(CustomTestCase):
         return ChatCompletionRequest(
             model="x", messages=messages, tools=[self.READ_TOOL], **kwargs
         )
-
-    def test_history_tool_call_without_function_name_is_a_400(self):
-        """A history tool call without function.name (missing or null) reached the
-        encoder, which reads the name to render the call."""
-        encoder = self.tm.tokenizer.apply_chat_template
-        encoder.reset_mock()  # the serving layer probes the template at init
-        for function in ({"arguments": "{}"}, {"name": None, "arguments": "{}"}):
-            nameless = {"id": ":1", "type": "function", "function": function}
-            with self.subTest(function=function):
-                response = get_or_create_event_loop().run_until_complete(
-                    self.chat.handle_request(
-                        self._request([self.NAMED_CALL, nameless]),
-                        Mock(spec=Request, headers={}),
-                    )
-                )
-                self.assertEqual(response.status_code, HTTPStatus.BAD_REQUEST)
-                self.assertEqual(
-                    json.loads(response.body)["message"],
-                    "messages[1].tool_calls[1].function.name is required.",
-                )
-        encoder.assert_not_called()
-
-        # OpenAI requires the name for every model, and the dsv32 encoder reads it
-        # too. An empty name and an id-less call still render.
-        nameless = {"id": ":1", "type": "function", "function": {"arguments": "{}"}}
-        empty_name = {
-            "id": ":1",
-            "type": "function",
-            "function": {"name": "", "arguments": "{}"},
-        }
-        id_less = {"type": "function", "function": {"name": "read", "arguments": ""}}
-        for spec in (None, "dsv32", "kimi_k3"):
-            with self.subTest(chat_encoding_spec=spec):
-                self.chat.chat_encoding_spec = spec
-                self.assertIsNotNone(
-                    self.chat._validate_request(self._request([nameless]))
-                )
-                for call in (empty_name, id_less):
-                    self.assertIsNone(
-                        self.chat._validate_request(self._request([call]))
-                    )
 
     def test_chat_template_kwargs_the_k3_encoder_rejects_are_400s(self):
         """The K3 encoder asserts thinking_effort, and _encode_messages passes three
