@@ -516,6 +516,9 @@ class DFlashWorkerV2(BaseSpecWorker):
     scheduler runs it synchronously when overlap is disabled.
     """
 
+    # Set by _init_verify_planner; None on pipeline stages that do not host the draft.
+    _info_dumper: Optional[DsparkInfoDumper] = None
+
     _hosts_draft: bool = True
     _runtime = None  # see kernel_plugins/nvidia/kimi_k31_dflash_binding.py
     _verify_planner: Optional[DSparkVerifyPlanner] = None
@@ -900,6 +903,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._verify_planner.set_forced_budget_frac(frac)
 
     def dump_info_records(self) -> Optional[dict]:
+        if self._info_dumper is None:
+            return None
         dumped = self._info_dumper.dump()
         if dumped is not None:
             dumped["simulate_acc_len"] = (
@@ -908,7 +913,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         return dumped
 
     def clear_info_records(self) -> None:
-        self._info_dumper.clear()
+        if self._info_dumper is not None:
+            self._info_dumper.clear()
 
     def _defer_target_verify_gather(self) -> Optional[LogitsProcessor]:
         processors = [
