@@ -52,6 +52,10 @@ pub struct ChatModel {
     /// `_apply_jinja_template` rejects image input otherwise.
     #[serde(default)]
     pub is_multimodal: bool,
+    /// A Jinja template that places image parts itself (GLM-5.3):
+    /// `ChatFormatter::places_images`.
+    #[serde(default)]
+    pub template_places_images: bool,
 }
 
 impl ChatModel {
@@ -68,6 +72,7 @@ impl ChatModel {
                 }
             }),
             chat_encoding_spec: formatter.chat_encoding_spec().map(str::to_owned),
+            template_places_images: formatter.places_images(),
             ..Self::default()
         }
     }
@@ -81,10 +86,11 @@ impl ChatModel {
     /// and DeepSeek V4/V4.1 (`<｜deepseek_image｜>`). Images still need a
     /// multimodal engine (`is_multimodal`).
     fn renders_images(&self) -> bool {
-        matches!(
-            self.chat_encoding_spec.as_deref(),
-            Some("kimi_k3" | "dsv4" | "dsv41")
-        )
+        self.template_places_images
+            || matches!(
+                self.chat_encoding_spec.as_deref(),
+                Some("kimi_k3" | "dsv4" | "dsv41")
+            )
     }
 
     /// `_patch_reasoning_skip_special_tokens`: K3's markers are special
@@ -1516,6 +1522,35 @@ mod tests {
     /// Kimi K3 lowers image parts (its renderer places one pad per image) and
     /// carries their sources as `image_data`; other models still send images to
     /// the engine's own OpenAI route, and video or audio always does.
+    #[test]
+    fn glm53_images_lower_only_for_a_multimodal_engine() {
+        let messages = json!([{"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]}]);
+        let body = serde_json::to_vec(&json!({"model": "m", "messages": messages})).unwrap();
+        let lower = |is_multimodal| {
+            let glm = ChatModel {
+                always_thinks: true,
+                template_places_images: true,
+                is_multimodal,
+                ..ChatModel::default()
+            };
+            lower_chat(
+                &body,
+                &OpenAiHeaders::default(),
+                &OpenAiSettings::default(),
+                &glm,
+                |_: &Value| Some(vec![1, 7]),
+                None,
+            )
+            .map(|(generate, _)| generate)
+            .map_err(|reason| reason.0)
+        };
+        let generate = lower(true).expect("images lower for a multimodal GLM-5.3 engine");
+        assert!(generate.image_data.is_some());
+        assert_eq!(lower(false).err(), Some("unsupported_chat_feature"));
+    }
+
     #[test]
     fn kimi_k3_images_lower_with_their_sources() {
         let messages = json!([{"role": "user", "content": [

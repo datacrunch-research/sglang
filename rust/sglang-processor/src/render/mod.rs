@@ -246,6 +246,15 @@ impl ChatFormatter {
         }
     }
 
+    /// The template places image parts itself, one placeholder per image, as
+    /// SGLang's Jinja path renders them (`{"type": "image"}` from
+    /// `process_content_for_template_format`): GLM-5.3's
+    /// `<|begin_of_image|><|image|><|end_of_image|>`. The engine expands each
+    /// placeholder over the image (`Glm4vImageProcessor`).
+    pub fn places_images(&self) -> bool {
+        matches!(self, ChatFormatter::Glm53(_))
+    }
+
     /// Python's `chat_encoding_spec`: the model's own encoder, for the chat
     /// layer's special cases (`kimi_k3`, `dsv4`, `dsv41`); `None` for a
     /// template-rendered model.

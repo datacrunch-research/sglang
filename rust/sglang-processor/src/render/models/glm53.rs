@@ -184,6 +184,9 @@ fn template_message(message: Value) -> Result<Value, RenderError> {
                 Some("tool_reference") => {
                     Ok(json!({"type": "tool_reference", "name": part["name"]}))
                 }
+                // `process_content_for_template_format`: an image becomes a bare
+                // `image` part, which the template renders as its placeholder.
+                Some("image_url" | "input_image") => Ok(json!({"type": "image"})),
                 _ => Err(RenderError::Declined("GLM-5.3 media".into())),
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -322,5 +325,31 @@ mod tests {
             formatter.unwrap(),
             ChatFormatter::HuggingFace { .. }
         ));
+    }
+
+    /// `process_content_for_template_format`: an image part reaches the template
+    /// as a bare `image` part, in place; video and audio stay with the engine.
+    #[test]
+    fn image_parts_reach_the_template_as_images() {
+        let message = json!({"role": "user", "content": [
+            {"type": "text", "text": "a"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA", "detail": "low"}},
+            {"type": "input_image", "image_url": "https://x/b.png"},
+            {"type": "text", "text": "b"}]});
+        let rendered = super::template_message(message).unwrap();
+        assert_eq!(
+            rendered["content"],
+            json!([{"type": "text", "text": "a"}, {"type": "image"}, {"type": "image"},
+                {"type": "text", "text": "b"}])
+        );
+        for media in ["video_url", "input_audio"] {
+            let message =
+                json!({"role": "user", "content": [{"type": media, media: {"url": "x"}}]});
+            assert!(super::template_message(message).is_err(), "{media}");
+        }
+        let formatter = ChatFormatter::from_tokenizer_config(&json!({
+            "chat_template": "[gMASK]<sop>Reasoning Effort: <tool_call><arg_key><arg_value>"}))
+        .unwrap();
+        assert!(formatter.places_images());
     }
 }
