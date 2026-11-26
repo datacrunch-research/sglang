@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{BlockSizeOracle, CacheNamespace, HashTree};
+use super::{BlockCheckpoints, BlockSizeOracle, CacheNamespace, HashTree};
 use sgl_kv_indexer::{PrefixMatch, PrefixOutcome};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -58,10 +58,53 @@ impl RadixTreePrefixProvider {
         namespace: &CacheNamespace,
     ) -> Option<PrefixLookupResult> {
         let hashes = self.block_hashes(tokens, namespace)?;
+        let confirmed = self
+            .tree
+            .prefix_depths(None, &hashes)
+            .into_iter()
+            .map(|(worker, depth)| (worker.url, depth));
+        Some(self.resolve(
+            hashes.len(),
+            confirmed,
+            || self.tree.pending().depths(&hashes),
+            Some(&hashes),
+        ))
+    }
 
+    /// The lookup for a prompt named by a sample of its block hashes (see
+    /// [`super::checkpoints`]), which an upstream router sends instead of the
+    /// token ids. Depths are those of the deepest sample each worker holds,
+    /// so they are lower bounds, short of the truth by less than one stride.
+    /// Nothing is staked from it: the sample cannot name every block of the
+    /// prompt, and a stake is the route's business, not the query's.
+    pub fn match_checkpoints(&self, checkpoints: &BlockCheckpoints) -> PrefixLookupResult {
+        let confirmed = self
+            .tree
+            .checkpoint_depths(checkpoints)
+            .into_iter()
+            .map(|(worker, depth)| (worker.url, depth as usize));
+        self.resolve(
+            checkpoints.total_blocks as usize,
+            confirmed,
+            || self.tree.pending().checkpoint_depths(checkpoints),
+            None,
+        )
+    }
+
+    /// Merges confirmed per-worker depths with the pending tier, by the
+    /// provider's pending mode, into the lookup result. `pending` runs only
+    /// when the mode consults the pending tier; `hashes`, when the query has
+    /// every block hash, is kept so the route can stake the prompt.
+    fn resolve(
+        &self,
+        query_blocks: usize,
+        confirmed: impl IntoIterator<Item = (String, usize)>,
+        pending: impl FnOnce() -> Vec<(Arc<str>, usize)>,
+        hashes: Option<&[i64]>,
+    ) -> PrefixLookupResult {
         let mut depth_by_url = BTreeMap::<String, u32>::new();
-        for (worker, depth) in self.tree.prefix_depths(None, &hashes) {
-            merge_depth(&mut depth_by_url, worker.url, depth);
+        for (url, depth) in confirmed {
+            merge_depth(&mut depth_by_url, url, depth);
         }
         let confirmed = depth_by_url.values().copied().max();
         let confirmed_by_url = depth_by_url.clone();
@@ -77,12 +120,12 @@ impl RadixTreePrefixProvider {
             // where it is strictly deeper than the best confirmed match, so a
             // real match that is at least as good always decides.
             Some(below) => {
-                let covered = confirmed.unwrap_or(0) as f64 / hashes.len() as f64;
+                let covered = confirmed.unwrap_or(0) as f64 / query_blocks.max(1) as f64;
                 (self.tree.pending().is_enabled() && covered < below, false)
             }
         };
         let pending = if consult_pending {
-            self.tree.pending().depths(&hashes)
+            pending()
         } else {
             Vec::new()
         };
@@ -121,12 +164,12 @@ impl RadixTreePrefixProvider {
             }
         };
         // Empty is still returned so routing can record where this prompt went.
-        Some(PrefixLookupResult {
+        PrefixLookupResult {
             outcome,
-            query_blocks: hashes.len(),
+            query_blocks,
             pending_winners,
-            block_hashes: consult_pending.then(|| hashes.into()),
-        })
+            block_hashes: hashes.filter(|_| consult_pending).map(Arc::from),
+        }
     }
 
     /// Remember that `signal`'s prompt was just routed to `url`. When the

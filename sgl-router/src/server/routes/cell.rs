@@ -22,7 +22,9 @@ use crate::policies_reorg::admission::partition_admitted;
 use crate::server::app_context::{AppContext, ChatRouting};
 use crate::server::error::ApiError;
 use crate::server::routes::chat::lookup_prefix_for_tokens;
-use crate::state::kv_events::CacheNamespace;
+use crate::state::kv_events::{
+    CacheNamespace, CheckpointQuery, HashScheme, RadixTreePrefixProvider,
+};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::workers::Worker;
 use axum::extract::State;
@@ -52,22 +54,40 @@ pub struct PrefixMatchRequest {
     /// 64-bit, as the engine caches them: a multimodal prompt's pad sentinels
     /// (above 2^32) match the blocks the engine published.
     pub token_ids: Vec<u64>,
-    /// The whole prompt's length; defaults to `token_ids.len()`.
+    /// The whole prompt's length; defaults to `token_ids.len()`, or to the
+    /// full blocks a checkpoint query names.
     pub input_tokens: Option<u64>,
     /// KV namespace components, as the chat request would carry them.
     pub cache_salt: Option<String>,
     pub lora_name: Option<String>,
     /// The caller's remaining budget. A lookup that cannot finish inside it
     /// answers 504 rather than late, so the caller counts a miss and moves on.
+    /// Only a remote indexer's lookup waits and can be cut short: one in the
+    /// local KV tree, by ids or by checkpoints, never yields and runs to the
+    /// end.
     pub deadline_ms: Option<u32>,
+    /// The prompt as a sample of its chained block hashes instead of its
+    /// token ids: the whole prompt, at a few hundred hashes whatever its
+    /// length. When present it decides the depth and `token_ids` is unused.
+    /// A cell whose engines hash otherwise cannot use it and answers 409, so
+    /// the caller resends the token ids.
+    pub checkpoints: Option<CheckpointQuery>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct PrefixMatchResponse {
     /// Deepest contiguous prefix any engine of this cell holds, in tokens,
-    /// capped at the query length.
+    /// capped at the query length. For a checkpoint query, the depth of the
+    /// deepest sample held: a lower bound.
     pub matched_prefix_tokens: u64,
     pub matched_prefix_blocks: u32,
+    /// For a checkpoint query, the most an engine of this cell holds as far
+    /// as its KV tree saw: one block short of the next sample, which none
+    /// holds there. A chain stored before this router subscribed can run past
+    /// it. Equal to `matched_prefix_tokens` where the samples are dense;
+    /// absent for a token query, whose depth is exact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_prefix_tokens_upper: Option<u64>,
     /// The cell's block size; 0 until an engine reports one.
     pub page_size: u32,
     /// The depth came from a pending stake (a prompt just routed here whose KV
@@ -104,12 +124,17 @@ pub struct CellLoad {
     pub router_inflight_requests: u64,
 }
 
-/// Why a prefix match produced no answer: the budget ran out.
+/// Why a prefix match produced no answer.
 #[derive(Debug)]
 pub enum PrefixMatchFailure {
     Api(ApiError),
     /// The lookup did not finish within `deadline_ms`.
     Deadline,
+    /// The checkpoints were hashed in a way this cell's engines do not hash
+    /// (block size, bigram mode, a LoRA namespace, or a remote indexer that
+    /// only takes full chains), or the cell does not know yet how they hash.
+    /// The caller resends the token ids.
+    CheckpointsUnusable(String),
 }
 
 impl From<ApiError> for PrefixMatchFailure {
@@ -130,6 +155,9 @@ pub async fn prefix_match(
             "prefix lookup did not finish within deadline_ms",
         )
             .into_response()),
+        Err(PrefixMatchFailure::CheckpointsUnusable(why)) => {
+            Ok((StatusCode::CONFLICT, why).into_response())
+        }
         Err(PrefixMatchFailure::Api(error)) => Err(error),
     }
 }
@@ -146,15 +174,29 @@ pub async fn prefix_match_answer(
         lora_name: request.lora_name.filter(|s| !s.is_empty()),
         ambiguous: false,
     };
-    let lookup = lookup_prefix_for_tokens(ctx, &request.token_ids, &namespace, &model.0);
-    let signal = match request.deadline_ms {
-        Some(ms) if ms > 0 => {
-            match tokio::time::timeout(Duration::from_millis(u64::from(ms)), lookup).await {
-                Ok(signal) => signal?,
-                Err(_) => return Err(PrefixMatchFailure::Deadline),
+    // What the query names: the tokens it carries, or the whole prompt its
+    // checkpoints sample. Depths are capped at it.
+    let query_tokens = match &request.checkpoints {
+        Some(query) => u64::from(query.samples.total_blocks) * u64::from(query.scheme.page_size),
+        None => request.token_ids.len() as u64,
+    };
+    let signal = match &request.checkpoints {
+        // A lookup by hash takes one shard's read lock at a time and does no
+        // hashing. Like the ids lookup in the local tree it never yields, so
+        // racing it against the deadline could not cut it short.
+        Some(query) => Some(lookup_prefix_for_checkpoints(ctx, query, &namespace)?),
+        None => {
+            let lookup = lookup_prefix_for_tokens(ctx, &request.token_ids, &namespace, &model.0);
+            match request.deadline_ms {
+                Some(ms) if ms > 0 => {
+                    match tokio::time::timeout(Duration::from_millis(u64::from(ms)), lookup).await {
+                        Ok(signal) => signal?,
+                        Err(_) => return Err(PrefixMatchFailure::Deadline),
+                    }
+                }
+                _ => lookup.await?,
             }
         }
-        _ => lookup.await?,
     };
 
     let now = Instant::now();
@@ -162,22 +204,72 @@ pub async fn prefix_match_answer(
     let urls: HashSet<&str> = engines.iter().map(|w| w.url.as_str()).collect();
     let (matched_prefix_blocks, pending) = cell_depth(signal.as_ref(), &urls);
     let page_size = ctx.block_size_oracle.get().unwrap_or(0);
-    let matched_prefix_tokens = (u64::from(matched_prefix_blocks) * u64::from(page_size))
-        .min(request.token_ids.len() as u64);
+    let to_tokens = |blocks: u32| (u64::from(blocks) * u64::from(page_size)).min(query_tokens);
+    let matched_prefix_tokens = to_tokens(matched_prefix_blocks);
+    let matched_prefix_tokens_upper = request
+        .checkpoints
+        .as_ref()
+        .map(|query| to_tokens(query.samples.upper_bound(matched_prefix_blocks)));
     let snapshot = ctx.engine_reported_load.capture_snapshot(now);
     let load = summarize_load(&engines, &snapshot, now);
-    let input_tokens = request
-        .input_tokens
-        .unwrap_or(request.token_ids.len() as u64);
+    let input_tokens = request.input_tokens.unwrap_or(query_tokens);
     let admits = admits(ctx, &model, input_tokens, &snapshot);
     Ok(PrefixMatchResponse {
         matched_prefix_tokens,
         matched_prefix_blocks,
+        matched_prefix_tokens_upper,
         page_size,
         pending,
         load,
         admits,
     })
+}
+
+/// The lookup for a checkpoint query, from the in-process KV tree. Refused
+/// (the caller falls back to token ids) unless the samples were hashed the
+/// way this cell's engines publish: same block size and bigram mode, and no
+/// LoRA namespace, whose published keys are per-worker ids the caller cannot
+/// compute. A cache salt is fine: it seeds the chain the caller hashed.
+fn lookup_prefix_for_checkpoints(
+    ctx: &AppContext,
+    query: &CheckpointQuery,
+    namespace: &CacheNamespace,
+) -> Result<PrefixLookupResult, PrefixMatchFailure> {
+    let unusable = |why: String| PrefixMatchFailure::CheckpointsUnusable(why);
+    query
+        .samples
+        .validate()
+        .map_err(|e| PrefixMatchFailure::Api(ApiError::BadRequest(e.to_string())))?;
+    if namespace.lora_name.is_some() {
+        return Err(unusable("checkpoints do not cover a LoRA namespace".into()));
+    }
+    let (provider, scheme) = checkpoint_scheme(ctx).map_err(|why| unusable(why.into()))?;
+    if scheme != query.scheme {
+        return Err(unusable(format!(
+            "this cell hashes {}-token pages (bigram {}), not {} (bigram {})",
+            scheme.page_size, scheme.bigram, query.scheme.page_size, query.scheme.bigram
+        )));
+    }
+    Ok(provider.match_checkpoints(&query.samples))
+}
+
+/// The hashing this cell answers checkpoint queries in, and the tree it
+/// answers them from: its engines' block size and bigram mode, once known,
+/// over the in-process KV tree. A cell matching through a remote indexer
+/// takes only token queries.
+fn checkpoint_scheme(
+    ctx: &AppContext,
+) -> Result<(&RadixTreePrefixProvider, HashScheme), &'static str> {
+    let provider = ctx
+        .radix_tree_prefix_provider
+        .as_ref()
+        .filter(|_| ctx.prefix_index.is_none())
+        .ok_or("this cell matches prefixes without a local KV tree")?;
+    let (page_size, bigram) = ctx
+        .block_size_oracle
+        .hash_config()
+        .ok_or("this cell does not know its engines' hashing yet")?;
+    Ok((provider, HashScheme::new(page_size, bigram)))
 }
 
 /// `GET /internal/cell_load`.
@@ -206,6 +298,12 @@ pub struct CellInfo {
     pub tokenizer_path: Option<String>,
     /// The cell's block size; 0 until an engine reports one.
     pub page_size: u32,
+    /// How the engines hash KV blocks, when this cell answers checkpoint
+    /// prefix queries (`PrefixMatchRequest::checkpoints`): an upstream that reads it
+    /// may name a prompt by a sample of its block hashes. Absent from a
+    /// router that does not take them, or before the engines report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_hash: Option<HashScheme>,
     /// This router's native gRPC port (`--grpc-port`), when it serves one:
     /// `sglang.runtime.v1.SglangService` on the same host as the HTTP port.
     pub grpc_port: Option<u16>,
@@ -400,6 +498,7 @@ pub fn cell_info_answer(ctx: &AppContext) -> CellInfo {
         model: model.0,
         tokenizer_path: ctx.config.model.tokenizer_path.clone(),
         page_size: ctx.block_size_oracle.get().unwrap_or(0),
+        kv_hash: checkpoint_scheme(ctx).ok().map(|(_, scheme)| scheme),
         grpc_port: ctx.config.server.grpc_port,
         engines: engines.len() as u32,
         engines_reporting_chat: reported.len() as u32,
@@ -486,6 +585,7 @@ impl From<proto::PrefixMatchRequest> for PrefixMatchRequest {
             cache_salt: request.cache_salt,
             lora_name: request.lora_name,
             deadline_ms: request.deadline_ms,
+            checkpoints: None,
         }
     }
 }
@@ -696,6 +796,7 @@ mod tests {
     use crate::state::kv_events::prefix_provider::RadixTreePrefixProvider;
     use crate::state::kv_events::tree::{HashTree, KvWorkerId};
     use crate::state::kv_events::wire::BlockStored;
+    use crate::state::kv_events::BlockCheckpoints;
     use crate::state::load_monitor::engine_reported_load::{LoadStat, NativeCacheRankLoad};
     use axum::body::Body;
     use axum::http::Request;
@@ -738,6 +839,11 @@ mod tests {
     /// A context with a local KV tree where `url_a` holds the first `blocks`
     /// blocks of `prompt`.
     fn ctx_with_tree(prompt: &[u64], blocks: usize) -> Arc<AppContext> {
+        ctx_and_tree(prompt, blocks).0
+    }
+
+    /// [`ctx_with_tree`], and the tree, for a test that publishes more events.
+    fn ctx_and_tree(prompt: &[u64], blocks: usize) -> (Arc<AppContext>, Arc<HashTree>) {
         let mut ctx = AppContext::stub();
         let oracle = BlockSizeOracle::new();
         oracle.try_set(BLOCK).expect("block size");
@@ -764,7 +870,7 @@ mod tests {
         ctx.radix_tree_prefix_provider = Some(provider);
         add_worker(&ctx, "a", "http://a:30000", WorkerMode::Plain);
         add_worker(&ctx, "b", "http://b:30000", WorkerMode::Plain);
-        Arc::new(ctx)
+        (Arc::new(ctx), tree)
     }
 
     async fn post_json(ctx: Arc<AppContext>, path: &str, body: Value) -> (StatusCode, Value) {
@@ -800,6 +906,179 @@ mod tests {
             status,
             serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         )
+    }
+
+    /// The checkpoint query an upstream would send for `prompt`: a sample
+    /// every `stride` blocks and the last full block.
+    fn checkpoint_query(prompt: &[u64], stride: usize) -> Value {
+        checkpoint_query_hashed(prompt, stride, false)
+    }
+
+    /// [`checkpoint_query`], hashed over bigrams or not. A bigram page is
+    /// `BLOCK` bigrams, of which a prompt has one fewer than tokens.
+    fn checkpoint_query_hashed(prompt: &[u64], stride: usize, bigram: bool) -> Value {
+        let hashes = CacheNamespace::default().block_hashes(prompt, BLOCK as usize, bigram);
+        let full = (prompt.len() - usize::from(bigram)) / BLOCK as usize;
+        let samples = BlockCheckpoints::grid(&hashes, full, stride);
+        json!({"page_size": BLOCK, "bigram": bigram, "blocks": samples.blocks,
+               "hashes": samples.hashes, "total_blocks": samples.total_blocks})
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_query_sees_the_whole_prompt_past_any_token_cap() {
+        // 400 tokens = 100 blocks; engine a holds the first 70.
+        let prompt: Vec<u64> = (1..=400).collect();
+        let ctx = ctx_with_tree(&prompt, 70);
+        ctx.block_size_oracle.set_bigram(false);
+        let model = ctx.config.model.id.clone();
+        // A token query capped at 16 tokens learns only that the start is held.
+        let (_, capped) = post_json(
+            Arc::clone(&ctx),
+            PREFIX_MATCH_PATH,
+            json!({"model": model, "token_ids": prompt[..16], "input_tokens": 400}),
+        )
+        .await;
+        assert_eq!(capped["matched_prefix_tokens"], 16);
+        // A sample every 12 blocks: 11, 23, …, 59, 71, …, 95, and 99.
+        let (status, body) = post_json(
+            ctx,
+            PREFIX_MATCH_PATH,
+            json!({"model": model, "checkpoints": checkpoint_query(&prompt, 12)}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // Block 59 is the deepest held, 71 the next.
+        assert_eq!(body["matched_prefix_blocks"], 60);
+        assert_eq!(body["matched_prefix_tokens"], 240);
+        assert_eq!(body["matched_prefix_tokens_upper"], 284);
+        let truth = 70 * BLOCK as u64;
+        assert!(body["matched_prefix_tokens"].as_u64().unwrap() <= truth);
+        assert!(body["matched_prefix_tokens_upper"].as_u64().unwrap() >= truth);
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_query_finds_a_chain_whose_start_the_tree_missed() {
+        // The engine stored blocks 0..30 before this router subscribed, then
+        // blocks 30..60 as a continuation of block 29: the tree holds those as
+        // an orphan, which a walk from the root never reaches.
+        let prompt: Vec<u64> = (1..=240).collect();
+        let (ctx, tree) = ctx_and_tree(&prompt, 0);
+        ctx.block_size_oracle.set_bigram(false);
+        let hashes = ctx
+            .block_size_oracle
+            .block_hashes(&prompt, &CacheNamespace::default())
+            .unwrap();
+        tree.store_event(
+            &KvWorkerId::new("http://a:30000".into(), 0),
+            &BlockStored {
+                block_hashes: hashes[30..60].to_vec(),
+                parent_block_hash: Some(hashes[29]),
+                token_ids: prompt[120..240].to_vec(),
+                block_size: BLOCK,
+                lora_id: None,
+                lora_name: None,
+                cache_salt: None,
+                is_bigram: false,
+                medium: None,
+            },
+        );
+        let model = ctx.config.model.id.clone();
+        let (_, walked) = post_json(
+            Arc::clone(&ctx),
+            PREFIX_MATCH_PATH,
+            json!({"model": model, "token_ids": prompt}),
+        )
+        .await;
+        assert_eq!(
+            walked["matched_prefix_tokens"], 0,
+            "the walk stops at the missing block 0"
+        );
+        let (status, body) = post_json(
+            ctx,
+            PREFIX_MATCH_PATH,
+            json!({"model": model, "checkpoints": checkpoint_query(&prompt, 16)}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["matched_prefix_tokens"], 240,
+            "the last block names the whole prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bigram_cell_answers_bigram_checkpoints_and_refuses_unigram_ones() {
+        // 41 tokens: 40 bigrams, 10 full pages; engine a holds 7 of them.
+        let prompt: Vec<u64> = (1..=41).collect();
+        let (ctx, tree) = ctx_and_tree(&prompt, 0);
+        ctx.block_size_oracle.set_bigram(true);
+        let hashes = ctx
+            .block_size_oracle
+            .block_hashes(&prompt, &CacheNamespace::default())
+            .unwrap();
+        assert_eq!(hashes.len(), 10);
+        tree.insert(
+            &KvWorkerId::new("http://a:30000".into(), 0),
+            None,
+            &hashes[..7],
+        );
+        let model = ctx.config.model.id.clone();
+        let (status, body) = post_json(
+            Arc::clone(&ctx),
+            PREFIX_MATCH_PATH,
+            json!({"model": model, "checkpoints": checkpoint_query_hashed(&prompt, 2, true)}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // Samples at blocks 1, 3, 5, 7 and 9: block 5 is the deepest held.
+        assert_eq!(body["matched_prefix_blocks"], 6);
+        assert_eq!(body["matched_prefix_tokens"], 6 * BLOCK);
+        assert_eq!(body["matched_prefix_tokens_upper"], 7 * BLOCK);
+        let (status, _) = post_json(
+            ctx,
+            PREFIX_MATCH_PATH,
+            json!({"model": model, "checkpoints": checkpoint_query(&prompt, 2)}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "unigram samples of a bigram fleet"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_query_hashed_another_way_is_refused_with_409() {
+        let prompt: Vec<u64> = (1..=40).collect();
+        let ctx = ctx_with_tree(&prompt, 6);
+        let model = ctx.config.model.id.clone();
+        // The cell does not know its engines' bigram mode yet.
+        let (status, _) = post_json(
+            Arc::clone(&ctx),
+            PREFIX_MATCH_PATH,
+            json!({"model": model, "checkpoints": checkpoint_query(&prompt, 4)}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        ctx.block_size_oracle.set_bigram(false);
+        let mut query = checkpoint_query(&prompt, 4);
+        query["page_size"] = json!(BLOCK * 2);
+        let (status, _) = post_json(
+            Arc::clone(&ctx),
+            PREFIX_MATCH_PATH,
+            json!({"model": model, "checkpoints": query}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let mut query = checkpoint_query(&prompt, 4);
+        query["hashes"].as_array_mut().unwrap().pop();
+        let (status, _) = post_json(
+            ctx,
+            PREFIX_MATCH_PATH,
+            json!({"model": model, "checkpoints": query}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -981,6 +1260,21 @@ mod tests {
         assert_eq!(body["engines_reporting_chat"], 0);
         assert!(body["chat"].is_null());
         assert_eq!(body["consistent"], true);
+        assert!(
+            body.get("kv_hash").is_none(),
+            "no checkpoint queries before the engines' bigram mode is known"
+        );
+    }
+
+    #[tokio::test]
+    async fn cell_info_advertises_checkpoint_queries_once_the_hashing_is_known() {
+        let ctx = ctx_with_tree(&(1..=40).collect::<Vec<u64>>(), 6);
+        ctx.block_size_oracle.set_bigram(false);
+        let (_, body) = get_json(ctx, CELL_INFO_PATH).await;
+        assert_eq!(
+            body["kv_hash"],
+            json!({"page_size": BLOCK, "bigram": false})
+        );
     }
 
     #[tokio::test]

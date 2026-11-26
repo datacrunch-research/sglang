@@ -295,6 +295,7 @@ sglang_service! {
                 Err(cell::PrefixMatchFailure::Deadline) => Err(Status::deadline_exceeded(
                     "prefix lookup did not finish within deadline_ms",
                 )),
+                Err(cell::PrefixMatchFailure::CheckpointsUnusable(why)) => Err(Status::failed_precondition(why)),
                 Err(cell::PrefixMatchFailure::Api(error)) => Err(error.into_grpc_status()),
             }
         }

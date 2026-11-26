@@ -118,6 +118,7 @@ use tracing::{debug, error};
 
 use super::pending::PendingPrefixes;
 
+mod checkpoints;
 mod snapshot;
 
 pub(super) use snapshot::ShapeViolation;

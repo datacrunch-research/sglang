@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 
+mod checkpoints;
+
 /// Bound on remembered (block, worker) records; arbitrary.
 const MAX_RECORDS: usize = 1 << 20;
 

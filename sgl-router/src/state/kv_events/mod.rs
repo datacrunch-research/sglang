@@ -22,6 +22,7 @@
 
 pub mod block_size_oracle;
 pub mod bootstrap;
+pub mod checkpoints;
 pub mod discovery;
 pub mod hash;
 pub mod index;
@@ -34,6 +35,7 @@ pub mod wire;
 
 pub use block_size_oracle::BlockSizeOracle;
 pub use bootstrap::{BootstrapState, BootstrapTracker, PeerRegistry, WireWorker};
+pub use checkpoints::{BlockCheckpoints, CheckpointQuery, HashScheme};
 pub(crate) use discovery::classify_bigram;
 pub use discovery::{fetch_event_config, EventConfig};
 pub use hash::{compute_block_hashes, compute_block_hashes_bigram, sha256_to_i64, CacheNamespace};

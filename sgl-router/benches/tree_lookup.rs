@@ -15,6 +15,10 @@
 //!     before writing one, so it costs strictly more than a `None` insert;
 //!     the paired `parent_none` case is the same block count without the
 //!     scan.
+//!   * `checkpoint_depths` — a checkpoint query looked up by hash in a tree
+//!     of about 1M nodes, a sample every 16 blocks (1024 tokens at 64-token
+//!     pages) of a 128K- and a 1M-token prompt: one the tree holds, and one
+//!     it does not, whose every sample is looked up in every shard.
 //!   * `contended_match` — reader `match_prefix` throughput WHILE a
 //!     background writer hammers `insert` / `remove`. The case sharding
 //!     targets: under one process-wide lock every event write blocks every
@@ -36,6 +40,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use sgl_router::state::kv_events::tree::{HashTree, KvWorkerId};
+use sgl_router::state::kv_events::BlockCheckpoints;
 
 fn build_tree(num_workers: usize, blocks_per_worker: usize, seed: u64) -> HashTree {
     let tree = HashTree::new();
@@ -242,11 +247,34 @@ impl Drop for StopOnDrop {
     }
 }
 
+fn bench_checkpoint_depths(c: &mut Criterion) {
+    let mut group = c.benchmark_group("hashtree_checkpoint_depths");
+    let (workers, bpw) = (64usize, 16_384usize);
+    let tree = build_tree(workers, bpw, 0xDEADBEEF);
+    // Worker 0's chain, as `build_tree` drew it, and a chain no worker holds.
+    let mut rng = StdRng::seed_from_u64(0xDEADBEEF);
+    let held: Vec<i64> = (0..bpw).map(|_| rng.gen::<i64>()).collect();
+    let mut rng = StdRng::seed_from_u64(0x0BAD_5EED);
+    let unknown: Vec<i64> = (0..bpw).map(|_| rng.gen::<i64>()).collect();
+    for (tokens, blocks) in [(128_000usize, 2_000usize), (1_000_000, 15_625)] {
+        for (kind, hashes) in [("held", &held), ("unknown", &unknown)] {
+            let samples = BlockCheckpoints::grid(&hashes[..blocks], blocks, 16);
+            let label = format!("{kind}_{}k_tokens_{}_samples", tokens / 1000, samples.len());
+            group.throughput(Throughput::Elements(samples.len() as u64));
+            group.bench_function(label, |b| {
+                b.iter(|| black_box(tree.checkpoint_depths(black_box(&samples))).len());
+            });
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_insert,
     bench_insert_continuation,
     bench_match_prefix,
+    bench_checkpoint_depths,
     bench_contended_match
 );
 criterion_main!(benches);
