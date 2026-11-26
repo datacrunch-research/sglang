@@ -14,6 +14,7 @@ use sglang_api_types::api::v1::{
     token_ids_or_list,
 };
 
+use super::glm_grammar::glm47_grammar;
 use super::kimi_k3_tag::auto_tool_call_tag;
 use super::request::{
     OneOrList, ResponseFormat, StreamOptions, custom_labels, default_model, format_json_schema,
@@ -337,17 +338,6 @@ pub fn lower_chat(
         Some(name) => Some(think_config(name).ok_or(Unsupported("reasoning_parser"))?),
         None => None,
     };
-    // `_process_messages`: glm47 constrains a request with tools, `"none"`
-    // included, by a grammar flagged `ebnf_full_assistant`, which `/generate`
-    // does not accept.
-    if settings.tool_call_parser.as_deref() == Some("glm47")
-        && raw
-            .get("tools")
-            .and_then(Value::as_array)
-            .is_some_and(|tools| !tools.is_empty())
-    {
-        return Err(Unsupported("tool_grammar"));
-    }
     let tools = request_tools(&raw)?;
     // `_effective_tools`: the request's, then the system turns' declarations.
     let tool_definitions = Some(effective_tools(&raw)).filter(|tools| !tools.is_empty());
@@ -455,6 +445,35 @@ pub fn lower_chat(
         if let Some(tag) = auto_tool_call_tag(definitions, parallel_tool_calls, &strip)? {
             sampling.structural_tag = Some(python_json(&tag, true));
         }
+    }
+    // `_process_messages` (the engine GLM-5.3 serves on): glm47 constrains an
+    // `auto` request with non-strict tools by a full-assistant grammar, unless
+    // the request is constrained. Python flags it `ebnf_full_assistant`, which
+    // `/generate` refuses; `__sglang_reasoning_in_grammar` in `custom_params`
+    // has the same effect (the grammar applies from the first token).
+    if let (Some((tool_parser, _)), Some(definitions)) = (&tool_parsing, &tool_definitions)
+        && tool_parser == "glm47"
+        && [
+            &sampling.regex,
+            &sampling.ebnf,
+            &sampling.json_schema,
+            &sampling.structural_tag,
+        ]
+        .iter()
+        .all(|value| value.as_deref().is_none_or(str::is_empty))
+    {
+        // A template that always opens `<think>` (GLM-5.3) ignores
+        // `enable_thinking`; Python's grammar still reads it and then forbids
+        // `</think>` (sgl-project/sglang#48336), so it is not read for those.
+        let enable_thinking = model.always_thinks
+            || kwargs
+                .get("enable_thinking")
+                .filter(|v| !v.is_null())
+                .is_none_or(py_bool);
+        let grammar = glm47_grammar(definitions, enable_thinking, parallel_tool_calls)
+            .ok_or(Unsupported("tool_grammar"))?;
+        sampling.ebnf = Some(grammar);
+        sampling.custom_params = Some(with_reasoning_in_grammar(sampling.custom_params.as_deref()));
     }
     if let Some(stop) = tool_call_stop {
         let mut stops = match sampling.stop.take().and_then(|s| s.value) {
@@ -680,6 +699,32 @@ fn re_compiles(pattern: &str) -> bool {
         escaped || pattern[i + 2..].starts_with(':') || pattern[i + 2..].starts_with("P<")
     });
     groups_shared && regex_syntax::Parser::new().parse(pattern).is_ok()
+}
+
+/// `set_request_reasoning_in_grammar` (`sampling/sampling_params.py`): the
+/// request's `custom_params` JSON with the private key that makes the
+/// scheduler apply the grammar from the first output token.
+fn with_reasoning_in_grammar(custom_params: Option<&str>) -> String {
+    let mut params: Map<String, Value> = custom_params
+        .and_then(|text| serde_json::from_str(text).ok())
+        .unwrap_or_default();
+    params.insert(REASONING_IN_GRAMMAR_KEY.to_owned(), Value::Bool(true));
+    serde_json::to_string(&params).expect("JSON object")
+}
+
+/// `REQUEST_REASONING_IN_GRAMMAR_KEY`.
+const REASONING_IN_GRAMMAR_KEY: &str = "__sglang_reasoning_in_grammar";
+
+/// Python's `bool(value)` of a JSON value.
+fn py_bool(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64() != Some(0.0),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(fields) => !fields.is_empty(),
+    }
 }
 
 fn truthy(value: &Value) -> bool {
@@ -2098,5 +2143,113 @@ mod tests {
             .collect();
         assert!(created.len() > 1, "{events:?}");
         assert!(created.iter().all(|c| *c == json!(1)), "{created:?}");
+    }
+
+    /// GLM-5.3: always thinks (the template opens `<think>`), glm45 and glm47.
+    fn glm_lower(body: &Value) -> Result<SamplingParams, &'static str> {
+        let settings = OpenAiSettings {
+            reasoning_parser: Some("glm45".into()),
+            tool_call_parser: Some("glm47".into()),
+            ..OpenAiSettings::default()
+        };
+        let model = ChatModel {
+            always_thinks: true,
+            ..ChatModel::default()
+        };
+        let (generate, _) = lower_chat(
+            &serde_json::to_vec(body).unwrap(),
+            &OpenAiHeaders::default(),
+            &settings,
+            &model,
+            |_: &Value| Some(vec![1, 7]),
+            None,
+        )
+        .map_err(|reason| reason.0)?;
+        assert_eq!(
+            generate.require_reasoning,
+            Some(true),
+            "the template always thinks"
+        );
+        let Some(sampling_params_or_list::Value::One(sampling)) =
+            generate.sampling_params.and_then(|p| p.value)
+        else {
+            panic!("one sampling configuration")
+        };
+        Ok(sampling)
+    }
+
+    fn glm_tool() -> Value {
+        json!({"type": "function", "function": {"name": "get_weather", "parameters": {
+            "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}})
+    }
+
+    fn custom_params(sampling: &SamplingParams) -> Value {
+        serde_json::from_str(sampling.custom_params.as_deref().unwrap_or("null")).unwrap()
+    }
+
+    /// A glm47 `auto` request with tools gets the engine's whole-turn grammar,
+    /// and the private key that applies it from the first token.
+    #[test]
+    fn glm47_tools_carry_the_whole_turn_grammar() {
+        let messages = json!([{"role": "user", "content": "Weather in Paris?"}]);
+        let sampling = glm_lower(&json!({"messages": messages, "tools": [glm_tool()]})).unwrap();
+        let want = glm47_grammar(&[glm_tool()], true, true).unwrap();
+        assert_eq!(sampling.ebnf.as_deref(), Some(want.as_str()));
+        assert!(want.contains(r#"thinking_block ::= thinking_block_content "</think>""#));
+        assert_eq!(
+            custom_params(&sampling),
+            json!({"__sglang_reasoning_in_grammar": true})
+        );
+    }
+
+    /// GLM-5.3 ignores `enable_thinking`, so its grammar keeps the thinking
+    /// block whatever the request says (sgl-project/sglang#48336).
+    #[test]
+    fn glm47_grammar_thinks_whatever_the_request_says() {
+        let messages = json!([{"role": "user", "content": "Weather in Paris?"}]);
+        let want = glm47_grammar(&[glm_tool()], true, true).unwrap();
+        for off in [
+            json!({"chat_template_kwargs": {"enable_thinking": false}}),
+            json!({"reasoning_effort": "none"}),
+            json!({"chat_template_kwargs": {"enable_thinking": 0}}),
+        ] {
+            let mut body = json!({"messages": messages, "tools": [glm_tool()]});
+            body.as_object_mut()
+                .unwrap()
+                .extend(off.as_object().unwrap().clone());
+            let sampling = glm_lower(&body).unwrap_or_else(|r| panic!("{off}: {r}"));
+            assert_eq!(sampling.ebnf.as_deref(), Some(want.as_str()), "{off}");
+        }
+    }
+
+    /// The key joins the client's own `custom_params`; a client value of the
+    /// key itself is overwritten.
+    #[test]
+    fn glm47_key_joins_the_clients_custom_params() {
+        let body = json!({"messages": [{"role": "user", "content": "hi"}], "tools": [glm_tool()],
+            "custom_params": {"mine": 1, "__sglang_reasoning_in_grammar": false}});
+        let sampling = glm_lower(&body).unwrap();
+        assert_eq!(
+            custom_params(&sampling),
+            json!({"mine": 1, "__sglang_reasoning_in_grammar": true})
+        );
+    }
+
+    /// No grammar where Python adds none: `tool_choice` "none", no tools, or a
+    /// request already constrained (Python warns and keeps the request's own).
+    #[test]
+    fn glm47_grammar_only_where_python_adds_it() {
+        let messages = json!([{"role": "user", "content": "hi"}]);
+        for body in [
+            json!({"messages": messages, "tools": [glm_tool()], "tool_choice": "none"}),
+            json!({"messages": messages}),
+            json!({"messages": messages, "tools": [glm_tool()], "response_format": {"type": "json_object"}}),
+            json!({"messages": messages, "tools": [glm_tool()], "regex": "a+"}),
+        ] {
+            let sampling = glm_lower(&body).unwrap();
+            let constrained = sampling.ebnf.is_some();
+            assert!(!constrained, "{body}");
+            assert!(sampling.custom_params.is_none(), "{body}");
+        }
     }
 }

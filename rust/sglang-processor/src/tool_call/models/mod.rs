@@ -2,6 +2,7 @@
 //! differently. Every other name goes to Dynamo.
 
 mod deepseek_v4;
+mod glm47;
 mod kimi_k3;
 mod qwen3_coder;
 
@@ -26,6 +27,8 @@ pub(crate) fn tool_detector(tool_parser: &str, tools: &[Value]) -> Option<Box<dy
             deepseek_v4::DSML_TAGS_V41,
             tool_names(),
         )),
+        // Typed argument values follow the tool schemas, unions narrowed by sibling arguments.
+        "glm47" => Box::new(glm47::Glm47Detector::new(tools.to_vec())),
         // `KimiK3Detector` keeps calls to tools the request does not list.
         "kimi_k3" => Box::new(kimi_k3::KimiK3Detector::default()),
         // Typed argument values follow the tool schemas.

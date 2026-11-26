@@ -457,7 +457,7 @@ fn digit_part(text: &str) -> bool {
 }
 
 /// Python's `int(text)` in base 10, as its decimal digits.
-fn py_int(text: &str) -> Option<String> {
+pub(super) fn py_int(text: &str) -> Option<String> {
     let text = ascii_decimals(py_strip(text))?;
     let text = text.as_str();
     let (negative, digits) = match text.as_bytes().first()? {
@@ -481,7 +481,7 @@ fn py_int(text: &str) -> Option<String> {
 }
 
 /// Python's `float(text)`.
-fn py_float(text: &str) -> Option<f64> {
+pub(super) fn py_float(text: &str) -> Option<f64> {
     let text = ascii_decimals(py_strip(text))?;
     let text = text.as_str();
     let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
@@ -565,7 +565,7 @@ const MAX_NESTING: usize = 200;
 
 /// `json.dumps(ast.literal_eval(text), ensure_ascii=False)` for the literals
 /// [`Literal`] holds, else `None`.
-fn literal_eval(text: &str) -> Option<String> {
+pub(super) fn literal_eval(text: &str) -> Option<String> {
     // Python's tokenizer reads `\r\n` and `\r` as `\n`.
     let source = text.replace("\r\n", "\n").replace('\r', "\n");
     let mut parser = LiteralParser {

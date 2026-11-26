@@ -19,7 +19,7 @@ render = [
 ]
 tokenizer = ["dep:dynamo-tokenizers"]
 # OpenAI endpoints served through `/generate`.
-openai = ["dep:regex", "dep:regex-syntax", "dep:uuid", "dep:sglang-api-types"]
+openai = ["dep:regex", "dep:regex-syntax", "dep:sha2", "dep:uuid", "dep:sglang-api-types"]
 
 [dependencies]
 sglang-api-types = { version = "0.1.0", path = "../sglang-api-types", optional = true }
@@ -50,6 +50,8 @@ regex = { version = "1", optional = true }
 # schema `pattern`s lower (`re_compiles`); a bump can widen that silently.
 regex-syntax = { version = "=0.8.11", optional = true }
 uuid = { workspace = true, optional = true }
+# The rule names of the GLM tool grammar, as SGLang hashes them.
+sha2 = { version = "0.10", optional = true }
 minijinja = { version = "2.24.0", features = ["unstable_machinery"], optional = true }
 
 # Keep this paired with the server until Dynamo exposes a smaller tokenizer API.

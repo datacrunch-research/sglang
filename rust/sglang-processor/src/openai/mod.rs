@@ -8,6 +8,7 @@
 
 mod chat;
 mod completions;
+mod glm_grammar;
 mod kimi_k3_tag;
 mod pieces;
 mod request;
