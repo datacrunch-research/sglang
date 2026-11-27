@@ -75,7 +75,12 @@ def serving_chat(model, path, revision, config, tokenizer, tool_call_parser):
         tokenizer=tokenizer,
         processor=None,
         model_path=path,
-        model_config=SimpleNamespace(is_multimodal=False, hf_config=hf_config),
+        model_config=SimpleNamespace(
+            is_multimodal=False,
+            hf_config=hf_config,
+            # ModelConfig reads hf_text_config.vocab_size; `top_logprobs` validation needs it.
+            vocab_size=(config.get("text_config") or config).get("vocab_size"),
+        ),
     )
     server.template_manager = TemplateManager()
     server.template_manager.load_chat_template(server.tokenizer_manager, None, model)
