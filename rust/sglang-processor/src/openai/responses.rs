@@ -309,9 +309,10 @@ pub fn lower(body: &Value) -> Result<Lowered, ResponsesError> {
     Ok(Lowered { chat, context })
 }
 
-/// Responses input items as chat messages. Function calls become the
-/// assistant's `tool_calls`, their outputs `tool` messages, reasoning items
-/// the next assistant message's `reasoning_content`.
+/// Responses input items as chat messages. A function call joins the
+/// `tool_calls` of the assistant message directly before it, or becomes a new
+/// assistant message when there is none; its output is a `tool` message; a
+/// reasoning item is the next assistant message's `reasoning_content`.
 fn lower_items(items: &[Value], messages: &mut Vec<Value>) -> Result<(), ResponsesError> {
     let mut pending_reasoning: Option<String> = None;
     for item in items {
@@ -362,14 +363,16 @@ fn lower_items(items: &[Value], messages: &mut Vec<Value>) -> Result<(), Respons
                     }
                 };
                 let call = json!({"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}});
-                // Consecutive calls ride on one assistant message, as chat expresses them.
+                // A call belongs to the assistant turn it follows: the text the
+                // model wrote before calling, and the calls before this one, are
+                // one chat message. Split in two, the text reads as a turn that
+                // ended without a call, and the model learns to end there.
                 match messages.last_mut() {
-                    Some(last)
-                        if last["role"] == "assistant"
-                            && last.get("tool_calls").is_some_and(Value::is_array)
-                            && pending_reasoning.is_none() =>
-                    {
-                        last["tool_calls"].as_array_mut().expect("array").push(call);
+                    Some(last) if last["role"] == "assistant" && pending_reasoning.is_none() => {
+                        match last.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                            Some(calls) => calls.push(call),
+                            None => last["tool_calls"] = json!([call]),
+                        }
                     }
                     _ => {
                         let mut message =
@@ -1343,6 +1346,184 @@ mod tests {
                 (kind, serde_json::from_str(data).unwrap())
             })
             .collect()
+    }
+
+    fn text(value: &str) -> Value {
+        json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": value}]})
+    }
+
+    fn call(id: &str, command: &str) -> Value {
+        json!({"type": "function_call", "call_id": id, "name": "shell", "arguments": format!("{{\"command\":\"{command}\"}}")})
+    }
+
+    fn output(id: &str, value: &str) -> Value {
+        json!({"type": "function_call_output", "call_id": id, "output": value})
+    }
+
+    fn lowered_messages(input: Value) -> Vec<Value> {
+        let body = json!({"model": "k3", "input": input});
+        lower(&body).unwrap().chat["messages"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn a_call_joins_the_assistant_text_it_follows() {
+        let messages = lowered_messages(json!([
+            {"role": "user", "content": "fix it"},
+            text("Running the test."),
+            call("call_1", "pytest"),
+        ]));
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "Running the test.");
+        assert_eq!(messages[1]["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_1");
+    }
+
+    #[test]
+    fn several_calls_after_text_stay_on_that_message() {
+        let messages = lowered_messages(json!([
+            {"role": "user", "content": "fix it"},
+            text("Reading both files."),
+            call("call_1", "cat a"),
+            call("call_2", "cat b"),
+        ]));
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(messages[1]["content"], "Reading both files.");
+        let ids: Vec<&str> = messages[1]["tool_calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["call_1", "call_2"]);
+    }
+
+    #[test]
+    fn each_step_of_a_tool_loop_is_one_assistant_turn() {
+        let messages = lowered_messages(json!([
+            {"role": "user", "content": "fix it"},
+            text("Running the test."),
+            call("call_1", "pytest"),
+            output("call_1", "1 failed"),
+            text("Fixing the bug."),
+            call("call_2", "sed"),
+            output("call_2", "ok"),
+        ]));
+        let shape: Vec<(&str, bool, bool)> = messages
+            .iter()
+            .map(|m| {
+                (
+                    m["role"].as_str().unwrap(),
+                    m["content"].is_string(),
+                    m.get("tool_calls").is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("user", true, false),
+                ("assistant", true, true),
+                ("tool", true, false),
+                ("assistant", true, true),
+                ("tool", true, false),
+            ]
+        );
+        assert_eq!(messages[3]["content"], "Fixing the bug.");
+        assert_eq!(messages[3]["tool_calls"][0]["id"], "call_2");
+    }
+
+    #[test]
+    fn reasoning_text_and_call_of_one_step_are_one_assistant_turn() {
+        let messages = lowered_messages(json!([
+            {"role": "user", "content": "fix it"},
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "think"}]},
+            text("Running the test."),
+            call("call_1", "pytest"),
+        ]));
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(messages[1]["reasoning_content"], "think");
+        assert_eq!(messages[1]["content"], "Running the test.");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_1");
+    }
+
+    #[test]
+    fn a_call_is_not_attached_to_a_message_of_another_role_or_turn() {
+        // After a user message the call is its own assistant message.
+        let messages = lowered_messages(
+            json!([{"role": "user", "content": "fix it"}, call("call_1", "pytest")]),
+        );
+        assert_eq!(messages[0], json!({"role": "user", "content": "fix it"}));
+        assert_eq!(messages[1]["role"], "assistant");
+        assert!(messages[1]["content"].is_null());
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_1");
+
+        // Reasoning between the text and the call starts a new assistant message, which carries it.
+        let messages = lowered_messages(json!([
+            {"role": "user", "content": "fix it"},
+            text("Done with the first file."),
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "next"}]},
+            call("call_1", "pytest"),
+        ]));
+        assert_eq!(messages.len(), 3, "{messages:?}");
+        assert_eq!(
+            messages[1],
+            json!({"role": "assistant", "content": "Done with the first file."})
+        );
+        assert_eq!(messages[2]["reasoning_content"], "next");
+        assert_eq!(messages[2]["tool_calls"][0]["id"], "call_1");
+    }
+
+    #[test]
+    fn calls_separated_by_an_output_are_separate_assistant_turns() {
+        let messages = lowered_messages(json!([
+            {"role": "user", "content": "fix it"},
+            call("call_1", "pytest"),
+            output("call_1", "1 failed"),
+            call("call_2", "sed"),
+        ]));
+        let roles: Vec<&str> = messages
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "tool", "assistant"]);
+        assert_eq!(messages[1]["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(messages[3]["tool_calls"][0]["id"], "call_2");
+    }
+
+    #[test]
+    fn a_custom_tool_call_joins_the_assistant_text_it_follows() {
+        let messages = lowered_messages(json!([
+            {"role": "user", "content": "fix it"},
+            text("Applying the patch."),
+            {"type": "custom_tool_call", "call_id": "call_1", "name": "apply_patch", "input": "*** Begin Patch"},
+        ]));
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(messages[1]["content"], "Applying the patch.");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(
+            messages[1]["tool_calls"][0]["function"]["name"],
+            "apply_patch"
+        );
+    }
+
+    #[test]
+    fn reasoning_without_replayable_text_does_not_split_a_turn() {
+        // Encrypted reasoning cannot be replayed through chat and is dropped,
+        // so the text and the call around it are still one turn.
+        let messages = lowered_messages(json!([
+            {"role": "user", "content": "fix it"},
+            text("Running the test."),
+            {"type": "reasoning", "summary": [], "encrypted_content": "zzz"},
+            call("call_1", "pytest"),
+        ]));
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(messages[1]["content"], "Running the test.");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_1");
+        assert!(messages[1].get("reasoning_content").is_none());
     }
 
     #[test]
