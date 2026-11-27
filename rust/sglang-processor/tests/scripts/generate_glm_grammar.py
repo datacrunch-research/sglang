@@ -16,7 +16,10 @@ import sys
 from pathlib import Path
 
 sys.path.insert(
-    0, os.environ.get("SGLANG_PYTHON", str(Path(__file__).resolve().parents[4] / "python"))
+    0,
+    os.environ.get(
+        "SGLANG_PYTHON", str(Path(__file__).resolve().parents[4] / "python")
+    ),
 )
 
 from fixture_json import dump
@@ -31,7 +34,9 @@ def grammar(tools, enable_thinking, parallel_tool_calls):
     parser = FunctionCallParser([Tool(**tool) for tool in tools], "glm47")
     try:
         constraint = parser.get_structure_constraint(
-            "auto", parallel_tool_calls=parallel_tool_calls, thinking_mode=enable_thinking
+            "auto",
+            parallel_tool_calls=parallel_tool_calls,
+            thinking_mode=enable_thinking,
         )
     except ValueError:
         return None

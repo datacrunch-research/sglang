@@ -26,28 +26,67 @@ from sglang.srt.function_call.glm4_moe_detector import (
 )
 
 TOOLS = [
-    {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {
-        "city": {"type": "string"}, "unit": {"type": "string", "enum": ["c", "f"]}}, "required": ["city"]}}},
-    {"type": "function", "function": {"name": "run_shell", "parameters": {"type": "object", "properties": {
-        "command": {"type": "string"}, "timeout_s": {"type": "integer"}, "env": {"type": "object"}},
-        "required": ["command"]}}},
-    {"type": "function", "function": {"name": "create_ticket", "parameters": {"type": "object", "properties": {
-        "title": {"type": "string"}, "priority": {"type": "string", "enum": ["low", "medium", "high"]},
-        "labels": {"type": "array", "items": {"type": "string"}}, "estimate_hours": {"type": "number"}},
-        "required": ["title", "priority"]}}},
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "unit": {"type": "string", "enum": ["c", "f"]},
+                },
+                "required": ["city"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_shell",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "timeout_s": {"type": "integer"},
+                    "env": {"type": "object"},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_ticket",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "priority": {"type": "string", "enum": ["low", "medium", "high"]},
+                    "labels": {"type": "array", "items": {"type": "string"}},
+                    "estimate_hours": {"type": "number"},
+                },
+                "required": ["title", "priority"],
+            },
+        },
+    },
 ]
 PROMPTS = [
     "What is the weather in Paris and in Tokyo today? Use Fahrenheit for Tokyo.",
     "Run `cargo test` with RUST_LOG=debug set, and kill it after 600 seconds.",
-    "Open a high ticket titled \"Engine OOM\" with the labels gpu and oncall, estimated at 2.5 hours.",
+    'Open a high ticket titled "Engine OOM" with the labels gpu and oncall, estimated at 2.5 hours.',
     "Hello! Who are you?",
 ]
 MAX_TOKENS = 2048
 
 
 def post(url, path, body, headers=None):
-    req = urllib.request.Request(url + path, data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json", **(headers or {})})
+    req = urllib.request.Request(
+        url + path,
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json", **(headers or {})},
+    )
     with urllib.request.urlopen(req, timeout=900) as r:
         return json.loads(r.read())
 
@@ -66,20 +105,34 @@ def main():
     )
     failed = 0
     for prompt in PROMPTS:
-        chat = {"model": "x", "messages": [{"role": "user", "content": prompt}], "tools": TOOLS,
-                "temperature": 0.0, "max_tokens": MAX_TOKENS}
+        chat = {
+            "model": "x",
+            "messages": [{"role": "user", "content": prompt}],
+            "tools": TOOLS,
+            "temperature": 0.0,
+            "max_tokens": MAX_TOKENS,
+        }
         # Warm the prefix cache first, so every compared request prefills alike.
         post(url, "/v1/chat/completions", {**chat, "max_tokens": 1})
         ids = {"x-sglext-return-input-ids": "1", "x-sglext-return-output-ids": "1"}
         engine = post(url, "/v1/chat/completions", chat, ids)
         want = engine["sglext"]["output_ids"][0]
         again = post(url, "/v1/chat/completions", chat, ids)["sglext"]["output_ids"][0]
-        routed = post(url, "/generate", {
-            "input_ids": engine["sglext"]["input_ids"],
-            "require_reasoning": True,
-            "sampling_params": {"max_new_tokens": MAX_TOKENS, "temperature": 0.0, "skip_special_tokens": False,
-                                "ebnf": grammar, "custom_params": {"__sglang_reasoning_in_grammar": True}},
-        })
+        routed = post(
+            url,
+            "/generate",
+            {
+                "input_ids": engine["sglext"]["input_ids"],
+                "require_reasoning": True,
+                "sampling_params": {
+                    "max_new_tokens": MAX_TOKENS,
+                    "temperature": 0.0,
+                    "skip_special_tokens": False,
+                    "ebnf": grammar,
+                    "custom_params": {"__sglang_reasoning_in_grammar": True},
+                },
+            },
+        )
         got = routed["output_ids"]
         same = got == want
         # Greedy decoding with MTP is not always repeatable on one engine; a
@@ -88,7 +141,9 @@ def main():
         failed += stable and not same
         first = next((i for i, (a, b) in enumerate(zip(got, want)) if a != b), None)
         label = "ok  " if same else ("DIFF" if stable else "skip")
-        print(f"{label} engine {len(want):5} again_same={stable!s:5} key {len(got):5} first_diff={first}  {prompt[:50]}")
+        print(
+            f"{label} engine {len(want):5} again_same={stable!s:5} key {len(got):5} first_diff={first}  {prompt[:50]}"
+        )
     print("PASS" if not failed else f"FAIL: {failed} of {len(PROMPTS)} prompts differ")
     sys.exit(1 if failed else 0)
 

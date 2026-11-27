@@ -16,7 +16,10 @@ from pathlib import Path
 # Record this checkout's SGLang, not whichever one is installed, unless
 # SGLANG_PYTHON names another (the engine's, for a parser the engine runs).
 sys.path.insert(
-    0, os.environ.get("SGLANG_PYTHON", str(Path(__file__).resolve().parents[4] / "python"))
+    0,
+    os.environ.get(
+        "SGLANG_PYTHON", str(Path(__file__).resolve().parents[4] / "python")
+    ),
 )
 
 from fixture_json import dump
