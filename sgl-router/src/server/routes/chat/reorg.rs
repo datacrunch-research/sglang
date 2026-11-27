@@ -9,6 +9,7 @@ use super::{
 };
 use crate::buckets_reorg::{BucketRequest, BucketResolver, SloPreference};
 use crate::discovery::{ModelId, WorkerId};
+use crate::policies_reorg::cache_aware::{uncached_by_url, PrefixMemo};
 use crate::policies_reorg::{PickError, Stage};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
@@ -58,7 +59,7 @@ pub(super) async fn select_workers(
             None,
         ));
     }
-    let prefix = crate::policies_reorg::cache_aware::PrefixMemo::default();
+    let prefix = PrefixMemo::default();
     let bucket_request = BucketRequest {
         prefix: Some(&prefix),
         model: &request.model,
@@ -91,11 +92,14 @@ pub(super) async fn select_workers(
                     prefix.local_signal().as_deref(),
                     &picks.prefill.engine.url,
                 );
+                let uncached_prefill_tokens =
+                    uncached_prefill_tokens(&bucket_request, &prefix, &picks.prefill.engine.url);
                 // Dispatch only after this bucket supplies the entire plain or PD selection.
                 return Ok(SelectedWorkers {
                     prefill: picks.prefill.engine,
                     decode: picks.decode.map(|pick| pick.engine),
                     track_dispatch_timestamps: false,
+                    uncached_prefill_tokens: Some(uncached_prefill_tokens),
                 });
             }
             Err((stage, error)) => {
@@ -119,6 +123,23 @@ pub(super) async fn select_workers(
         None => PickError::NoCandidates,
     };
     Err(selection_error(error, &request.model, missing_stage))
+}
+
+/// The prompt tokens `prefill_url` has to prefill for `request`, from the
+/// prefix lookup the pick made, as the cache-aware policy reckons them: the
+/// hit covers the longest prompt, the rest of a batch is uncached. All of it
+/// when no lookup was made.
+fn uncached_prefill_tokens(
+    request: &BucketRequest<'_>,
+    prefix: &PrefixMemo,
+    prefill_url: &str,
+) -> u64 {
+    let signal = prefix.signal();
+    let uncached = uncached_by_url(signal.as_deref(), request.input_tokens);
+    let cached = uncached
+        .get(prefill_url)
+        .map_or(0, |&left| request.input_tokens - left);
+    request.total_input_tokens.saturating_sub(cached)
 }
 
 fn selection_error(error: PickError, model: &ModelId, stage: Option<Stage>) -> ApiError {

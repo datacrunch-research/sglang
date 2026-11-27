@@ -11,6 +11,7 @@ pub mod factory;
 pub mod power_of_two;
 pub mod session_aware;
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -18,6 +19,7 @@ use futures::future::BoxFuture;
 
 use crate::discovery::{ModelId, WorkerId};
 use crate::state::kv_events::CacheNamespace;
+use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::workers::Worker;
 
 pub use crate::discovery::WorkerMode as Stage;
@@ -62,6 +64,26 @@ impl<'a> PickRequest<'a> {
 pub struct Pick {
     pub engine: Arc<Worker>,
     pub reason: &'static str,
+}
+
+/// The engines a policy could pick for one request, with the chance of each.
+#[derive(Debug, Clone)]
+pub enum PickDistribution {
+    /// The pick depends on something a distribution does not see, such as a
+    /// session binding.
+    Unsupported,
+    /// The chances sum to 1; an engine the policy would not pick is absent.
+    Engines(Vec<(Arc<Worker>, f64)>),
+}
+
+impl PickDistribution {
+    /// Adds `chance` to `engine`'s share.
+    pub(crate) fn add(chances: &mut Vec<(Arc<Worker>, f64)>, engine: Arc<Worker>, chance: f64) {
+        match chances.iter_mut().find(|(e, _)| Arc::ptr_eq(e, &engine)) {
+            Some((_, share)) => *share += chance,
+            None => chances.push((engine, chance)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +142,22 @@ pub trait Policy: Send + Sync + Debug {
     /// engine would admit a request without picking one.
     fn admission(&self) -> Option<&dyn admission::EngineAdmission> {
         None
+    }
+
+    /// What [`Self::pick`] would choose from `engines` for `request`, as the
+    /// chance of each engine: no side effects and no draw, a random choice
+    /// spread over its outcomes, so one state always gives one answer.
+    /// `uncached` holds each prefix holder's uncached share of the request by
+    /// URL, as `pick` derives it from its prefix lookup; `load` is the
+    /// observation `pick` would capture. Fails where `pick` would.
+    fn pick_distribution(
+        &self,
+        _engines: &[Arc<Worker>],
+        _request: &PickRequest<'_>,
+        _uncached: &HashMap<&str, u64>,
+        _load: &EngineReportedLoadSnapshot,
+    ) -> Result<PickDistribution, PickError> {
+        Ok(PickDistribution::Unsupported)
     }
 
     /// Delegate within the same candidates; the fallback reads its own state.

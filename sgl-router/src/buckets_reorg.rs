@@ -20,12 +20,14 @@
 //! [`WorkerRegistry`] owns live workers; groups select by ID or Service. Policies own
 //! their load/KV/affinity dependencies and pass selected observations to admission.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::discovery::{ModelId, WorkerId};
-use crate::policies_reorg::{Pick, PickError, PickRequest, Policy, Stage};
+use crate::policies_reorg::admission::partition_admitted;
+use crate::policies_reorg::{Pick, PickDistribution, PickError, PickRequest, Policy, Stage};
 use crate::state::kv_events::CacheNamespace;
+use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::workers::{paired_prefills, Worker, WorkerRegistry};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -291,6 +293,52 @@ impl Bucket {
         Ok(BucketPick { prefill, decode })
     }
 
+    /// The plain or prefill engines [`Self::pick_engines`] would choose for a
+    /// prompt of `input_tokens` with no SLO or output budget, with the chance
+    /// of each ([`Policy::pick_distribution`]), without side effects. Under
+    /// P/D only prefills whose version group has a decode that admits count,
+    /// as `pick_engines` moves past a full group.
+    pub fn prefill_distribution(
+        &self,
+        workers: &WorkerRegistry,
+        model: &ModelId,
+        input_tokens: u64,
+        uncached: &HashMap<&str, u64>,
+        load: &EngineReportedLoadSnapshot,
+    ) -> Result<PickDistribution, (Stage, PickError)> {
+        let (group, stage, mut engines) = match &self.groups {
+            BucketGroups::Plain(group) => (
+                group,
+                Stage::Plain,
+                group.members(workers, model, Stage::Plain),
+            ),
+            BucketGroups::Pd { prefill, decode } => {
+                let mut decoders = decode.members(workers, model, Stage::Decode);
+                if let Some(admission) = decode.policy.admission() {
+                    decoders = partition_admitted(admission, &decoders, load)
+                        .map_err(|error| (Stage::Decode, error))?
+                        .0;
+                }
+                let prefills = prefill.members(workers, model, Stage::Prefill);
+                (
+                    prefill,
+                    Stage::Prefill,
+                    paired_prefills(prefills, &decoders),
+                )
+            }
+        };
+        engines.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+        if engines.is_empty() {
+            return Err((stage, PickError::NoCandidates));
+        }
+        let mut request = PickRequest::new(model, stage, input_tokens);
+        request.bucket = &self.id;
+        group
+            .policy
+            .pick_distribution(&engines, &request, uncached, load)
+            .map_err(|error| (stage, error))
+    }
+
     /// Scope the request to this bucket and role, then ask the group for one engine.
     async fn pick_from_group(
         &self,
@@ -480,5 +528,73 @@ mod tests {
         assert!(BucketResolver::new(vec![load_only_bucket("a"), bounded])
             .unwrap()
             .needs_request_tokens());
+    }
+
+    /// A prefill whose version group has no decode that admits is not
+    /// picked, so its chance goes to the prefills that can hand off.
+    #[test]
+    fn a_pd_distribution_leaves_out_prefills_whose_decodes_are_full() {
+        use crate::discovery::WorkerSpec;
+        use crate::policies_reorg::admission::AdmissionLimits;
+        use crate::state::load_monitor::engine_reported_load::{
+            EngineReportedLoadSnapshot, EngineReportedWorkerLoad,
+        };
+        use std::time::Instant;
+
+        let model = ModelId("m".into());
+        let registry = WorkerRegistry::default();
+        for (id, mode, group) in [
+            ("p1", Stage::Prefill, "v1"),
+            ("p2", Stage::Prefill, "v2"),
+            ("d1", Stage::Decode, "v1"),
+            ("d2", Stage::Decode, "v2"),
+        ] {
+            registry
+                .add(WorkerSpec {
+                    id: WorkerId(id.into()),
+                    url: format!("http://{id}:30000"),
+                    mode,
+                    model_ids: vec![model.clone()],
+                    bootstrap_port: (mode == Stage::Prefill).then_some(8998),
+                    version_group: Some(group.into()),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let table = EngineReportedLoadTable::new();
+        let mut decode = PowerOfTwoPolicy::new(table.clone());
+        decode.admission = Arc::new(AdmissionLimits {
+            max_waiting_requests: Some(1),
+            ..Default::default()
+        });
+        let bucket = Bucket::new(
+            "pd",
+            BucketGroups::Pd {
+                prefill: EngineGroup::new(Arc::new(PowerOfTwoPolicy::new(table))),
+                decode: EngineGroup::new(Arc::new(decode)),
+            },
+        );
+        let waiting = |num_waiting_reqs| EngineReportedWorkerLoad {
+            num_running_reqs: 0,
+            num_waiting_reqs,
+            num_tokens: 0,
+            max_total_num_tokens: 0,
+            captured_at: Instant::now(),
+        };
+        let load = EngineReportedLoadSnapshot::from_workers(
+            1,
+            [
+                ("http://d1:30000".to_owned(), waiting(5)),
+                ("http://d2:30000".to_owned(), waiting(0)),
+            ]
+            .into(),
+        );
+        let Ok(PickDistribution::Engines(chances)) =
+            bucket.prefill_distribution(&registry, &model, 100, &HashMap::new(), &load)
+        else {
+            panic!("p2 can hand off to d2");
+        };
+        let picked: Vec<_> = chances.iter().map(|(e, c)| (e.id.0.as_str(), *c)).collect();
+        assert_eq!(picked, vec![("p2", 1.0)]);
     }
 }

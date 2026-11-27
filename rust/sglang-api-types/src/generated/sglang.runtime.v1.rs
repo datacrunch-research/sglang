@@ -265,6 +265,18 @@ pub struct PrefixMatchResponse {
     /// Whether some engine would currently admit a request of input_tokens.
     #[prost(bool, tag = "6")]
     pub admits: bool,
+    /// Milliseconds until this request's first token were it sent to this cell
+    /// now: the prefill queue at the engine the cell would pick (the expectation
+    /// over its draw when it draws), then the prompt's uncached prefill there,
+    /// at that engine's measured rate. No network time or decode. Absent when
+    /// the cell cannot stand behind a number.
+    #[prost(double, optional, tag = "7")]
+    pub expected_ttft_ms: ::core::option::Option<f64>,
+    /// The part of expected_ttft_ms that is the prompt's own uncached prefill, at
+    /// the same engine and rate: the work the request would cost the cell, as
+    /// opposed to its wait in the queue. Present exactly when expected_ttft_ms is.
+    #[prost(double, optional, tag = "8")]
+    pub expected_prefill_ms: ::core::option::Option<f64>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetCellLoadRequest {}

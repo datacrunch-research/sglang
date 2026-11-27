@@ -102,6 +102,22 @@ pub struct EngineReportedLoadSnapshot {
     /// Least pending prefill work on any one DP rank, for the workers in `workers`.
     min_rank_pending: HashMap<String, u64>,
     native_cache_workers: HashMap<String, EngineReportedSchedulingLoad>,
+    /// For the workers in `native_cache_workers`.
+    prefill_paces: HashMap<String, EnginePrefillPace>,
+}
+
+/// What a time-to-first-token quote needs beyond the scheduling load, for a
+/// worker whose every rank sent a fresh, complete report.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EnginePrefillPace {
+    /// Reporting ranks; each prefills the requests it is given.
+    pub ranks: u32,
+    /// Mean smoothed prefill rate of the ranks that have measured one, in
+    /// tokens/s; `None` until one has.
+    pub rank_tokens_per_s: Option<f64>,
+    /// Requests this router dispatched before this instant are taken to be in
+    /// the report's waiting tokens, and later ones not.
+    pub reflects_dispatches_before: Instant,
 }
 
 impl EngineReportedLoadSnapshot {
@@ -155,6 +171,18 @@ impl EngineReportedLoadSnapshot {
         self.native_cache_workers.get(worker_url)
     }
 
+    /// Present exactly when [`Self::fresh_native_cache_load_for_url`] is.
+    pub fn fresh_prefill_pace_for_url(&self, worker_url: &str) -> Option<&EnginePrefillPace> {
+        self.prefill_paces.get(worker_url)
+    }
+
+    /// Sets a worker's pace in a test snapshot built from native monitor data.
+    #[cfg(test)]
+    pub fn with_prefill_pace(mut self, worker_url: &str, pace: EnginePrefillPace) -> Self {
+        self.prefill_paces.insert(worker_url.to_owned(), pace);
+        self
+    }
+
     /// Builds a view from worker data that already passed freshness and rank checks.
     /// Production requests should use [`EngineReportedLoadTable::capture_snapshot`].
     pub fn from_workers(version: u64, workers: HashMap<String, EngineReportedWorkerLoad>) -> Self {
@@ -163,6 +191,7 @@ impl EngineReportedLoadSnapshot {
             workers,
             min_rank_pending: HashMap::new(),
             native_cache_workers: HashMap::new(),
+            prefill_paces: HashMap::new(),
         }
     }
 
@@ -192,6 +221,7 @@ impl EngineReportedLoadSnapshot {
             workers: basic,
             min_rank_pending: HashMap::new(),
             native_cache_workers: workers,
+            prefill_paces: HashMap::new(),
         }
     }
 }
@@ -296,14 +326,92 @@ pub fn decode_load_stat(payload: &[u8]) -> Result<LoadStat, rmp_serde::decode::E
 /// pinning a worker at its last reported value.
 const DEFAULT_FRESHNESS: Duration = Duration::from_secs(5);
 
+/// Arbitrary: the smoothed rate follows roughly the last half-minute of
+/// prefill busy time.
+const PREFILL_RATE_HALF_LIFE_US: f64 = 30_000_000.0;
+/// Arbitrary: with less prefill busy time behind it, a rate is one or two
+/// small batches' and says little about a long prompt.
+const PREFILL_RATE_MIN_BUSY_US: f64 = 200_000.0;
+/// Arbitrary allowance for a dispatched request to reach the engine's
+/// scheduler (HTTP, the tokenizer manager) before its next receive.
+const DISPATCH_TRANSIT: Duration = Duration::from_millis(100);
+
+/// One rank's prefill speed over its recent prefill work: token and busy-time
+/// sums, each decayed by the busy time that came after it. Idle and decode
+/// spells add no busy time, so they keep the last measurement.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct PrefillRate {
+    tokens: f64,
+    busy_us: f64,
+}
+
+impl PrefillRate {
+    /// Folds in the prefill work between two consecutive reports.
+    fn observe(
+        self,
+        previous: Option<&NativeCacheRankLoad>,
+        next: Option<&NativeCacheRankLoad>,
+    ) -> Self {
+        let (Some(previous), Some(next)) = (previous, next) else {
+            return self;
+        };
+        if next.total_prefill_uncached_tokens < previous.total_prefill_uncached_tokens
+            || next.total_prefill_busy_us < previous.total_prefill_busy_us
+        {
+            // The engine restarted and its counters with it.
+            return Self::default();
+        }
+        let tokens = next.total_prefill_uncached_tokens - previous.total_prefill_uncached_tokens;
+        let busy_us = next.total_prefill_busy_us - previous.total_prefill_busy_us;
+        if tokens == 0 || busy_us == 0 {
+            return self;
+        }
+        let keep = 0.5f64.powf(busy_us as f64 / PREFILL_RATE_HALF_LIFE_US);
+        Self {
+            tokens: self.tokens * keep + tokens as f64,
+            busy_us: self.busy_us * keep + busy_us as f64,
+        }
+    }
+
+    fn tokens_per_s(&self) -> Option<f64> {
+        (self.busy_us >= PREFILL_RATE_MIN_BUSY_US)
+            .then(|| 1_000_000.0 * self.tokens / self.busy_us)
+            .filter(|rate| rate.is_finite() && *rate > 0.0)
+    }
+}
+
+/// When the scheduler last received requests before publishing `load` at
+/// `at`, less the transit allowance. A prefill step forces a report at its
+/// end, and the receive that fed it came just before the step began, so the
+/// prefill busy time since the previous report is taken off `at`.
+fn reflects_dispatches_before(
+    at: Instant,
+    load: &NativeCacheRankLoad,
+    previous: Option<&NativeCacheRankLoad>,
+) -> Instant {
+    let step_us = previous.map_or(0, |previous| {
+        load.total_prefill_busy_us
+            .saturating_sub(previous.total_prefill_busy_us)
+    });
+    at.checked_sub(Duration::from_micros(step_us) + DISPATCH_TRANSIT)
+        .unwrap_or(at)
+}
+
 #[derive(Debug, Clone)]
 struct LoadEntry {
     load: LoadStat,
     previous_native_cache: Option<NativeCacheRankLoad>,
+    prefill_rate: PrefillRate,
     at: Instant,
 }
 
-type NativeRankObservation = (LoadStat, Option<NativeCacheRankLoad>, bool, Instant);
+type NativeRankObservation = (
+    LoadStat,
+    Option<NativeCacheRankLoad>,
+    PrefillRate,
+    bool,
+    Instant,
+);
 type NativeWorkerObservations = HashMap<u32, NativeRankObservation>;
 
 /// Per-`(worker_url, dp_rank)` engine-reported load, written by the load
@@ -342,15 +450,19 @@ impl EngineReportedLoadTable {
     /// Record the latest load for one `(worker_url, dp_rank)`.
     pub fn set(&self, url: &str, dp_rank: u32, load: LoadStat, at: Instant) {
         let key = (url.to_string(), dp_rank);
-        let previous_native_cache = self
+        let (previous_native_cache, prefill_rate) = self
             .by_rank
             .get(&key)
-            .and_then(|entry| entry.load.native_cache.clone());
+            .map(|entry| (entry.load.native_cache.clone(), entry.prefill_rate))
+            .unwrap_or_default();
+        let prefill_rate =
+            prefill_rate.observe(previous_native_cache.as_ref(), load.native_cache.as_ref());
         self.by_rank.insert(
             key,
             LoadEntry {
                 load,
                 previous_native_cache,
+                prefill_rate,
                 at,
             },
         );
@@ -456,9 +568,11 @@ impl EngineReportedLoadTable {
     ///
     /// Every rank must be fresh, capacity-valid, and include the #34608
     /// extension. Otherwise the worker is omitted from monitor-backed guards.
+    /// Also records each such worker's prefill pace.
     fn fresh_native_cache_worker_loads(
         &self,
         now: Instant,
+        prefill_paces: &mut HashMap<String, EnginePrefillPace>,
     ) -> HashMap<String, EngineReportedSchedulingLoad> {
         let mut observed: HashMap<String, NativeWorkerObservations> = HashMap::new();
         for entry in self.by_rank.iter() {
@@ -469,6 +583,7 @@ impl EngineReportedLoadTable {
                 (
                     entry.value().load.clone(),
                     entry.value().previous_native_cache.clone(),
+                    entry.value().prefill_rate,
                     fresh,
                     at,
                 ),
@@ -500,9 +615,12 @@ impl EngineReportedLoadTable {
                 let mut oldest_at = None;
                 let mut prefill_throughput_tokens_per_s = 0.0f64;
                 let mut complete_prefill_sample = !required.is_empty();
+                let rank_count = required.len() as u32;
+                let (mut rate_sum, mut rated_ranks) = (0.0f64, 0u32);
+                let mut reflects_before: Option<Instant> = None;
 
                 for rank in required {
-                    let (load, previous, fresh, at) = ranks.get(&rank)?;
+                    let (load, previous, smoothed, fresh, at) = ranks.get(&rank)?;
                     let native = load.native_cache.as_ref()?;
                     if !fresh || load.max_total_num_tokens == 0 || native.max_running_requests == 0
                     {
@@ -519,6 +637,12 @@ impl EngineReportedLoadTable {
                     max_running_requests =
                         max_running_requests.saturating_add(native.max_running_requests);
                     oldest_at = Some(oldest_at.map_or(*at, |oldest: Instant| oldest.min(*at)));
+                    if let Some(rate) = smoothed.tokens_per_s() {
+                        rate_sum += rate;
+                        rated_ranks += 1;
+                    }
+                    let before = reflects_dispatches_before(*at, native, previous.as_ref());
+                    reflects_before = Some(reflects_before.map_or(before, |b| b.min(before)));
 
                     match previous {
                         Some(previous)
@@ -546,6 +670,15 @@ impl EngineReportedLoadTable {
                 let estimated_prefill_queue_ms = prefill_throughput_tokens_per_s
                     .map(|rate| 1_000.0 * num_waiting_uncached_tokens as f64 / rate);
                 oldest_at.map(|captured_at| {
+                    prefill_paces.insert(
+                        url.clone(),
+                        EnginePrefillPace {
+                            ranks: rank_count,
+                            rank_tokens_per_s: (rated_ranks > 0)
+                                .then(|| rate_sum / f64::from(rated_ranks)),
+                            reflects_dispatches_before: reflects_before.unwrap_or(captured_at),
+                        },
+                    );
                     (
                         url,
                         EngineReportedSchedulingLoad {
@@ -569,11 +702,13 @@ impl EngineReportedLoadTable {
     /// Captures one immutable view for all routing decisions in a request.
     pub fn capture_snapshot(&self, now: Instant) -> EngineReportedLoadSnapshot {
         let mut min_rank_pending = HashMap::new();
+        let mut prefill_paces = HashMap::new();
         EngineReportedLoadSnapshot {
             version: self.version.load(Ordering::Acquire),
             workers: self.fresh_worker_loads(now, &mut min_rank_pending),
             min_rank_pending,
-            native_cache_workers: self.fresh_native_cache_worker_loads(now),
+            native_cache_workers: self.fresh_native_cache_worker_loads(now, &mut prefill_paces),
+            prefill_paces,
         }
     }
 
@@ -807,5 +942,103 @@ mod tests {
             worker.estimated_prefill_queue_ms,
             Some(666.666_666_666_666_6)
         );
+    }
+
+    /// A native frame with cumulative prefill counters.
+    fn native(waiting: u64, prefilled: u64, busy_us: u64) -> LoadStat {
+        LoadStat {
+            num_running_reqs: 1,
+            num_waiting_reqs: 1,
+            num_tokens: 1_000,
+            max_total_num_tokens: 100_000,
+            native_cache: Some(NativeCacheRankLoad {
+                num_waiting_uncached_tokens: waiting,
+                num_total_tokens: 1_000,
+                max_running_requests: 64,
+                total_prefill_uncached_tokens: prefilled,
+                total_prefill_busy_us: busy_us,
+            }),
+        }
+    }
+
+    const W: &str = "http://w:30000";
+
+    fn pace(t: &EngineReportedLoadTable, now: Instant) -> EnginePrefillPace {
+        *t.capture_snapshot(now)
+            .fresh_prefill_pace_for_url(W)
+            .expect("a complete native report has a pace")
+    }
+
+    /// The smoothed rate outlives the frames without prefill that break the
+    /// two-frame throughput, and waits for enough busy time to mean anything.
+    #[test]
+    fn smoothed_prefill_rate_survives_idle_frames() {
+        let t = EngineReportedLoadTable::new();
+        let start = Instant::now();
+        t.set(W, 0, native(0, 0, 0), start);
+        // 1k tokens in 0.1 s of busy time: too little to quote from.
+        t.set(W, 0, native(0, 1_000, 100_000), start);
+        assert_eq!(pace(&t, start).rank_tokens_per_s, None);
+        // 19k more in 0.9 s: 20k tokens over 1 s.
+        t.set(W, 0, native(0, 20_000, 1_000_000), start);
+        let rate = pace(&t, start).rank_tokens_per_s.expect("1 s of prefill");
+        assert!((rate - 20_000.0).abs() < 50.0, "{rate}");
+        // Idle heartbeats: the two-frame throughput is gone, the rate is not.
+        t.set(W, 0, native(0, 20_000, 1_000_000), start);
+        t.set(W, 0, native(0, 20_000, 1_000_000), start);
+        let snapshot = t.capture_snapshot(start);
+        let load = snapshot.fresh_native_cache_load_for_url(W).unwrap();
+        assert_eq!(load.prefill_throughput_tokens_per_s, None);
+        assert_eq!(pace(&t, start).rank_tokens_per_s, Some(rate));
+    }
+
+    #[test]
+    fn smoothed_prefill_rate_follows_recent_work_and_resets_with_the_engine() {
+        let t = EngineReportedLoadTable::new();
+        let now = Instant::now();
+        t.set(W, 0, native(0, 0, 0), now);
+        t.set(W, 0, native(0, 10_000, 1_000_000), now);
+        // Two minutes of busy time at 40k/s bury the first second at 10k/s.
+        t.set(W, 0, native(0, 4_810_000, 121_000_000), now);
+        let rate = pace(&t, now).rank_tokens_per_s.unwrap();
+        assert!(rate > 39_900.0 && rate < 40_000.0, "{rate}");
+        // A restarted engine counts from zero: nothing carries over.
+        t.set(W, 0, native(0, 500, 50_000), now);
+        assert_eq!(pace(&t, now).rank_tokens_per_s, None);
+    }
+
+    /// A report covers what the scheduler received before the prefill step
+    /// whose end it marks: its arrival less that step's busy time and the
+    /// transit allowance, the earliest over the ranks.
+    #[test]
+    fn a_report_reflects_dispatches_before_its_last_receive() {
+        let t = EngineReportedLoadTable::new();
+        let start = Instant::now();
+        t.mark_expected_rank(W, 0);
+        t.mark_expected_rank(W, 1);
+        t.set(W, 0, native(0, 0, 0), start);
+        t.set(W, 1, native(0, 0, 0), start);
+        let end = start + Duration::from_secs(3);
+        // Rank 0 ends a 1.5 s prefill step; rank 1 only decoded.
+        t.set(W, 0, native(8_000, 30_000, 1_500_000), end);
+        t.set(W, 1, native(0, 0, 0), end);
+        let pace = pace(&t, end);
+        assert_eq!(pace.ranks, 2);
+        assert_eq!(
+            pace.reflects_dispatches_before,
+            end - Duration::from_millis(1_500) - DISPATCH_TRANSIT
+        );
+        // Only rank 0 measured a rate; the pace is the mean of those that did.
+        assert_eq!(pace.rank_tokens_per_s, Some(20_000.0));
+    }
+
+    #[test]
+    fn a_report_without_the_native_extension_has_no_pace() {
+        let t = EngineReportedLoadTable::new();
+        let now = Instant::now();
+        t.set(W, 0, load(1, 1), now);
+        let snapshot = t.capture_snapshot(now);
+        assert!(snapshot.fresh_load_for_url(W).is_some());
+        assert!(snapshot.fresh_prefill_pace_for_url(W).is_none());
     }
 }

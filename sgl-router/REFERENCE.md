@@ -203,6 +203,36 @@ groups; a policy without admission, or legacy routing, admits). Depth comes
 from the Router-local radix tree or the external Indexer, whichever
 cache-aware routing uses; without either it is 0.
 
+`expected_ttft_ms` is the cell's own quote of this prompt's time to first
+token were it sent here now, in milliseconds, network time and decode
+excluded. It is taken at the engine the cell's reorg routing would pick (the
+first bucket that would take the prompt; under P/D, a prefill whose version
+group has a decode that admits). Where the routing draws at random (power of
+two, or balanced affinity's alternative), it is the expectation over the
+draw, so one state gives one quote. At that engine it is the queue, then the
+prompt's own prefill: `(W + P) / (ranks x r) + U / r`.
+- `W` is the engine's reported waiting uncached tokens.
+- `P` is the uncached tokens this router dispatched to it since its report's
+  cut-off: the report's arrival, less the prefill busy time it covers and a
+  100 ms transit allowance. A dispatch stops counting when its request ends.
+- `U` is the prompt's uncached part there. The held prefix is what the query
+  showed, capped at `token_ids` or, for checkpoints, the lower bound.
+- `r` is the engine's prefill rate per rank, a busy-time-weighted average that
+  idle spells leave as it was.
+
+`expected_prefill_ms` is the second term alone, `U / r`, taken over the same
+draw: the work the prompt would cost the cell, as opposed to its wait behind
+work already there. A cell holding the prompt's prefix behind a long queue
+quotes a long time to first token and a short prefill; an idle cell without
+the prefix quotes the reverse.
+
+The two fields are absent together when the cell cannot stand behind a
+number: legacy or `session_aware` routing, no engine that admits, or an engine
+the routing may pick without a fresh native load report or without 200 ms of
+measured prefill.
+On a hybrid (Mamba) engine the held prefix is the KV tree's, which can run
+past the last state checkpoint the engine resumes from.
+
 `GET /internal/cell_load` returns the load summary alone, summed over the
 healthy plain and prefill engines from their own load reports:
 `waiting_uncached_tokens`, `estimated_prefill_queue_ms` (the smallest any

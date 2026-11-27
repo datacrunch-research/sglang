@@ -43,6 +43,10 @@ pub(super) struct SelectedWorkers {
     pub(super) prefill: Arc<Worker>,
     pub(super) decode: Option<Arc<Worker>>,
     pub(super) track_dispatch_timestamps: bool,
+    /// The prompt tokens the prefill engine has to prefill, when the routing
+    /// knows them; counted on the engine as dispatched work until its load
+    /// reports catch up (`Worker::uncached_tokens_dispatched_since`).
+    pub(super) uncached_prefill_tokens: Option<u64>,
 }
 
 /// PD sends to both workers and returns the decode response.
@@ -173,6 +177,7 @@ async fn dispatch<T: Transport>(
         prefill,
         decode,
         track_dispatch_timestamps,
+        uncached_prefill_tokens,
     } = workers;
     let decode_url_header = decode
         .as_ref()
@@ -191,10 +196,10 @@ async fn dispatch<T: Transport>(
         .flatten();
 
     // Track worker occupancy and the prompt's contribution to active load.
-    let worker_load_guard = if track_dispatch_timestamps {
-        prefill.timestamped_load_guard()
-    } else {
-        prefill.load_guard()
+    let worker_load_guard = match uncached_prefill_tokens {
+        Some(tokens) => prefill.prefill_load_guard(tokens),
+        None if track_dispatch_timestamps => prefill.timestamped_load_guard(),
+        None => prefill.load_guard(),
     };
     let active_request_guard = ctx.router_inflight_load.register_aged(
         prefill.id.clone(),

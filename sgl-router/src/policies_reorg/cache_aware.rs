@@ -28,7 +28,7 @@ use super::admission::{
 };
 use super::affinity;
 use super::power_of_two::PowerOfTwoPolicy;
-use super::{Pick, PickError, PickRequest, Policy, Rejection, Stage};
+use super::{Pick, PickDistribution, PickError, PickRequest, Policy, Rejection, Stage};
 
 type Signal = Option<Arc<PrefixLookupResult>>;
 type Lookup = Arc<OnceCell<Signal>>;
@@ -110,6 +110,14 @@ impl fmt::Debug for PrefixMemo {
 }
 
 impl PrefixMemo {
+    /// The first answer any source gave, once a policy has looked it up.
+    pub fn signal(&self) -> Option<Arc<PrefixLookupResult>> {
+        let cells = self.cells.lock().unwrap_or_else(|e| e.into_inner());
+        cells
+            .iter()
+            .find_map(|(_, cell)| cell.get().cloned().flatten())
+    }
+
     /// The local tree's answer, once a policy has looked it up.
     pub fn local_signal(&self) -> Option<Arc<PrefixLookupResult>> {
         let cells = self.cells.lock().unwrap_or_else(|e| e.into_inner());
@@ -147,7 +155,10 @@ fn rank(loads: &CandidateLoads<'_>, left: &Candidate<'_>, right: &Candidate<'_>)
 }
 
 /// Each prefix holder's uncached share of `input`, by URL, before hit thresholds.
-fn uncached_by_url(signal: Option<&PrefixLookupResult>, input: u64) -> HashMap<&str, u64> {
+pub(crate) fn uncached_by_url(
+    signal: Option<&PrefixLookupResult>,
+    input: u64,
+) -> HashMap<&str, u64> {
     let Some(PrefixLookupResult {
         outcome: PrefixOutcome::Matched { matches, .. },
         query_blocks,
@@ -171,6 +182,30 @@ fn uncached_by_url(signal: Option<&PrefixLookupResult>, input: u64) -> HashMap<&
             )
         })
         .collect()
+}
+
+/// The prompt tokens of `request` that `engine` would prefill: the prefix hit
+/// covers the longest prompt; the rest of the batch is uncached.
+fn batch_uncached_tokens(
+    request: &PickRequest<'_>,
+    uncached: &HashMap<&str, u64>,
+    engine: &Worker,
+) -> u64 {
+    let cached =
+        (uncached.get(engine.url.as_str())).map_or(0, |&tokens| request.input_tokens - tokens);
+    request.total_input_tokens.saturating_sub(cached)
+}
+
+/// A pick's decision before its fallback draws.
+enum Plan {
+    /// An admitted prefix owner, kept without asking the fallback.
+    Affinity(Pick),
+    /// The engines the fallback samples, and the owner the draw is balanced
+    /// against, if any.
+    Fallback {
+        affinity: Option<Pick>,
+        pool: Vec<Arc<Worker>>,
+    },
 }
 
 #[derive(Debug)]
@@ -269,6 +304,43 @@ impl CacheAwarePolicy {
         })
     }
 
+    /// Everything [`Policy::pick`] decides before the fallback's draw.
+    fn plan(
+        &self,
+        engines: &[Arc<Worker>],
+        request: &PickRequest<'_>,
+        uncached: &HashMap<&str, u64>,
+        load: &EngineReportedLoadSnapshot,
+    ) -> Result<Plan, PickError> {
+        let candidates = self.candidates(engines, request, uncached, load);
+        let mut rejections = Vec::new();
+        let admitted = self.admit(&candidates, load, &mut rejections)?;
+        let affinity = admitted.first().map(|c| Pick {
+            engine: Arc::clone(c.engine),
+            reason: "cache_candidate",
+        });
+        if self.config.mode != AffinityMode::Balanced {
+            if let Some(pick) = affinity {
+                return Ok(Plan::Affinity(pick));
+            }
+        }
+        let pool: Vec<_> = engines
+            .iter()
+            .filter(|e| {
+                !rejections.iter().any(|r| r.engine == e.id)
+                    && affinity.as_ref().is_none_or(|p| p.engine.id != e.id)
+            })
+            .cloned()
+            .collect();
+        // The fallback samples only engines that pass admission.
+        let (pool, pool_rejections) = partition_admitted(self.admission.as_ref(), &pool, load)?;
+        rejections.extend(pool_rejections);
+        if pool.is_empty() && affinity.is_none() && !rejections.is_empty() {
+            return Err(PickError::NoAdmissibleEngine(rejections));
+        }
+        Ok(Plan::Fallback { affinity, pool })
+    }
+
     fn admit<'e>(
         &self,
         candidates: &[Candidate<'e>],
@@ -328,33 +400,10 @@ impl Policy for CacheAwarePolicy {
             // Capture load after remote I/O; selection and admission share it.
             let load = self.engine_load.capture_snapshot(Instant::now());
             let uncached = uncached_by_url(signal.as_deref(), request.input_tokens);
-            let candidates = self.candidates(engines, request, &uncached, &load);
-            let mut rejections = Vec::new();
-            let admitted = self.admit(&candidates, &load, &mut rejections)?;
-            let affinity = admitted.first().map(|c| Pick {
-                engine: Arc::clone(c.engine),
-                reason: "cache_candidate",
-            });
-            if self.config.mode != AffinityMode::Balanced {
-                if let Some(pick) = affinity {
-                    return Ok(pick);
-                }
-            }
-            let pool: Vec<_> = engines
-                .iter()
-                .filter(|e| {
-                    !rejections.iter().any(|r| r.engine == e.id)
-                        && affinity.as_ref().is_none_or(|p| p.engine.id != e.id)
-                })
-                .cloned()
-                .collect();
-            // The fallback samples only engines that pass admission.
-            let (pool, pool_rejections) =
-                partition_admitted(self.admission.as_ref(), &pool, &load)?;
-            rejections.extend(pool_rejections);
-            if pool.is_empty() && affinity.is_none() && !rejections.is_empty() {
-                return Err(PickError::NoAdmissibleEngine(rejections));
-            }
+            let (affinity, pool) = match self.plan(engines, request, &uncached, &load)? {
+                Plan::Affinity(pick) => return Ok(pick),
+                Plan::Fallback { affinity, pool } => (affinity, pool),
+            };
             let fallback = async {
                 let mut pick = self.pick_fallback(&pool, request).await?;
                 if !pool.iter().any(|e| Arc::ptr_eq(e, &pick.engine)) {
@@ -368,17 +417,177 @@ impl Policy for CacheAwarePolicy {
                 Ok(pick)
             }
             .await;
-            // The prefix hit covers the longest prompt; the rest of the batch is uncached.
-            let uncached_tokens = |engine: &Worker| {
-                let cached = (uncached.get(engine.url.as_str()))
-                    .map_or(0, |&tokens| request.input_tokens - tokens);
-                request.total_input_tokens.saturating_sub(cached)
-            };
+            let uncached_tokens =
+                |engine: &Worker| batch_uncached_tokens(request, &uncached, engine);
             affinity::choose(&self.config, affinity, fallback, &load, uncached_tokens)
         })
     }
 
+    fn pick_distribution(
+        &self,
+        engines: &[Arc<Worker>],
+        request: &PickRequest<'_>,
+        uncached: &HashMap<&str, u64>,
+        load: &EngineReportedLoadSnapshot,
+    ) -> Result<PickDistribution, PickError> {
+        if engines.is_empty() {
+            return Err(PickError::NoCandidates);
+        }
+        if request.stage == Stage::Decode {
+            return Err(PickError::InvalidConfiguration(
+                "cache-aware selection requires a plain or prefill group".into(),
+            ));
+        }
+        let (affinity, pool) = match self.plan(engines, request, uncached, load)? {
+            Plan::Affinity(pick) => {
+                return Ok(PickDistribution::Engines(vec![(pick.engine, 1.0)]));
+            }
+            Plan::Fallback { affinity, pool } => (affinity, pool),
+        };
+        let uncached_tokens = |engine: &Worker| batch_uncached_tokens(request, uncached, engine);
+        // Each outcome of the fallback's draw, balanced against the owner as `pick` does.
+        let draws = match self
+            .fallback
+            .pick_distribution(&pool, request, uncached, load)
+        {
+            Ok(PickDistribution::Unsupported) => return Ok(PickDistribution::Unsupported),
+            Ok(PickDistribution::Engines(draws)) => draws,
+            Err(error) => {
+                let pick =
+                    affinity::choose(&self.config, affinity, Err(error), load, uncached_tokens)?;
+                return Ok(PickDistribution::Engines(vec![(pick.engine, 1.0)]));
+            }
+        };
+        let mut chances = Vec::with_capacity(draws.len() + 1);
+        for (engine, chance) in draws {
+            let alternative = Ok(Pick {
+                engine,
+                reason: "affinity_load",
+            });
+            let pick = affinity::choose(
+                &self.config,
+                affinity.clone(),
+                alternative,
+                load,
+                uncached_tokens,
+            )?;
+            PickDistribution::add(&mut chances, pick.engine, chance);
+        }
+        Ok(PickDistribution::Engines(chances))
+    }
+
     fn fallback(&self) -> Option<&dyn Policy> {
         Some(self.fallback.as_ref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discovery::{ModelId, WorkerId, WorkerSpec};
+    use crate::state::kv_events::tree::HashTree;
+    use crate::state::load_monitor::engine_reported_load::EngineReportedSchedulingLoad;
+
+    const INPUT: u64 = 10_000;
+
+    fn policy(mode: AffinityMode) -> CacheAwarePolicy {
+        let provider =
+            RadixTreePrefixProvider::new(Arc::new(HashTree::new()), BlockSizeOracle::new());
+        let config = AffinityConfig {
+            mode,
+            load_gap: Some(1_000),
+            ..Default::default()
+        };
+        CacheAwarePolicy::new(
+            Arc::new(CacheSource::Local(provider)),
+            EngineReportedLoadTable::new(),
+            config,
+        )
+        .unwrap()
+    }
+
+    /// Engine `a` holds the whole prompt behind 30k waiting tokens; `b`, `c`
+    /// and `d` hold nothing behind 0, 15k and 40k.
+    fn fleet() -> (Vec<Arc<Worker>>, EngineReportedLoadSnapshot) {
+        let now = Instant::now();
+        let mut loads = HashMap::new();
+        let engines = [("a", 30_000), ("b", 0), ("c", 15_000), ("d", 40_000)]
+            .into_iter()
+            .map(|(id, waiting)| {
+                let engine = Arc::new(Worker::new(WorkerSpec {
+                    id: WorkerId(id.into()),
+                    url: format!("http://{id}:30000"),
+                    ..Default::default()
+                }));
+                let load = EngineReportedSchedulingLoad {
+                    num_running_reqs: 0,
+                    num_waiting_reqs: u64::from(waiting > 0),
+                    num_waiting_uncached_tokens: waiting,
+                    num_used_tokens: 0,
+                    num_total_tokens: 0,
+                    max_total_num_tokens: 1_000_000,
+                    max_running_requests: 64,
+                    prefill_throughput_tokens_per_s: Some(10_000.0),
+                    estimated_prefill_queue_ms: Some(waiting as f64 / 10.0),
+                    captured_at: now,
+                };
+                loads.insert(engine.url.clone(), load);
+                engine
+            })
+            .collect();
+        (
+            engines,
+            EngineReportedLoadSnapshot::from_native_cache_workers(1, loads),
+        )
+    }
+
+    fn chances(policy: &CacheAwarePolicy, uncached: &HashMap<&str, u64>) -> Vec<(String, f64)> {
+        let (engines, load) = fleet();
+        let model = ModelId("m".into());
+        let request = PickRequest::new(&model, Stage::Plain, INPUT);
+        let PickDistribution::Engines(chances) = policy
+            .pick_distribution(&engines, &request, uncached, &load)
+            .unwrap()
+        else {
+            panic!("cache-aware selection has a distribution");
+        };
+        let mut chances: Vec<_> = chances
+            .into_iter()
+            .map(|(engine, chance)| (engine.id.0.clone(), chance))
+            .collect();
+        chances.sort_by(|left, right| left.0.cmp(&right.0));
+        chances
+    }
+
+    #[test]
+    fn an_admitted_owner_takes_the_request_outright() {
+        let holder = HashMap::from([("http://a:30000", 0)]);
+        assert_eq!(
+            chances(&policy(AffinityMode::Prefer), &holder),
+            vec![("a".into(), 1.0)]
+        );
+    }
+
+    /// Balanced: the draw over b, c and d lands on b two times in three,
+    /// which relieves the owner; c, drawn otherwise, is not light enough.
+    #[test]
+    fn a_balanced_owner_keeps_the_draws_that_do_not_relieve_it() {
+        let holder = HashMap::from([("http://a:30000", 0)]);
+        assert_eq!(
+            chances(&policy(AffinityMode::Balanced), &holder),
+            vec![("a".into(), 1.0 / 3.0), ("b".into(), 2.0 / 3.0)]
+        );
+    }
+
+    #[test]
+    fn without_an_owner_the_fallback_draws_over_every_engine() {
+        assert_eq!(
+            chances(&policy(AffinityMode::Prefer), &HashMap::new()),
+            vec![
+                ("a".into(), 2.0 / 12.0),
+                ("b".into(), 6.0 / 12.0),
+                ("c".into(), 4.0 / 12.0),
+            ]
+        );
     }
 }

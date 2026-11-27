@@ -19,6 +19,7 @@ use crate::buckets_reorg::BucketGroups;
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::PrefixLookupResult;
 use crate::policies_reorg::admission::partition_admitted;
+use crate::policies_reorg::{PickDistribution, PickError};
 use crate::server::app_context::{AppContext, ChatRouting};
 use crate::server::error::ApiError;
 use crate::server::routes::chat::lookup_prefix_for_tokens;
@@ -26,6 +27,7 @@ use crate::state::kv_events::{
     CacheNamespace, CheckpointQuery, HashScheme, RadixTreePrefixProvider,
 };
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
+use crate::state::load_monitor::ttft_quote::{engine_ttft_quote, TtftQuote};
 use crate::workers::Worker;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -34,7 +36,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use sgl_kv_indexer::PrefixOutcome;
 use sglang_api_types::runtime::v1 as proto;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -98,6 +100,22 @@ pub struct PrefixMatchResponse {
     /// `input_tokens`, under the admission limits its routing applies. True
     /// when the routing has no admission to consult.
     pub admits: bool,
+    /// Milliseconds until this request's first token were it sent to this
+    /// cell now: at the engine this cell's routing would pick (the
+    /// expectation over its draw when the routing draws), the prefill queue
+    /// ahead of it, then its uncached prefill, at that engine's measured
+    /// rate. The cached prefix is what this query showed. No network time or
+    /// decode. Absent when the cell cannot stand behind a number: legacy or
+    /// session routing, no admitted engine, or an engine it may pick with no
+    /// fresh report or no measured prefill rate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_ttft_ms: Option<f64>,
+    /// The part of `expected_ttft_ms` that is this request's own uncached
+    /// prefill, at the same engine and rate: the work the request would cost
+    /// the cell, as opposed to its wait in the queue. Present exactly when
+    /// `expected_ttft_ms` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_prefill_ms: Option<f64>,
 }
 
 /// The load of this cell's prefill-side engines (plain engines, or the
@@ -214,6 +232,10 @@ pub async fn prefix_match_answer(
     let load = summarize_load(&engines, &snapshot, now);
     let input_tokens = request.input_tokens.unwrap_or(query_tokens);
     let admits = admits(ctx, &model, input_tokens, &snapshot);
+    let uncached = quoted_uncached_by_url(signal.as_ref(), to_tokens, input_tokens);
+    let quote = cell_ttft_quote(ctx, &model, input_tokens, &uncached, &snapshot)
+        .inspect_err(|reason| tracing::debug!(reason, "prefix match without a TTFT quote"))
+        .ok();
     Ok(PrefixMatchResponse {
         matched_prefix_tokens,
         matched_prefix_blocks,
@@ -222,6 +244,8 @@ pub async fn prefix_match_answer(
         pending,
         load,
         admits,
+        expected_ttft_ms: quote.map(|quote| quote.ttft_ms()),
+        expected_prefill_ms: quote.map(|quote| quote.prefill_ms),
     })
 }
 
@@ -615,6 +639,8 @@ impl From<PrefixMatchResponse> for proto::PrefixMatchResponse {
             pending: answer.pending,
             load: Some(answer.load.into()),
             admits: answer.admits,
+            expected_ttft_ms: answer.expected_ttft_ms,
+            expected_prefill_ms: answer.expected_prefill_ms,
         }
     }
 }
@@ -786,6 +812,92 @@ fn admits(
         }
     }
     false
+}
+
+/// Each engine's uncached share of a prompt of `input_tokens`, by URL, for
+/// the engines holding part of it. The held part is what the query showed
+/// (`to_tokens` caps blocks at it), never extrapolated: a query of the first
+/// few thousand tokens that an engine holds says nothing of the rest.
+fn quoted_uncached_by_url(
+    signal: Option<&PrefixLookupResult>,
+    to_tokens: impl Fn(u32) -> u64,
+    input_tokens: u64,
+) -> HashMap<&str, u64> {
+    let mut uncached = HashMap::new();
+    let Some(PrefixLookupResult {
+        outcome: PrefixOutcome::Matched { matches, .. },
+        ..
+    }) = signal
+    else {
+        return uncached;
+    };
+    for entry in matches {
+        let held = to_tokens(entry.matched_prefix_blocks).min(input_tokens);
+        if held > 0 {
+            let left = uncached
+                .entry(entry.address.as_str())
+                .or_insert(input_tokens);
+            *left = (*left).min(input_tokens - held);
+        }
+    }
+    uncached
+}
+
+/// The time to first token this cell quotes for a prompt of `input_tokens`,
+/// in its two parts: each engine's [`engine_ttft_quote`], weighted by the
+/// chance its routing picks that engine, in the first bucket that would take
+/// the request. An error says why the cell gives none.
+fn cell_ttft_quote(
+    ctx: &AppContext,
+    model: &ModelId,
+    input_tokens: u64,
+    uncached: &HashMap<&str, u64>,
+    snapshot: &EngineReportedLoadSnapshot,
+) -> Result<TtftQuote, &'static str> {
+    let ChatRouting::Reorg(resolvers) = &ctx.chat_routing else {
+        return Err("legacy routing picks no engine to quote");
+    };
+    let resolver = resolvers.get(model).ok_or("no routing for the model")?;
+    let buckets = resolver
+        .resolve(input_tokens, None, None, None)
+        .map_err(|_| "no bucket takes the request")?;
+    for bucket in buckets {
+        let chances = match bucket.prefill_distribution(
+            &ctx.registry,
+            model,
+            input_tokens,
+            uncached,
+            snapshot,
+        ) {
+            Ok(PickDistribution::Engines(chances)) => chances,
+            Ok(PickDistribution::Unsupported) => {
+                return Err("the routing's pick depends on more than the prompt")
+            }
+            // The routing would move to the next bucket.
+            Err((
+                _,
+                PickError::NoCandidates
+                | PickError::NoAdmissibleEngine(_)
+                | PickError::AdmissionRejected(_),
+            )) => continue,
+            Err(_) => return Err("the routing cannot pick an engine"),
+        };
+        let mut quote = TtftQuote::default();
+        for (engine, chance) in chances {
+            let left = uncached
+                .get(engine.url.as_str())
+                .copied()
+                .unwrap_or(input_tokens);
+            let at_engine = engine_ttft_quote(&engine, left, snapshot)?;
+            quote.queue_ms += chance * at_engine.queue_ms;
+            quote.prefill_ms += chance * at_engine.prefill_ms;
+        }
+        let finite = |ms: f64| ms.is_finite() && ms >= 0.0;
+        return Some(quote)
+            .filter(|quote| finite(quote.queue_ms) && finite(quote.prefill_ms))
+            .ok_or("the quote is not a finite duration");
+    }
+    Err("no engine would admit the request")
 }
 
 #[cfg(test)]
@@ -1406,6 +1518,182 @@ mod tests {
         );
         assert!(family_spec(Some(&serde_json::json!({"model_type": "llama"})), None).is_none());
         assert!(family_spec(None, None).is_none());
+    }
+
+    /// [`ctx_with_tree`] under reorg routing: one plain bucket of every
+    /// engine, picked by `policy`.
+    fn reorg_ctx_with_tree(
+        prompt: &[u64],
+        blocks: usize,
+        policy: impl FnOnce(&AppContext) -> Arc<dyn crate::policies_reorg::Policy>,
+    ) -> Arc<AppContext> {
+        use crate::buckets_reorg::{Bucket, BucketResolver, EngineGroup};
+        let (ctx, _) = ctx_and_tree(prompt, blocks);
+        let mut ctx = Arc::into_inner(ctx).expect("not shared yet");
+        let bucket = Bucket::new("all", BucketGroups::Plain(EngineGroup::new(policy(&ctx))));
+        let resolver = BucketResolver::new(vec![bucket]).expect("a valid bucket");
+        let model = ModelId(ctx.config.model.id.clone());
+        ctx.chat_routing = ChatRouting::Reorg([(model, resolver)].into());
+        Arc::new(ctx)
+    }
+
+    fn power_of_two(ctx: &AppContext) -> Arc<dyn crate::policies_reorg::Policy> {
+        Arc::new(crate::policies_reorg::power_of_two::PowerOfTwoPolicy::new(
+            Arc::clone(&ctx.engine_reported_load),
+        ))
+    }
+
+    /// Two native frames from `url`: 10k tokens prefilled in 1 s of busy
+    /// time, and `waiting` uncached tokens queued now.
+    fn report_prefill(ctx: &AppContext, url: &str, waiting: u64) {
+        let frame = |waiting: u64, prefilled: u64, busy_us: u64| {
+            let mut stat = load_stat(0, u64::from(waiting > 0), Some(waiting));
+            let native = stat.native_cache.as_mut().unwrap();
+            native.total_prefill_uncached_tokens = prefilled;
+            native.total_prefill_busy_us = busy_us;
+            stat
+        };
+        let now = Instant::now();
+        ctx.engine_reported_load.set(url, 0, frame(0, 0, 0), now);
+        ctx.engine_reported_load
+            .set(url, 0, frame(waiting, 10_000, 1_000_000), now);
+    }
+
+    fn quote(body: &Value) -> f64 {
+        body["expected_ttft_ms"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("no quote in {body}"))
+    }
+
+    fn prefill(body: &Value) -> f64 {
+        body["expected_prefill_ms"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("no prefill quote in {body}"))
+    }
+
+    /// The prefix owner's queue, then the part of the prompt it lacks, at its
+    /// rate: a holds 24 of 5000 tokens behind 20k waiting, at 10k tokens/s.
+    /// The prefill alone is that part: 4976 tokens.
+    #[tokio::test]
+    async fn prefix_match_quotes_the_ttft_at_the_engine_the_cell_would_pick() {
+        use crate::config::{AffinityConfig, AffinityMode};
+        use crate::policies_reorg::cache_aware::{CacheAwarePolicy, CacheSource};
+        let prompt: Vec<u64> = (1..=40).collect();
+        let ctx = reorg_ctx_with_tree(&prompt, 6, |ctx| {
+            let provider = RadixTreePrefixProvider::new(
+                Arc::new(HashTree::new()),
+                Arc::clone(&ctx.block_size_oracle),
+            );
+            let config = AffinityConfig {
+                mode: AffinityMode::Prefer,
+                cache_affinity_min_matched_tokens: None,
+                ..Default::default()
+            };
+            let policy = CacheAwarePolicy::new(
+                Arc::new(CacheSource::Local(provider)),
+                Arc::clone(&ctx.engine_reported_load),
+                config,
+            );
+            Arc::new(policy.expect("valid settings"))
+        });
+        report_prefill(&ctx, "http://a:30000", 20_000);
+        report_prefill(&ctx, "http://b:30000", 0);
+        let query = json!({"token_ids": prompt, "input_tokens": 5000});
+        let (status, body) = post_json(Arc::clone(&ctx), PREFIX_MATCH_PATH, query).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["matched_prefix_tokens"], 24);
+        assert!((quote(&body) - 2_497.6).abs() < 1e-6, "{body}");
+        assert!((prefill(&body) - 497.6).abs() < 1e-6, "{body}");
+
+        let request = proto::PrefixMatchRequest {
+            token_ids: prompt,
+            input_tokens: Some(5000),
+            ..Default::default()
+        };
+        let answer: proto::PrefixMatchResponse = prefix_match_answer(&ctx, request.into())
+            .await
+            .expect("the cell answers")
+            .into();
+        let grpc_quote = answer.expected_ttft_ms.expect("the quote rides along");
+        assert!((grpc_quote - 2_497.6).abs() < 1e-6);
+        let grpc_prefill = answer.expected_prefill_ms.expect("the prefill rides along");
+        assert!((grpc_prefill - 497.6).abs() < 1e-6);
+    }
+
+    /// Power of two over a (20k waiting) and b (idle) always lands on b;
+    /// work dispatched to b since its report joins its queue until it ends.
+    /// It lengthens the wait, not the prompt's own prefill.
+    #[tokio::test]
+    async fn prefix_match_counts_work_dispatched_since_the_report() {
+        let prompt: Vec<u64> = (1..=40).collect();
+        let ctx = reorg_ctx_with_tree(&prompt, 6, power_of_two);
+        report_prefill(&ctx, "http://a:30000", 20_000);
+        report_prefill(&ctx, "http://b:30000", 0);
+        let query = json!({"token_ids": prompt, "input_tokens": 5000});
+        let (_, body) = post_json(Arc::clone(&ctx), PREFIX_MATCH_PATH, query.clone()).await;
+        assert!((quote(&body) - 500.0).abs() < 1e-6, "{body}");
+        assert!((prefill(&body) - 500.0).abs() < 1e-6, "{body}");
+
+        let b = ctx.registry.get(&WorkerId("b".into())).unwrap();
+        let dispatched = b.prefill_load_guard(2_000);
+        let (_, body) = post_json(Arc::clone(&ctx), PREFIX_MATCH_PATH, query.clone()).await;
+        assert!((quote(&body) - 700.0).abs() < 1e-6, "{body}");
+        assert!((prefill(&body) - 500.0).abs() < 1e-6, "{body}");
+        drop(dispatched);
+        let (_, body) = post_json(ctx, PREFIX_MATCH_PATH, query).await;
+        assert!((quote(&body) - 500.0).abs() < 1e-6, "{body}");
+    }
+
+    #[tokio::test]
+    async fn prefix_match_omits_the_quote_it_cannot_stand_behind() {
+        let prompt: Vec<u64> = (1..=40).collect();
+        let query = json!({"token_ids": prompt, "input_tokens": 5000});
+        // The two parts come and go together.
+        let omitted = |body: &Value| {
+            let none = body.get("expected_ttft_ms").is_none();
+            assert_eq!(none, body.get("expected_prefill_ms").is_none(), "{body}");
+            none
+        };
+
+        // Legacy routing picks no engine to quote, reports or not.
+        let ctx = ctx_with_tree(&prompt, 6);
+        report_prefill(&ctx, "http://a:30000", 0);
+        report_prefill(&ctx, "http://b:30000", 0);
+        let (_, body) = post_json(ctx, PREFIX_MATCH_PATH, query.clone()).await;
+        assert!(omitted(&body), "{body}");
+
+        // No engine reports.
+        let ctx = reorg_ctx_with_tree(&prompt, 6, power_of_two);
+        let (_, body) = post_json(Arc::clone(&ctx), PREFIX_MATCH_PATH, query.clone()).await;
+        assert!(omitted(&body), "{body}");
+
+        // One engine the draw may land on has reported, but never prefilled.
+        report_prefill(&ctx, "http://a:30000", 0);
+        let now = Instant::now();
+        ctx.engine_reported_load
+            .set("http://b:30000", 0, load_stat(0, 0, Some(0)), now);
+        let (_, body) = post_json(Arc::clone(&ctx), PREFIX_MATCH_PATH, query.clone()).await;
+        assert!(omitted(&body), "{body}");
+        report_prefill(&ctx, "http://b:30000", 0);
+        let (_, body) = post_json(Arc::clone(&ctx), PREFIX_MATCH_PATH, query.clone()).await;
+        assert!(!omitted(&body), "{body}");
+
+        // No engine admits the request.
+        let ctx = reorg_ctx_with_tree(&prompt, 6, |ctx| {
+            let mut policy = crate::policies_reorg::power_of_two::PowerOfTwoPolicy::new(
+                Arc::clone(&ctx.engine_reported_load),
+            );
+            policy.admission = Arc::new(crate::policies_reorg::admission::AdmissionLimits {
+                max_waiting_requests: Some(1),
+                ..Default::default()
+            });
+            Arc::new(policy)
+        });
+        report_prefill(&ctx, "http://a:30000", 100);
+        report_prefill(&ctx, "http://b:30000", 100);
+        let (_, body) = post_json(ctx, PREFIX_MATCH_PATH, query).await;
+        assert_eq!(body["admits"], false, "{body}");
+        assert!(omitted(&body), "{body}");
     }
 
     #[test]

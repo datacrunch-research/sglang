@@ -407,6 +407,7 @@ async fn select_workers(
         prefill,
         decode,
         track_dispatch_timestamps: policy.needs_dispatch_timestamps(),
+        uncached_prefill_tokens: None,
     })
 }
 

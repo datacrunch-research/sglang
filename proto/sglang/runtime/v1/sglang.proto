@@ -211,6 +211,16 @@ message PrefixMatchResponse {
   CellLoad load = 5;
   // Whether some engine would currently admit a request of input_tokens.
   bool admits = 6;
+  // Milliseconds until this request's first token were it sent to this cell
+  // now: the prefill queue at the engine the cell would pick (the expectation
+  // over its draw when it draws), then the prompt's uncached prefill there,
+  // at that engine's measured rate. No network time or decode. Absent when
+  // the cell cannot stand behind a number.
+  optional double expected_ttft_ms = 7;
+  // The part of expected_ttft_ms that is the prompt's own uncached prefill, at
+  // the same engine and rate: the work the request would cost the cell, as
+  // opposed to its wait in the queue. Present exactly when expected_ttft_ms is.
+  optional double expected_prefill_ms = 8;
 }
 
 message GetCellLoadRequest {}

@@ -130,13 +130,16 @@ fn parse_bootstrap_host(url: &str) -> String {
 
 /// Tracks each in-flight slot with an acquisition timestamp so a routing
 /// policy can ask how many slots were claimed recently
-/// ([`count_acquired_since`](SlotRegistry::count_acquired_since)). The
+/// ([`count_acquired_since`](SlotRegistry::count_acquired_since)), and how
+/// many uncached prompt tokens they brought
+/// ([`tokens_acquired_since`](SlotRegistry::tokens_acquired_since)). The
 /// registry is separate from [`Worker::active_requests`]: ordinary load
 /// tracking stays lock-free, while policies that correct an engine snapshot
 /// explicitly opt into timestamp tracking.
 #[derive(Debug)]
 pub struct SlotRegistry {
-    slots: Mutex<HashMap<u64, Instant>>,
+    /// Claim time and the request's uncached prompt tokens, 0 when not counted.
+    slots: Mutex<HashMap<u64, (Instant, u64)>>,
     next_id: AtomicU64,
 }
 
@@ -148,10 +151,13 @@ impl SlotRegistry {
         })
     }
 
-    /// Records one timestamped slot and returns its identity.
-    fn claim(&self) -> u64 {
+    /// Records one timestamped slot carrying `tokens` and returns its identity.
+    fn claim(&self, tokens: u64) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.slots.lock().unwrap().insert(id, Instant::now());
+        self.slots
+            .lock()
+            .unwrap()
+            .insert(id, (Instant::now(), tokens));
         id
     }
 
@@ -172,8 +178,20 @@ impl SlotRegistry {
             .lock()
             .unwrap()
             .values()
-            .filter(|&&t| t >= since)
+            .filter(|&&(t, _)| t >= since)
             .count()
+    }
+
+    /// Uncached prompt tokens of the currently-claimed slots acquired at or
+    /// after `since`: prefill work dispatched that a report captured before
+    /// it cannot show.
+    pub fn tokens_acquired_since(&self, since: Instant) -> u64 {
+        self.slots
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|&&(t, _)| t >= since)
+            .fold(0u64, |sum, &(_, tokens)| sum.saturating_add(tokens))
     }
 }
 
@@ -458,6 +476,12 @@ impl Worker {
         self.slots.count_acquired_since(since)
     }
 
+    /// Uncached prompt tokens of this worker's in-flight requests dispatched
+    /// at or after `since`. See [`SlotRegistry::tokens_acquired_since`].
+    pub fn uncached_tokens_dispatched_since(&self, since: Instant) -> u64 {
+        self.slots.tokens_acquired_since(since)
+    }
+
     /// Returns a RAII guard that increments `active_requests` now and
     /// decrements when the guard is dropped.
     pub fn load_guard(&self) -> LoadGuard {
@@ -470,7 +494,14 @@ impl Worker {
 
     /// Returns a load guard that also records when the request was dispatched.
     pub(crate) fn timestamped_load_guard(&self) -> LoadGuard {
-        let slot_id = self.slots.claim();
+        self.prefill_load_guard(0)
+    }
+
+    /// [`Self::timestamped_load_guard`] for a request that leaves
+    /// `uncached_tokens` of its prompt to prefill here, which
+    /// [`Self::uncached_tokens_dispatched_since`] counts until the guard drops.
+    pub(crate) fn prefill_load_guard(&self, uncached_tokens: u64) -> LoadGuard {
+        let slot_id = self.slots.claim(uncached_tokens);
         self.active_requests.fetch_add(1, Ordering::Relaxed);
         LoadGuard {
             active_requests: Arc::clone(&self.active_requests),
@@ -554,6 +585,32 @@ mod tests {
         drop(guard);
         assert_eq!(w.router_inflight_load(), 0);
         assert_eq!(w.slots_acquired_since(cutoff), 0);
+    }
+
+    /// The uncached tokens of a dispatch count from its claim until its
+    /// guard drops, and only for a cutoff at or before the claim.
+    #[test]
+    fn prefill_load_guards_count_their_uncached_tokens_until_dropped() {
+        let w = test_worker();
+        let before = Instant::now() - Duration::from_secs(1);
+        let first = w.prefill_load_guard(3_000);
+        let between = Instant::now();
+        let second = w.prefill_load_guard(500);
+        let _plain = w.timestamped_load_guard();
+
+        assert_eq!(w.router_inflight_load(), 3);
+        assert_eq!(w.uncached_tokens_dispatched_since(before), 3_500);
+        assert_eq!(w.uncached_tokens_dispatched_since(between), 500);
+        assert_eq!(w.slots_acquired_since(before), 3);
+        assert_eq!(
+            w.uncached_tokens_dispatched_since(Instant::now() + Duration::from_secs(1)),
+            0
+        );
+
+        drop(first);
+        assert_eq!(w.uncached_tokens_dispatched_since(before), 500);
+        drop(second);
+        assert_eq!(w.uncached_tokens_dispatched_since(before), 0);
     }
 
     #[test]

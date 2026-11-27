@@ -710,6 +710,69 @@ async fn cache_aware_routes_tokenized_prompt_and_rechecks_the_next_bucket() {
     assert!(owner.captured.lock().unwrap().last_body.is_some());
 }
 
+/// A dispatched request counts on its prefill engine with the prompt tokens
+/// the engine lacks, until the request ends; the cell's TTFT quote adds
+/// them to the engine's reported queue.
+#[tokio::test]
+async fn a_dispatch_counts_its_uncached_tokens_on_the_engine_until_it_ends() {
+    use sgl_router::config::AffinityConfig;
+    use sgl_router::policies_reorg::cache_aware::{CacheAwarePolicy, CacheSource};
+    use sgl_router::state::kv_events::{
+        compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId, RadixTreePrefixProvider,
+    };
+    use sgl_router::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
+
+    let owner = MockWorker::start_hanging(Duration::from_millis(500)).await;
+    let value = body("hello world, a prompt long enough to hold in part");
+    let config = config_for("");
+    let tokenizers = TokenizerRegistry::load_from_config(&config).unwrap();
+    let ids =
+        sgl_router::policies::request_tokens_for(&tokenizers, &ModelId("tiny".into()), &value)
+            .unwrap()
+            .ids;
+    let hashes = compute_block_hashes(&ids.iter().map(|&t| u64::from(t)).collect::<Vec<u64>>(), 1);
+    let held = hashes.len() / 2;
+    assert!(held > 0, "the owner holds part of the prompt");
+    let tree = Arc::new(HashTree::new());
+    tree.insert(
+        &KvWorkerId::new(owner.url.clone(), 0),
+        None,
+        &hashes[..held],
+    );
+    let oracle = BlockSizeOracle::new();
+    oracle.try_set(1).unwrap();
+    let source = Arc::new(CacheSource::Local(RadixTreePrefixProvider::new(
+        tree, oracle,
+    )));
+    let config = AffinityConfig {
+        cache_affinity_min_matched_tokens: Some(1),
+        ..Default::default()
+    };
+    let policy = CacheAwarePolicy::new(source, EngineReportedLoadTable::new(), config).unwrap();
+    let ctx = context(
+        &[("owner", Stage::Plain, &owner)],
+        vec![Bucket::new(
+            "all",
+            BucketGroups::Plain(EngineGroup::new(Arc::new(policy))),
+        )],
+    );
+    let engine = ctx.registry.get(&WorkerId("owner".into())).unwrap();
+    let before = std::time::Instant::now();
+    let app = build_router(Arc::clone(&ctx));
+    let request = tokio::spawn(app.oneshot(request(value)));
+    while engine.router_inflight_load() == 0 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        engine.uncached_tokens_dispatched_since(before),
+        (ids.len() - held) as u64
+    );
+    let response = request.await.unwrap().unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.into_body().collect().await.unwrap();
+    assert_eq!(engine.uncached_tokens_dispatched_since(before), 0);
+}
+
 #[tokio::test]
 async fn default_pd_groups_apply_configured_inflight_admission() {
     use sgl_router::config::PolicyKind;
